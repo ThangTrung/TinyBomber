@@ -1,12 +1,65 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Net.Sockets;
+using GameShared;
 
 namespace GameServer
 {
-    internal class Client
+    class Client
     {
+        public int id;
+        public TCP tcp;
+
+        public Client(int _clientId)
+        {
+            id = _clientId;
+            tcp = new TCP(id);
+        }
+
+        public class TCP
+        {
+            public TcpClient socket = null!;
+            private readonly int id;
+            private NetworkStream stream = null!;
+            private byte[] receiveBuffer = null!;
+
+            public TCP(int _id)
+            {
+                id = _id;
+            }
+
+            public void Connect(TcpClient _socket)
+            {
+                socket = _socket;
+                socket.ReceiveBufferSize = Constants.DATA_BUFFER_SIZE;
+                socket.SendBufferSize = Constants.DATA_BUFFER_SIZE;
+
+                stream = socket.GetStream();
+                receiveBuffer = new byte[Constants.DATA_BUFFER_SIZE];
+
+                stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
+
+                ServerSend.Welcome(id, "Chao mung ban den voi may chu Tiny Bomber!");
+            }
+
+            public void SendData(Packet _packet)
+            {
+                try
+                {
+                    if (socket != null)
+                    {
+                        stream.BeginWrite(_packet.ToArray(), 0, _packet.Length(), null, null);
+                    }
+                }
+                catch (Exception _ex)
+                {
+                    Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {_ex}");
+                }
+            }
+
+            private void ReceiveCallback(IAsyncResult _result)
+            {
+                // Xử lý dữ liệu nhận được (Sẽ làm ở nhánh sau)
+            }
+        }
     }
 }

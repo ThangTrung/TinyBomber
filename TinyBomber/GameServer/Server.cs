@@ -9,6 +9,8 @@ namespace GameServer
         public static int MaxPlayers { get; private set; }
         public static int Port { get; private set; }
 
+        public static Dictionary<int, Client> clients = new Dictionary<int, Client>();
+
         private static TcpListener tcpListener = null!;
 
         public static void Start(int _maxPlayers, int _port)
@@ -17,12 +19,10 @@ namespace GameServer
             Port = _port;
 
             Console.WriteLine("Dang khoi dong may chu Tiny Bomber...");
+            InitializeServerData();
 
-            // Khởi tạo người gác cổng, lắng nghe trên mọi IP (Any) ở cổng Port
             tcpListener = new TcpListener(IPAddress.Any, Port);
             tcpListener.Start();
-
-            // Bắt đầu nhận khách (dùng Bất đồng bộ - Async để không làm treo màn hình đen)
             tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
 
             Console.WriteLine($"[THANH CONG] May chu da mo tren cong {Port}.");
@@ -30,16 +30,27 @@ namespace GameServer
 
         private static void TCPConnectCallback(IAsyncResult _result)
         {
-            // 1. Nhận người khách vừa tới
             TcpClient _client = tcpListener.EndAcceptTcpClient(_result);
-
-            // 2. NGAY LẬP TỨC quay ra cửa đón người tiếp theo (rất quan trọng)
             tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
-
-            // 3. In ra IP của khách vừa vào
             Console.WriteLine($"[KẾT NỐI MỚI] Co nguoi vua truy cap tu IP: {_client.Client.RemoteEndPoint}");
 
-            // (Tạm thời để đây, bài sau chúng ta sẽ phân phát ID cho khách này)
+            for (int i = 1; i <= MaxPlayers; i++)
+            {
+                if (clients[i].tcp.socket == null)
+                {
+                    clients[i].tcp.Connect(_client);
+                    return;
+                }
+            }
+            Console.WriteLine($"[TỪ CHỐI] Server da day, khong the nhan them {_client.Client.RemoteEndPoint}");
+        }
+
+        private static void InitializeServerData()
+        {
+            for (int i = 1; i <= MaxPlayers; i++)
+            {
+                clients.Add(i, new Client(i));
+            }
         }
     }
 }
