@@ -71,6 +71,21 @@ public class Client : MonoBehaviour
             stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
         }
 
+        public void SendData(Packet _packet)
+        {
+            try
+            {
+                if (socket != null)
+                {
+                    stream.BeginWrite(_packet.ToArray(), 0, _packet.Length(), null, null);
+                }
+            }
+            catch (Exception _ex)
+            {
+                Debug.Log($"Lỗi gửi dữ liệu TCP tới server: {_ex}");
+            }
+        }
+
         private void ReceiveCallback(IAsyncResult _result)
         {
             try

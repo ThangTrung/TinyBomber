@@ -58,7 +58,35 @@ namespace GameServer
 
             private void ReceiveCallback(IAsyncResult _result)
             {
-                // Xử lý dữ liệu nhận được (Sẽ làm ở nhánh sau)
+                try
+                {
+                    int _byteLength = stream.EndRead(_result);
+                    if (_byteLength <= 0)
+                    {
+                        //disconnect
+                        return;
+                    }
+
+                    byte[] _data = new byte[_byteLength];
+                    Array.Copy(receiveBuffer, _data, _byteLength);
+
+                    using (Packet _packet = new Packet(_data))
+                    {
+                        int _packetLength = _packet.ReadInt();
+                        int _packetId = _packet.ReadInt();
+
+                        if (_packetId == (int)ClientPackets.welcomeReceived)
+                        {
+                            ServerHandle.WelcomeReceived(id, _packet);
+                        }
+                    }
+
+                    stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
+                }
+                catch (Exception _ex)
+                {
+                    Console.WriteLine($"Loi nhan du lieu tu ID {id}: {_ex}");
+                }
             }
         }
     }

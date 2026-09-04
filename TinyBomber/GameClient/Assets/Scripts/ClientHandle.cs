@@ -12,6 +12,6 @@ public class ClientHandle : MonoBehaviour
 
         Client.instance.myId = _myId;
 
-        // welcome received
+        ClientSend.WelcomeReceived();
     }
 }
