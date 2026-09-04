@@ -6,7 +6,7 @@ using GameShared;
 public class Client : MonoBehaviour
 {
     public static Client instance;
-
+    public int myId = 0;
     public string ip = "127.0.0.1";
     public int port = Constants.PORT;
 
@@ -71,9 +71,54 @@ public class Client : MonoBehaviour
             stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
         }
 
+        public void SendData(Packet _packet)
+        {
+            try
+            {
+                if (socket != null)
+                {
+                    stream.BeginWrite(_packet.ToArray(), 0, _packet.Length(), null, null);
+                }
+            }
+            catch (Exception _ex)
+            {
+                Debug.Log($"Lỗi gửi dữ liệu TCP tới server: {_ex}");
+            }
+        }
+
         private void ReceiveCallback(IAsyncResult _result)
         {
-            
+            try
+            {
+                int _byteLength = stream.EndRead(_result);
+                if (_byteLength <= 0)
+                {
+                    // disconnect
+                    return;
+                }
+
+                byte[] _data = new byte[_byteLength];
+                Array.Copy(receiveBuffer, _data, _byteLength);
+
+                using (Packet _packet = new Packet(_data))
+                {
+                    int _packetLength = _packet.ReadInt();
+                    int _packetId = _packet.ReadInt();
+
+                    // add dictionary later
+                    if (_packetId == (int)ServerPackets.welcome)
+                    {
+                        ClientHandle.Welcome(_packet);
+                    }
+                }
+
+                stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
+            }
+            catch (Exception _ex)
+            {
+                Debug.Log($"Lỗi khi nhận dữ liệu TCP: {_ex}");
+                // Disconnect();
+            }
         }
     }
 }
