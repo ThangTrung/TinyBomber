@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace GameServer
 {
@@ -8,10 +9,11 @@ namespace GameServer
     {
         public static int MaxPlayers { get; private set; }
         public static int Port { get; private set; }
-
         public static Dictionary<int, Client> clients = new Dictionary<int, Client>();
 
         private static TcpListener tcpListener = null!;
+        private static Thread updateThread = null!;
+        private static bool isRunning = false;
 
         public static void Start(int _maxPlayers, int _port)
         {
@@ -19,6 +21,7 @@ namespace GameServer
             Port = _port;
 
             Console.WriteLine("Dang khoi dong may chu Tiny Bomber...");
+            ThreadManager.Initialize();
             InitializeServerData();
 
             tcpListener = new TcpListener(IPAddress.Any, Port);
@@ -26,6 +29,48 @@ namespace GameServer
             tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
 
             Console.WriteLine($"[THANH CONG] May chu da mo tren cong {Port}.");
+            StartUpdateLoop();
+        }
+
+        private static void StartUpdateLoop()
+        {
+            if (isRunning)
+            {
+                Console.WriteLine("[WARNING] Update loop da chay roi!");
+                return;
+            }
+
+            isRunning = true;
+            updateThread = new Thread(UpdateLoop)
+            {
+                Name = "ServerUpdateThread",
+                IsBackground = false
+            };
+            updateThread.Start();
+
+            Console.WriteLine("[INFO] Server update loop started (30 ticks/sec)");
+        }
+
+        private static void UpdateLoop()
+        {
+            while (isRunning)
+            {
+                ThreadManager.UpdateMain();
+            }
+        }
+
+        public static void Shutdown()
+        {
+            Console.WriteLine("[INFO] Dang tat may chu...");
+            isRunning = false;
+
+            if (updateThread != null && updateThread.IsAlive)
+            {
+                updateThread.Join(5000);
+            }
+
+            tcpListener?.Stop();
+            Console.WriteLine("[INFO] May chu da tat.");
         }
 
         private static void TCPConnectCallback(IAsyncResult _result)
