@@ -77,7 +77,13 @@ namespace GameServer
 
                         if (_packetId == (int)ClientPackets.welcomeReceived)
                         {
-                            ServerHandle.WelcomeReceived(id, _packet);
+                            int _clientIdCheck = _packet.ReadInt();
+                            string _username = _packet.ReadString();
+
+                            ThreadManager.EnqueueAction(() =>
+                            {
+                                ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
+                            });
                         }
                     }
 

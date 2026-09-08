@@ -5,11 +5,8 @@ namespace GameServer
 {
     class ServerHandle
     {
-        public static void WelcomeReceived(int _fromClient, Packet _packet)
+        public static void WelcomeReceived(int _fromClient, int _clientIdCheck, string _username)
         {
-            int _clientIdCheck = _packet.ReadInt();
-            string _username = _packet.ReadString();
-
             Console.WriteLine($"[ĐĂNG NHẬP] Người chơi ID {_fromClient} (Tên: {_username}) đã vào phòng!");
 
             if (_fromClient != _clientIdCheck)
