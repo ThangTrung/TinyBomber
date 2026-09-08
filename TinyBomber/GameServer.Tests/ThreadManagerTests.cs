@@ -10,6 +10,7 @@ namespace GameServer.Tests
     {
         public ThreadManagerTests()
         {
+            ThreadManager.Initialize();
             ThreadManager.ResetStats();
         }
 
