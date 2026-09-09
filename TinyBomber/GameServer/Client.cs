@@ -72,6 +72,8 @@ namespace GameServer
 
                     using (Packet _packet = new Packet(_data))
                     {
+                        _packet.DecryptPayload();
+
                         int _packetLength = _packet.ReadInt();
                         int _packetId = _packet.ReadInt();
 
