@@ -45,6 +45,7 @@ namespace GameServer.Tests
                     receivePacket.DecryptPayload();
 
                     // Read back data
+                    int packetLength = receivePacket.ReadInt();
                     int packetId = receivePacket.ReadInt();
                     string receivedMessage = receivePacket.ReadString();
                     int receivedInt = receivePacket.ReadInt();
@@ -82,6 +83,7 @@ namespace GameServer.Tests
                 {
                     receivePacket.DecryptPayload();
 
+                    int packetLength = receivePacket.ReadInt();
                     int packetId = receivePacket.ReadInt();
                     float rxPosX = receivePacket.ReadFloat();
                     float rxPosY = receivePacket.ReadFloat();
@@ -111,6 +113,7 @@ namespace GameServer.Tests
                 using (Packet receivePacket = new Packet(encryptedData))
                 {
                     receivePacket.DecryptPayload();
+                    int packetLength = receivePacket.ReadInt();
                     int packetId = receivePacket.ReadInt();
 
                     // Assert
@@ -227,11 +230,13 @@ namespace GameServer.Tests
             using (Packet rx1 = new Packet(encrypted1))
             {
                 rx1.DecryptPayload();
+                rx1.ReadInt();
                 string msg1 = rx1.ReadString();
 
                 using (Packet rx2 = new Packet(encrypted2))
                 {
                     rx2.DecryptPayload();
+                    rx2.ReadInt();
                     string msg2 = rx2.ReadString();
 
                     Assert.Equal(msg1, msg2);
@@ -413,6 +418,7 @@ namespace GameServer.Tests
                         using (Packet rxPacket = new Packet(encrypted))
                         {
                             rxPacket.DecryptPayload();
+                            rxPacket.ReadInt();
                             int id = rxPacket.ReadInt();
                             float x = rxPacket.ReadFloat();
                             float y = rxPacket.ReadFloat();
