@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Text;
+using System.Security.Cryptography;
 
 namespace GameShared
 {
@@ -148,8 +149,8 @@ namespace GameShared
         {
             try
             {
-                int _length = ReadInt(); // Đọc chiều dài của chuỗi trước
-                string _value = Encoding.UTF8.GetString(readableBuffer, readPos, _length); // Đọc nội dung
+                int _length = ReadInt(); 
+                string _value = Encoding.UTF8.GetString(readableBuffer, readPos, _length); 
                 if (_moveReadPos) { readPos += _length; }
                 return _value;
             }
@@ -159,7 +160,161 @@ namespace GameShared
             }
         }
 
-        // Dọn dẹp bộ nhớ chống rò rỉ RAM (Memory Leak)
+        public void EncryptPayload()
+        {
+            try
+            {
+                byte[] lengthBytes = buffer.GetRange(0, 4).ToArray();
+                int originalLength = BitConverter.ToInt32(lengthBytes, 0);
+
+                byte[] dataToEncrypt = buffer.GetRange(4, buffer.Count - 4).ToArray();
+
+                byte[] iv = new byte[Constants.AES_IV_SIZE];
+                using (var rng = new RNGCryptoServiceProvider())
+                {
+                    rng.GetBytes(iv);
+                }
+
+                byte[] encryptedData = EncryptAES(dataToEncrypt, iv);
+
+                byte[] hmac = CalculateHMAC(iv, encryptedData);
+
+                buffer.Clear();
+
+                buffer.AddRange(lengthBytes);
+
+                buffer.AddRange(iv);
+
+                buffer.AddRange(encryptedData);
+
+                buffer.AddRange(hmac);
+
+                int newLength = Constants.AES_IV_SIZE + encryptedData.Length + Constants.HMAC_SIZE;
+                byte[] newLengthBytes = BitConverter.GetBytes(newLength);
+
+                for (int i = 0; i < 4; i++)
+                {
+                    buffer[i] = newLengthBytes[i];
+                }
+
+                readableBuffer = buffer.ToArray();
+            }
+            catch (Exception ex)
+            {
+                throw new Exception($"Error encrypting packet: {ex.Message}", ex);
+            }
+        }
+
+        public void DecryptPayload()
+        {
+            try
+            {
+                if (buffer.Count < 4 + Constants.AES_IV_SIZE + Constants.HMAC_SIZE)
+                {
+                    throw new Exception($"Packet too small for decryption: {buffer.Count} bytes");
+                }
+
+                byte[] lengthBytes = buffer.GetRange(0, 4).ToArray();
+                int packetLength = BitConverter.ToInt32(lengthBytes, 0);
+
+                byte[] iv = buffer.GetRange(4, Constants.AES_IV_SIZE).ToArray();
+
+                int encryptedDataStart = 4 + Constants.AES_IV_SIZE;
+                int encryptedDataLength = packetLength - Constants.AES_IV_SIZE - Constants.HMAC_SIZE;
+
+                if (encryptedDataLength <= 0)
+                {
+                    throw new Exception($"Invalid encrypted data length: {encryptedDataLength}");
+                }
+
+                byte[] encryptedData = buffer.GetRange(encryptedDataStart, encryptedDataLength).ToArray();
+
+                int hmacStart = 4 + Constants.AES_IV_SIZE + encryptedDataLength;
+                byte[] receivedHmac = buffer.GetRange(hmacStart, Constants.HMAC_SIZE).ToArray();
+
+                byte[] calculatedHmac = CalculateHMAC(iv, encryptedData);
+
+                if (!ByteArrayEquals(calculatedHmac, receivedHmac))
+                {
+                    throw new Exception("HMAC verification failed - packet may have been tampered with!");
+                }
+
+                byte[] decryptedData = DecryptAES(encryptedData, iv);
+
+                buffer.Clear();
+
+                buffer.AddRange(lengthBytes);
+
+                buffer.AddRange(decryptedData);
+
+                readableBuffer = buffer.ToArray();
+                readPos = 0;
+            }
+            catch (Exception ex)
+            {
+                throw new Exception($"Error decrypting packet: {ex.Message}", ex);
+            }
+        }
+
+        private byte[] EncryptAES(byte[] plaintext, byte[] iv)
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.Key = Constants.ENCRYPTION_KEY;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (var encryptor = aes.CreateEncryptor(aes.Key, aes.IV))
+                {
+                    return encryptor.TransformFinalBlock(plaintext, 0, plaintext.Length);
+                }
+            }
+        }
+
+        private byte[] DecryptAES(byte[] ciphertext, byte[] iv)
+        {
+            using (var aes = Aes.Create())
+            {
+                aes.Key = Constants.ENCRYPTION_KEY;
+                aes.IV = iv;
+                aes.Mode = CipherMode.CBC;
+                aes.Padding = PaddingMode.PKCS7;
+
+                using (var decryptor = aes.CreateDecryptor(aes.Key, aes.IV))
+                {
+                    return decryptor.TransformFinalBlock(ciphertext, 0, ciphertext.Length);
+                }
+            }
+        }
+
+        private byte[] CalculateHMAC(byte[] iv, byte[] encryptedData)
+        {
+            // Combine IV + EncryptedData for HMAC input
+            byte[] hmacInput = new byte[iv.Length + encryptedData.Length];
+            Array.Copy(iv, 0, hmacInput, 0, iv.Length);
+            Array.Copy(encryptedData, 0, hmacInput, iv.Length, encryptedData.Length);
+
+            using (var hmac = new HMACSHA256(Constants.ENCRYPTION_KEY))
+            {
+                return hmac.ComputeHash(hmacInput);
+            }
+        }
+
+        private bool ByteArrayEquals(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length)
+                return false;
+
+            int result = 0;
+            for (int i = 0; i < a.Length; i++)
+            {
+                result |= a[i] ^ b[i];
+            }
+
+            return result == 0;
+        }
+
         private bool disposed = false;
         protected virtual void Dispose(bool _disposing)
         {
