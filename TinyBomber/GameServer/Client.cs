@@ -87,6 +87,16 @@ namespace GameServer
                                 ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
                             });
                         }
+                        else if (_packetId == (int)ClientPackets.playerMovement)
+                        {
+                            float _x = _packet.ReadFloat();
+                            float _y = _packet.ReadFloat();
+
+                            ThreadManager.EnqueueAction(() =>
+                            {
+                                ServerHandle.PlayerMovement(id, _x, _y);
+                            });
+                        }
                     }
 
                     stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
