@@ -2,6 +2,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using GameShared;
 
 namespace GameServer
 {
@@ -12,6 +13,7 @@ namespace GameServer
         public static Dictionary<int, Client> clients = new Dictionary<int, Client>();
 
         private static TcpListener tcpListener = null!;
+        private static UdpClient udpSocket = null!;
         private static Thread updateThread = null!;
         private static bool isRunning = false;
 
@@ -29,6 +31,20 @@ namespace GameServer
             tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
 
             Console.WriteLine($"[THANH CONG] May chu da mo tren cong {Port}.");
+
+            try
+            {
+                udpSocket = new UdpClient(Constants.UDP_PORT);
+                udpSocket.DontFragment = true;  // Prevent UDP fragmentation
+
+                Console.WriteLine($"[THANH CONG] UDP socket da mo tren cong {Constants.UDP_PORT}.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERROR] Khong the tao UDP socket: {ex.Message}");
+                throw;
+            }
+
             StartUpdateLoop();
         }
 
@@ -96,6 +112,11 @@ namespace GameServer
             {
                 clients.Add(i, new Client(i));
             }
+        }
+
+        public static UdpClient GetUdpSocket()
+        {
+            return udpSocket;
         }
     }
 }
