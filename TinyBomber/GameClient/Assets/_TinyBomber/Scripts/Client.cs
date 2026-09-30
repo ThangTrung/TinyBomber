@@ -7,7 +7,7 @@ public class Client : MonoBehaviour
 {
     public static Client instance;
     public int myId = 0;
-    public string ip = "127.0.0.1";
+    public string ip = "172.31.99.137";
     public int port = Constants.PORT;
 
     public TCP tcp;
@@ -100,17 +100,29 @@ public class Client : MonoBehaviour
                 byte[] _data = new byte[_byteLength];
                 Array.Copy(receiveBuffer, _data, _byteLength);
 
-                using (Packet _packet = new Packet(_data))
+                ThreadManager.ExecuteOnMainThread(() =>
                 {
-                    int _packetLength = _packet.ReadInt();
-                    int _packetId = _packet.ReadInt();
-
-                    // add dictionary later
-                    if (_packetId == (int)ServerPackets.welcome)
+                    using (Packet _packet = new Packet(_data))
                     {
-                        ClientHandle.Welcome(_packet);
+                        _packet.DecryptPayload();
+                        int _packetLength = _packet.ReadInt();
+                        int _packetId = _packet.ReadInt();
+
+                        // Điều hướng
+                        if (_packetId == (int)ServerPackets.welcome)
+                        {
+                            ClientHandle.Welcome(_packet);
+                        }
+                        else if (_packetId == (int)ServerPackets.spawnPlayer)
+                        {
+                            ClientHandle.SpawnPlayer(_packet);
+                        }
+                        else if (_packetId == (int)ServerPackets.playerPosition)
+                        {
+                            ClientHandle.PlayerPosition(_packet);
+                        }
                     }
-                }
+                });
 
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
             }

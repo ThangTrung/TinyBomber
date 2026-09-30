@@ -39,6 +39,31 @@ namespace GameServer
                 client.tcp.SendData(_packet);
             }
         }
+        private static void SendTCPDataToAll(int _exceptClient, Packet _packet)
+        {
+            _packet.WriteLength();
+            _packet.EncryptPayload();
+            for (int i = 1; i <= Server.MaxPlayers; i++)
+            {
+                if (i != _exceptClient && Server.clients[i].tcp.socket != null)
+                {
+                    Server.clients[i].tcp.SendData(_packet);
+                }
+            }
+        }
+
+        private static void SendTCPDataToAll(Packet _packet)
+        {
+            _packet.WriteLength();
+            _packet.EncryptPayload();
+            for (int i = 1; i <= Server.MaxPlayers; i++)
+            {
+                if (Server.clients[i].tcp.socket != null)
+                {
+                    Server.clients[i].tcp.SendData(_packet);
+                }
+            }
+        }
 
         public static void Welcome(int _toClient, string _msg)
         {
@@ -75,6 +100,27 @@ namespace GameServer
             {
                 _packet.Write(_disconnectedClientId);
                 SendTCPData(_toClient, _packet);  // Always TCP for critical events
+            }
+        }
+        public static void SpawnPlayer(int _toClient, int _playerToSpawnId, float _x, float _y)
+        {
+            using (Packet _packet = new Packet((int)ServerPackets.spawnPlayer))
+            {
+                _packet.Write(_playerToSpawnId);
+                _packet.Write(_x);
+                _packet.Write(_y);
+                SendTCPData(_toClient, _packet);
+            }
+        }
+
+        public static void BroadcastPlayerPosition(int _playerId, float _x, float _y)
+        {
+            using (Packet _packet = new Packet((int)ServerPackets.playerPosition))
+            {
+                _packet.Write(_playerId);
+                _packet.Write(_x);
+                _packet.Write(_y);
+                SendTCPDataToAll(_playerId, _packet);
             }
         }
     }

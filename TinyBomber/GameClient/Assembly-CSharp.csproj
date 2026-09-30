@@ -61,8 +61,12 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Assets\_TinyBomber\Scripts\Client.cs" />
+    <Compile Include="Assets\_TinyBomber\Scripts\ThreadManager.cs" />
+    <Compile Include="Assets\_TinyBomber\Scripts\RemotePlayerController.cs" />
     <Compile Include="Assets\_TinyBomber\Scripts\ClientHandle.cs" />
+    <Compile Include="Assets\_TinyBomber\Scripts\PlayerController.cs" />
     <Compile Include="Assets\_TinyBomber\Scripts\ClientSend.cs" />
+    <Compile Include="Assets\_TinyBomber\Scripts\GameManager.cs" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="UnityEngine">
