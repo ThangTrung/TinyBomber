@@ -20,6 +20,8 @@ namespace GameShared
 
         public const int AES_IV_SIZE = 16;
         public const int HMAC_SIZE = 32;
+
+        public const int UDP_PORT = PORT + 1;
     }
 
     public enum ServerPackets
