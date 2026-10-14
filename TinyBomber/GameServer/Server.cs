@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -29,14 +30,13 @@ namespace GameServer
             tcpListener = new TcpListener(IPAddress.Any, Port);
             tcpListener.Start();
             tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
-
             Console.WriteLine($"[THANH CONG] May chu da mo tren cong {Port}.");
 
             try
             {
                 udpSocket = new UdpClient(Constants.UDP_PORT);
-                udpSocket.DontFragment = true;  // Prevent UDP fragmentation
-
+                udpSocket.DontFragment = true;
+                udpSocket.BeginReceive(UDPReceiveCallback, null);
                 Console.WriteLine($"[THANH CONG] UDP socket da mo tren cong {Constants.UDP_PORT}.");
             }
             catch (Exception ex)
@@ -46,6 +46,63 @@ namespace GameServer
             }
 
             StartUpdateLoop();
+        }
+
+        private static void UDPReceiveCallback(IAsyncResult _result)
+        {
+            try
+            {
+                IPEndPoint _clientEndPoint = new IPEndPoint(IPAddress.Any, 0);
+                byte[] _data = udpSocket.EndReceive(_result, ref _clientEndPoint!);
+                udpSocket.BeginReceive(UDPReceiveCallback, null);
+
+                if (_data.Length < 4)
+                {
+                    return;
+                }
+
+                int _clientId = BitConverter.ToInt32(_data, 0);
+                if (_clientId < 1 || _clientId > MaxPlayers)
+                {
+                    return;
+                }
+
+                if (clients[_clientId].udp.endPoint == null)
+                {
+                    clients[_clientId].udp.Connect(_clientEndPoint);
+                    return;
+                }
+
+                if (clients[_clientId].udp.endPoint!.ToString() == _clientEndPoint.ToString())
+                {
+                    byte[] _encryptedPayload = new byte[_data.Length - 4];
+                    Array.Copy(_data, 4, _encryptedPayload, 0, _encryptedPayload.Length);
+                    clients[_clientId].udp.HandleData(_encryptedPayload);
+                }
+            }
+            catch (Exception _ex)
+            {
+                Console.WriteLine($"[UDP Receive Warning] {_ex.Message}");
+                if (isRunning && udpSocket != null)
+                {
+                    try { udpSocket.BeginReceive(UDPReceiveCallback, null); } catch { }
+                }
+            }
+        }
+
+        public static void SendUDPData(IPEndPoint _clientEndPoint, Packet _packet)
+        {
+            try
+            {
+                if (_clientEndPoint != null && udpSocket != null)
+                {
+                    udpSocket.BeginSend(_packet.ToArray(), _packet.Length(), _clientEndPoint, null, null);
+                }
+            }
+            catch (Exception _ex)
+            {
+                Console.WriteLine($"[ERROR] Loi gui UDP toi {_clientEndPoint}: {_ex.Message}");
+            }
         }
 
         private static void StartUpdateLoop()
@@ -63,7 +120,6 @@ namespace GameServer
                 IsBackground = false
             };
             updateThread.Start();
-
             Console.WriteLine("[INFO] Server update loop started (30 ticks/sec)");
         }
 
@@ -86,6 +142,7 @@ namespace GameServer
             }
 
             tcpListener?.Stop();
+            udpSocket?.Close();
             Console.WriteLine("[INFO] May chu da tat.");
         }
 
@@ -112,11 +169,6 @@ namespace GameServer
             {
                 clients.Add(i, new Client(i));
             }
-        }
-
-        public static UdpClient GetUdpSocket()
-        {
-            return udpSocket;
         }
     }
 }
