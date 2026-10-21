@@ -1,4 +1,5 @@
-﻿using UnityEngine;
+﻿using System.Net;
+using UnityEngine;
 using GameShared;
 
 public class ClientHandle : MonoBehaviour
@@ -9,10 +10,11 @@ public class ClientHandle : MonoBehaviour
         int _myId = _packet.ReadInt();
 
         Debug.Log($"[SERVER NÓI]: {_msg}");
-
         Client.instance.myId = _myId;
-
         ClientSend.WelcomeReceived();
+
+        int _localPort = ((IPEndPoint)Client.instance.tcp.socket.Client.LocalEndPoint).Port;
+        Client.instance.udp.Connect(_localPort);
     }
 
     public static void SpawnPlayer(Packet _packet)

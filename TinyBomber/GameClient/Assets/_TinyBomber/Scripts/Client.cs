@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Net;
 using System.Net.Sockets;
 using UnityEngine;
 using GameShared;
@@ -7,10 +8,11 @@ public class Client : MonoBehaviour
 {
     public static Client instance;
     public int myId = 0;
-    public string ip = "172.31.99.137";
+    public string ip = "127.0.0.1";
     public int port = Constants.PORT;
 
     public TCP tcp;
+    public UDP udp;
 
     private void Awake()
     {
@@ -28,6 +30,7 @@ public class Client : MonoBehaviour
     private void Start()
     {
         tcp = new TCP();
+        udp = new UDP();
         ConnectToServer();
     }
 
@@ -130,6 +133,75 @@ public class Client : MonoBehaviour
             {
                 Debug.Log($"Lỗi khi nhận dữ liệu TCP: {_ex}");
                 // Disconnect();
+            }
+        }
+    }
+
+    public class UDP
+    {
+        public UdpClient socket;
+        public IPEndPoint endPoint;
+
+        public UDP()
+        {
+            endPoint = new IPEndPoint(IPAddress.Parse(instance.ip), Constants.UDP_PORT);
+        }
+
+        public void Connect(int _localPort)
+        {
+            socket = new UdpClient(_localPort);
+            socket.Connect(endPoint);
+            socket.BeginReceive(ReceiveCallback, null);
+
+            using (Packet _packet = new Packet())
+            {
+                SendData(_packet);
+            }
+        }
+
+        public void SendData(Packet _packet)
+        {
+            try
+            {
+                _packet.InsertInt(instance.myId);
+                if (socket != null)
+                {
+                    socket.BeginSend(_packet.ToArray(), _packet.Length(), null, null);
+                }
+            }
+            catch (Exception _ex)
+            {
+                Debug.Log($"Lỗi gửi UDP: {_ex}");
+            }
+        }
+
+        private void ReceiveCallback(IAsyncResult _result)
+        {
+            try
+            {
+                byte[] _data = socket.EndReceive(_result, ref endPoint);
+                socket.BeginReceive(ReceiveCallback, null);
+
+                if (_data.Length < 4) return;
+
+                ThreadManager.ExecuteOnMainThread(() =>
+                {
+                    using (Packet _packet = new Packet(_data))
+                    {
+                        _packet.DecryptPayload();
+                        int _packetLength = _packet.ReadInt();
+                        int _packetId = _packet.ReadInt();
+
+                        if (_packetId == (int)ServerPackets.playerPosition)
+                        {
+                            ClientHandle.PlayerPosition(_packet);
+                        }
+                    }
+                });
+            }
+            catch (Exception _ex)
+            {
+                Debug.Log($"Lỗi nhận UDP: {_ex}");
             }
         }
     }
