@@ -112,130 +112,61 @@ namespace GameServer
         }
         public class UDP
         {
-            public UdpClient socket = null!;
+            public IPEndPoint? endPoint;
             private readonly int id;
-            private IPEndPoint remoteEndPoint = null!;  
-            private byte[] receiveBuffer = null!;
-            private bool isConnected = false; 
 
             public UDP(int _id)
             {
                 id = _id;
             }
 
-            public void Connect(IPEndPoint _remoteEndPoint)
+            public void Connect(IPEndPoint _endPoint)
             {
-                remoteEndPoint = _remoteEndPoint;
-                receiveBuffer = new byte[Constants.DATA_BUFFER_SIZE];
-                socket = Server.GetUdpSocket();
-
-                Console.WriteLine($"[UDP] Client {id} UDP endpoint discovered: {remoteEndPoint}");
-
-                isConnected = true;
-            }
-
-            public void BeginReceiveFrom()
-            {
-                if (!isConnected || socket == null)
-                    return;
-
-                try
-                {
-                    EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
-                    socket.Client.BeginReceiveFrom(
-                        receiveBuffer, 0, Constants.DATA_BUFFER_SIZE,
-                        SocketFlags.None, ref ep, UDPReceiveCallback, null
-                    );
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[ERROR] BeginReceiveFrom failed for UDP {id}: {ex.Message}");
-                }
-            }
-
-            private void UDPReceiveCallback(IAsyncResult _result)
-            {
-                try
-                {
-                    if (!isConnected || socket == null)
-                        return;
-
-                    EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
-                    int _byteLength = socket.Client.EndReceiveFrom(_result, ref ep);
-
-                    if (_byteLength <= 0)
-                    {
-                        BeginReceiveFrom();
-                        return;
-                    }
-
-                    byte[] _data = new byte[_byteLength];
-                    Array.Copy(receiveBuffer, _data, _byteLength);
-
-                    using (Packet _packet = new Packet(_data))
-                    {
-                        _packet.DecryptPayload();
-
-                        int _packetLength = _packet.ReadInt(); 
-                        int _packetId = _packet.ReadInt();  
-
-                        ThreadManager.EnqueueAction(() =>
-                        {
-                            ServerHandle.HandleUDPPacket(id, _packetId, _packet);
-                        });
-                    }
-
-                    BeginReceiveFrom();
-                }
-                catch (Exception _ex)
-                {
-                    Console.WriteLine($"[ERROR] UDP receive error for Client {id}: {_ex.Message}");
-                    BeginReceiveFrom(); 
-                }
-            }
-
-            public void SendData(Packet _packet)
-            {
-                if (!isConnected || socket == null || remoteEndPoint == null)
-                {
-                    Console.WriteLine($"[WARNING] UDP not connected for Client {id}");
-                    return;
-                }
-
-                try
-                {
-                    byte[] data = _packet.ToArray();
-                    socket.Client.BeginSendTo(data, 0, data.Length, SocketFlags.None, remoteEndPoint, UDPSendCallback, null);
-                }
-                catch (Exception _ex)
-                {
-                    Console.WriteLine($"[ERROR] UDP send error for Client {id}: {_ex.Message}");
-                }
-            }
-
-            private void UDPSendCallback(IAsyncResult _result)
-            {
-                try
-                {
-                    if (socket != null)
-                    {
-                        int bytesSent = socket.Client.EndSendTo(_result);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[ERROR] UDP send callback error for Client {id}: {ex.Message}");
-                }
+                endPoint = _endPoint;
+                Console.WriteLine($"[UDP] Client {id} UDP endpoint discovered: {endPoint}");
             }
 
             public bool IsConnected()
             {
-                return isConnected;
+                return endPoint != null;
             }
 
-            public IPEndPoint GetEndPoint()
+            public void SendData(Packet _packet)
             {
-                return remoteEndPoint;
+                if (endPoint != null)
+                {
+                    Server.SendUDPData(endPoint, _packet);
+                }
+            }
+
+            public void HandleData(byte[] _packetData)
+            {
+                try
+                {
+                    using (Packet _packet = new Packet(_packetData))
+                    {
+                        _packet.DecryptPayload();
+
+                        int _packetLength = _packet.ReadInt();
+                        int _packetId = _packet.ReadInt();
+
+                        if (_packetId == (int)ClientPackets.playerMovement)
+                        {
+                            // Bóc tách dữ liệu nguyên thủy ngay trên luồng mạng trước khi Packet bị Dispose
+                            float _x = _packet.ReadFloat();
+                            float _y = _packet.ReadFloat();
+
+                            ThreadManager.EnqueueAction(() =>
+                            {
+                                ServerHandle.PlayerMovement(id, _x, _y);
+                            });
+                        }
+                    }
+                }
+                catch (Exception _ex)
+                {
+                    Console.WriteLine($"[ERROR] Loi giai ma/xu ly UDP tu Client {id}: {_ex.Message}");
+                }
             }
         }
     }
