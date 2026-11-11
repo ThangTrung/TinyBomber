@@ -18,12 +18,26 @@ namespace GameServer
             udp = new UDP(id);
         }
 
+        // [HEARTBEAT] Ngắt kết nối hoàn chỉnh. Luôn gọi trên luồng game (qua ThreadManager.EnqueueAction).
+        public void Disconnect()
+        {
+            if (!tcp.Disconnect()) return; // đã ngắt rồi, không làm lại lần hai
+
+            Console.WriteLine($"[NGAT KET NOI] Client {id} da roi khoi may chu.");
+
+            udp.Disconnect();
+
+            // TODO: dọn player và báo cho người chơi khác (cần xem ServerHandle / Player / ServerSend)
+            // ví dụ: player = null; ServerSend.PlayerDisconnected(id);
+        }
+
         public class TCP
         {
             public TcpClient socket = null!;
             private readonly int id;
             private NetworkStream stream = null!;
             private byte[] receiveBuffer = null!;
+            private readonly object disconnectLock = new object(); // [HEARTBEAT]
 
             public TCP(int _id)
             {
@@ -42,6 +56,19 @@ namespace GameServer
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
 
                 ServerSend.Welcome(id, "Chao mung ban den voi may chu Tiny Bomber!");
+            }
+
+            // [HEARTBEAT] Trả về true nếu lần gọi này thực sự đóng socket
+            public bool Disconnect()
+            {
+                lock (disconnectLock)
+                {
+                    if (socket == null) return false;
+
+                    try { socket.Close(); } catch { }
+                    socket = null!;   // quan trọng: Server dùng socket == null để biết slot trống
+                    return true;
+                }
             }
 
             public void SendData(Packet _packet)
@@ -66,22 +93,25 @@ namespace GameServer
                     int _byteLength = stream.EndRead(_result);
                     if (_byteLength <= 0)
                     {
-                        //disconnect
+                        ThreadManager.EnqueueAction(() => Server.clients[id].Disconnect());
                         return;
                     }
+
+                    Server.Touch(id);
 
                     byte[] _data = new byte[_byteLength];
                     Array.Copy(receiveBuffer, _data, _byteLength);
 
                     using (Packet _packet = new Packet(_data))
                     {
-                        _packet.DecryptPayload();
+                        _packet.DecryptPayload();               // 1. giải mã TRƯỚC
 
-                        int _packetLength = _packet.ReadInt();
-                        int _packetId = _packet.ReadInt();
+                        int _packetLength = _packet.ReadInt();  // 2. rồi mới đọc length
+                        int _packetId = _packet.ReadInt();      //    và id
 
                         if (_packetId == (int)ClientPackets.welcomeReceived)
                         {
+                            Console.WriteLine("Nhận welcomeReceived");
                             int _clientIdCheck = _packet.ReadInt();
                             string _username = _packet.ReadString();
 
@@ -92,6 +122,7 @@ namespace GameServer
                         }
                         else if (_packetId == (int)ClientPackets.playerMovement)
                         {
+                            Console.WriteLine("Nhận playermovement");
                             float _x = _packet.ReadFloat();
                             float _y = _packet.ReadFloat();
 
@@ -100,23 +131,33 @@ namespace GameServer
                                 ServerHandle.PlayerMovement(id, _x, _y);
                             });
                         }
+                        else if (_packetId == (int)ClientPackets.ping)   // [HEARTBEAT]
+                        {
+                            Console.WriteLine("Nhận ping");
+                            ThreadManager.EnqueueAction(() => ServerSend.Pong(id));
+                        }
                     }
 
                     stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
                 }
                 catch (Exception _ex)
                 {
-                    Console.WriteLine($"Loi nhan du lieu tu ID {id}: {_ex}");
+                    if (socket != null)
+                    {
+                        Console.WriteLine($"Loi nhan du lieu tu ID {id}: {_ex}");
+                    }
+                    ThreadManager.EnqueueAction(() => Server.clients[id].Disconnect());
                 }
             }
         }
+
         public class UDP
         {
             public UdpClient socket = null!;
             private readonly int id;
-            private IPEndPoint remoteEndPoint = null!;  
+            private IPEndPoint remoteEndPoint = null!;
             private byte[] receiveBuffer = null!;
-            private bool isConnected = false; 
+            private bool isConnected = false;
 
             public UDP(int _id)
             {
@@ -132,6 +173,13 @@ namespace GameServer
                 Console.WriteLine($"[UDP] Client {id} UDP endpoint discovered: {remoteEndPoint}");
 
                 isConnected = true;
+            }
+
+            // [HEARTBEAT] KHÔNG đóng socket vì nó dùng chung cho mọi client
+            public void Disconnect()
+            {
+                isConnected = false;
+                remoteEndPoint = null!;
             }
 
             public void BeginReceiveFrom()
@@ -169,6 +217,13 @@ namespace GameServer
                         return;
                     }
 
+                    // [HEARTBEAT] chỉ Touch nếu gói thật sự đến từ endpoint của client này
+                    IPEndPoint? _remote = remoteEndPoint;
+                    if (_remote != null && ep.Equals(_remote))
+                    {
+                        Server.Touch(id);
+                    }
+
                     byte[] _data = new byte[_byteLength];
                     Array.Copy(receiveBuffer, _data, _byteLength);
 
@@ -176,8 +231,8 @@ namespace GameServer
                     {
                         _packet.DecryptPayload();
 
-                        int _packetLength = _packet.ReadInt(); 
-                        int _packetId = _packet.ReadInt();  
+                        int _packetLength = _packet.ReadInt();
+                        int _packetId = _packet.ReadInt();
 
                         ThreadManager.EnqueueAction(() =>
                         {
@@ -190,7 +245,7 @@ namespace GameServer
                 catch (Exception _ex)
                 {
                     Console.WriteLine($"[ERROR] UDP receive error for Client {id}: {_ex.Message}");
-                    BeginReceiveFrom(); 
+                    BeginReceiveFrom();
                 }
             }
 

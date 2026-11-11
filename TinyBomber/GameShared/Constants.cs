@@ -29,12 +29,15 @@ namespace GameShared
         welcome = 1,
         spawnPlayer,
         playerPosition,
-        playerDisconnected
+        playerDisconnected,
+        pong
     }
 
     public enum ClientPackets
     {
         welcomeReceived = 1,
-        playerMovement
+        playerMovement, 
+        ping
+
     }
 }

@@ -123,5 +123,14 @@ namespace GameServer
                 SendTCPDataToAll(_playerId, _packet);
             }
         }
+
+        public static void Pong(int _toClient)   // [HEARTBEAT]
+        {
+            Console.WriteLine("Gửi pong");
+            using (Packet _packet = new Packet((int)ServerPackets.pong))
+            {
+                SendTCPData(_toClient, _packet);   // TODO: đổi theo tên hàm gửi trong ServerSend của bạn
+            }
+        }
     }
 }
