@@ -30,4 +30,11 @@ public class ClientSend : MonoBehaviour
             SendTCPData(_packet);
         }
     }
+    public static void Ping()   // [HEARTBEAT]
+    {
+        using (Packet _packet = new Packet((int)ClientPackets.ping))
+        {
+            SendTCPData(_packet);
+        }
+    }
 }

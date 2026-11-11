@@ -25,7 +25,7 @@ public class ThreadManager : MonoBehaviour
     }
 
     public static void UpdateMain()
-    {
+    { 
         if (actionToExecute)
         {
             executeCopiedOnMainThread.Clear();
