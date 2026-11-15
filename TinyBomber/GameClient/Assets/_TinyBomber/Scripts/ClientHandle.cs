@@ -35,11 +35,31 @@ public class ClientHandle : MonoBehaviour
 
         if (GameManager.players.ContainsKey(_id))
         {
-            RemotePlayerController remoteControl = GameManager.players[_id].GetComponent<RemotePlayerController>();
-            if (remoteControl != null)
+            if (_id == Client.instance.myId)
             {
-                remoteControl.UpdatePosition(new Vector2(_x, _y));
+                GameManager.players[_id].transform.position = new Vector2(_x, _y);
+            }
+            else
+            {
+                RemotePlayerController remoteControl = GameManager.players[_id].GetComponent<RemotePlayerController>();
+                if (remoteControl != null)
+                {
+                    remoteControl.UpdatePosition(new Vector2(_x, _y));
+                }
             }
         }
+    }
+
+    public static void MapData(Packet _packet)
+    {
+        int[,] _map = new int[Constants.MAP_WIDTH, Constants.MAP_HEIGHT];
+        for (int col = 0; col < Constants.MAP_WIDTH; col++)
+        {
+            for (int row = 0; row < Constants.MAP_HEIGHT; row++)
+            {
+                _map[col, row] = _packet.ReadInt();
+            }
+        }
+        GameManager.instance.BuildMap(_map);
     }
 }

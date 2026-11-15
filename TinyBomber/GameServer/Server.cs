@@ -26,6 +26,7 @@ namespace GameServer
             Console.WriteLine("Dang khoi dong may chu Tiny Bomber...");
             ThreadManager.Initialize();
             InitializeServerData();
+            GameLogic.InitializeMap();
 
             tcpListener = new TcpListener(IPAddress.Any, Port);
             tcpListener.Start();

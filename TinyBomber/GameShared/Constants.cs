@@ -8,9 +8,13 @@ namespace GameShared
         public const int MS_PER_TICK = 1000 / TICKS_PER_SEC;
 
         public const int PORT = 26950;
+        public const int UDP_PORT = PORT + 1;
         public const int MAX_PLAYERS = 4;
 
         public const int DATA_BUFFER_SIZE = 4096;
+
+        public const int MAP_WIDTH = 17;
+        public const int MAP_HEIGHT = 15;   
 
         public static readonly byte[] ENCRYPTION_KEY = new byte[16]
         {
@@ -20,8 +24,6 @@ namespace GameShared
 
         public const int AES_IV_SIZE = 16;
         public const int HMAC_SIZE = 32;
-
-        public const int UDP_PORT = PORT + 1;
     }
 
     public enum ServerPackets
@@ -29,7 +31,8 @@ namespace GameShared
         welcome = 1,
         spawnPlayer,
         playerPosition,
-        playerDisconnected
+        playerDisconnected,
+        mapData
     }
 
     public enum ClientPackets

@@ -12,23 +12,53 @@ namespace GameServer
             if (_fromClient != _clientIdCheck)
             {
                 Console.WriteLine($"[CẢNH BÁO] ID không khớp! Có dấu hiệu gian lận từ người chơi {_username}");
+                return;
             }
 
-            ServerSend.SpawnPlayer(_fromClient, _fromClient, 0f, 0f);
+            ServerSend.SendMapData(_fromClient);
+            Player newPlayer = new Player(_fromClient, _username);
+            Server.clients[_fromClient].player = newPlayer;
+
+            // Báo cho chính người đó vị trí sinh ra (Lấy từ x, y của class Player)
+            ServerSend.SpawnPlayer(_fromClient, _fromClient, newPlayer.x, newPlayer.y);
+
+            // Đồng bộ với người chơi khác
+            for (int i = 1; i <= Server.MaxPlayers; i++)
+            {
+                if (i != _fromClient && Server.clients[i].player != null)
+                {
+                    Player other = Server.clients[i].player;
+                    ServerSend.SpawnPlayer(i, _fromClient, newPlayer.x, newPlayer.y);
+                    ServerSend.SpawnPlayer(_fromClient, i, other.x, other.y);
+                }
+            }
 
             for (int i = 1; i <= Server.MaxPlayers; i++)
             {
-                if (i != _fromClient && Server.clients[i].tcp.socket != null)
+                if (i != _fromClient && Server.clients[i].player != null)
                 {
-                    ServerSend.SpawnPlayer(i, _fromClient, 0f, 0f); 
-                    ServerSend.SpawnPlayer(_fromClient, i, 0f, 0f); 
+                    Player other = Server.clients[i].player!;
+                    ServerSend.SpawnPlayer(i, _fromClient, newPlayer.x, newPlayer.y);
+                    ServerSend.SpawnPlayer(_fromClient, i, other.x, other.y);
                 }
             }
         }
 
         public static void PlayerMovement(int _fromClient, float _x, float _y)
         {
-            ServerSend.BroadcastPlayerPosition(_fromClient, _x, _y);
+            Player? player = Server.clients[_fromClient].player;
+            if (player == null || !player.isAlive) return;
+
+            if (GameLogic.CanMoveTo(_x, _y))
+            {
+                player.x = _x;
+                player.y = _y;
+                ServerSend.BroadcastPlayerPosition(_fromClient, _x, _y);
+            }
+            else
+            {
+                ServerSend.SnapPlayerPosition(_fromClient, player.x, player.y);
+            }
         }
     }
 }

@@ -64,5 +64,31 @@ namespace GameServer
                 SendUDPDataToAll(_playerId, _packet);
             }
         }
+
+        public static void SendMapData(int _toClient)
+        {
+            using (Packet _packet = new Packet((int)ServerPackets.mapData))
+            {
+                for (int col = 0; col < Constants.MAP_WIDTH; col++)
+                {
+                    for (int row = 0; row < Constants.MAP_HEIGHT; row++)
+                    {
+                        _packet.Write(GameLogic.mapData[col, row]);
+                    }
+                }
+                SendTCPData(_toClient, _packet);
+            }
+        }
+
+        public static void SnapPlayerPosition(int _toClient, float _x, float _y)
+        {
+            using (Packet _packet = new Packet((int)ServerPackets.playerPosition))
+            {
+                _packet.Write(_toClient);
+                _packet.Write(_x);
+                _packet.Write(_y);
+                SendTCPData(_toClient, _packet);
+            }
+        }
     }
 }

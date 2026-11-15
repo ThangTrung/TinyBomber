@@ -124,6 +124,10 @@ public class Client : MonoBehaviour
                         {
                             ClientHandle.PlayerPosition(_packet);
                         }
+                        else if (_packetId == (int)ServerPackets.mapData)
+                        {
+                            ClientHandle.MapData(_packet);
+                        }
                     }
                 });
 
