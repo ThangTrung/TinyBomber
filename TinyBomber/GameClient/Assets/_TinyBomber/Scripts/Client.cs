@@ -44,6 +44,7 @@ public class Client : MonoBehaviour
         public TcpClient socket;
         private NetworkStream stream;
         private byte[] receiveBuffer;
+        private TcpFrameReader frameReader;
 
         public void Connect()
         {
@@ -54,6 +55,7 @@ public class Client : MonoBehaviour
             };
 
             receiveBuffer = new byte[Constants.DATA_BUFFER_SIZE];
+            frameReader = new TcpFrameReader();
 
             socket.BeginConnect(instance.ip, instance.port, ConnectCallback, socket);
         }
@@ -89,6 +91,37 @@ public class Client : MonoBehaviour
             }
         }
 
+        private void HandleFrame(byte[] _data)
+        {
+            ThreadManager.ExecuteOnMainThread(() =>
+            {
+                using (Packet _packet = new Packet(_data))
+                {
+                    _packet.DecryptPayload();
+                    int _packetLength = _packet.ReadInt();
+                    int _packetId = _packet.ReadInt();
+
+                    // Điều hướng
+                    if (_packetId == (int)ServerPackets.welcome)
+                    {
+                        ClientHandle.Welcome(_packet);
+                    }
+                    else if (_packetId == (int)ServerPackets.spawnPlayer)
+                    {
+                        ClientHandle.SpawnPlayer(_packet);
+                    }
+                    else if (_packetId == (int)ServerPackets.playerPosition)
+                    {
+                        ClientHandle.PlayerPosition(_packet);
+                    }
+                    else if (_packetId == (int)ServerPackets.mapData)
+                    {
+                        ClientHandle.MapData(_packet);
+                    }
+                }
+            });
+        }
+
         private void ReceiveCallback(IAsyncResult _result)
         {
             try
@@ -100,36 +133,7 @@ public class Client : MonoBehaviour
                     return;
                 }
 
-                byte[] _data = new byte[_byteLength];
-                Array.Copy(receiveBuffer, _data, _byteLength);
-
-                ThreadManager.ExecuteOnMainThread(() =>
-                {
-                    using (Packet _packet = new Packet(_data))
-                    {
-                        _packet.DecryptPayload();
-                        int _packetLength = _packet.ReadInt();
-                        int _packetId = _packet.ReadInt();
-
-                        // Điều hướng
-                        if (_packetId == (int)ServerPackets.welcome)
-                        {
-                            ClientHandle.Welcome(_packet);
-                        }
-                        else if (_packetId == (int)ServerPackets.spawnPlayer)
-                        {
-                            ClientHandle.SpawnPlayer(_packet);
-                        }
-                        else if (_packetId == (int)ServerPackets.playerPosition)
-                        {
-                            ClientHandle.PlayerPosition(_packet);
-                        }
-                        else if (_packetId == (int)ServerPackets.mapData)
-                        {
-                            ClientHandle.MapData(_packet);
-                        }
-                    }
-                });
+                frameReader.Feed(receiveBuffer.AsSpan(0, _byteLength), HandleFrame);
 
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
             }

@@ -25,6 +25,7 @@ namespace GameServer
             private readonly int id;
             private NetworkStream stream = null!;
             private byte[] receiveBuffer = null!;
+            private TcpFrameReader frameReader = null!;
 
             public TCP(int _id)
             {
@@ -39,6 +40,7 @@ namespace GameServer
 
                 stream = socket.GetStream();
                 receiveBuffer = new byte[Constants.DATA_BUFFER_SIZE];
+                frameReader = new TcpFrameReader();
 
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
 
@@ -60,6 +62,38 @@ namespace GameServer
                 }
             }
 
+            private void HandleFrame(byte[] _data)
+            {
+                using (Packet _packet = new Packet(_data))
+                {
+                    _packet.DecryptPayload();
+
+                    int _packetLength = _packet.ReadInt();
+                    int _packetId = _packet.ReadInt();
+
+                    if (_packetId == (int)ClientPackets.welcomeReceived)
+                    {
+                        int _clientIdCheck = _packet.ReadInt();
+                        string _username = _packet.ReadString();
+
+                        ThreadManager.EnqueueAction(() =>
+                        {
+                            ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
+                        });
+                    }
+                    else if (_packetId == (int)ClientPackets.playerMovement)
+                    {
+                        float _x = _packet.ReadFloat();
+                        float _y = _packet.ReadFloat();
+
+                        ThreadManager.EnqueueAction(() =>
+                        {
+                            ServerHandle.PlayerMovement(id, _x, _y);
+                        });
+                    }
+                }
+            }
+
             private void ReceiveCallback(IAsyncResult _result)
             {
                 try
@@ -71,37 +105,7 @@ namespace GameServer
                         return;
                     }
 
-                    byte[] _data = new byte[_byteLength];
-                    Array.Copy(receiveBuffer, _data, _byteLength);
-
-                    using (Packet _packet = new Packet(_data))
-                    {
-                        _packet.DecryptPayload();
-
-                        int _packetLength = _packet.ReadInt();
-                        int _packetId = _packet.ReadInt();
-
-                        if (_packetId == (int)ClientPackets.welcomeReceived)
-                        {
-                            int _clientIdCheck = _packet.ReadInt();
-                            string _username = _packet.ReadString();
-
-                            ThreadManager.EnqueueAction(() =>
-                            {
-                                ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
-                            });
-                        }
-                        else if (_packetId == (int)ClientPackets.playerMovement)
-                        {
-                            float _x = _packet.ReadFloat();
-                            float _y = _packet.ReadFloat();
-
-                            ThreadManager.EnqueueAction(() =>
-                            {
-                                ServerHandle.PlayerMovement(id, _x, _y);
-                            });
-                        }
-                    }
+                    frameReader.Feed(receiveBuffer.AsSpan(0, _byteLength), HandleFrame);
 
                     stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
                 }
