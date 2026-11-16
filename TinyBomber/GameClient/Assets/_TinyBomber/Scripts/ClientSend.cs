@@ -17,6 +17,11 @@ public class ClientSend : MonoBehaviour
         Client.instance.udp.SendData(_packet);
     }
 
+    public static void PlaceBomb()
+    {
+        using (var packet = new Packet((int)ClientPackets.placeBomb)) SendTCPData(packet);
+    }
+
     public static void WelcomeReceived()
     {
         using (Packet _packet = new Packet((int)ClientPackets.welcomeReceived))

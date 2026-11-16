@@ -157,6 +157,14 @@ public class Client : MonoBehaviour
                     {
                         ClientHandle.PlayerDisconnected(_packet);
                     }
+                    else if (_packetId == (int)ServerPackets.bombPlaced)
+                    {
+                        ClientHandle.BombPlaced(_packet);
+                    }
+                    else if (_packetId == (int)ServerPackets.bombExploded)
+                    {
+                        ClientHandle.BombExploded(_packet);
+                    }
                 }
             });
         }

@@ -55,6 +55,37 @@ public class ClientHandle : MonoBehaviour
         GameManager.RemovePlayer(packet.ReadInt());
     }
 
+    public static void BombPlaced(Packet packet)
+    {
+        GameManager.instance.ShowBomb(ReadCell(packet));
+    }
+
+    public static void BombExploded(Packet packet)
+    {
+        var origin = ReadCell(packet);
+        var affected = ReadCells(packet);
+        var destroyed = ReadCells(packet);
+        GameManager.instance.ShowExplosion(origin, affected, destroyed);
+    }
+
+    private static Vector2Int ReadCell(Packet packet)
+    {
+        int col = packet.ReadInt(), row = packet.ReadInt();
+        if (col < 0 || col >= Constants.MAP_WIDTH || row < 0 || row >= Constants.MAP_HEIGHT)
+            throw new System.IO.InvalidDataException("Invalid bomb cell");
+        return new Vector2Int(col, row);
+    }
+
+    private static Vector2Int[] ReadCells(Packet packet)
+    {
+        int count = packet.ReadInt();
+        if (count < 0 || count > Constants.MAP_WIDTH * Constants.MAP_HEIGHT || count > packet.UnreadLength() / 8)
+            throw new System.IO.InvalidDataException("Invalid explosion cell count");
+        var cells = new Vector2Int[count];
+        for (int i = 0; i < count; i++) cells[i] = ReadCell(packet);
+        return cells;
+    }
+
     public static void MapData(Packet _packet)
     {
         int[,] _map = new int[Constants.MAP_WIDTH, Constants.MAP_HEIGHT];
