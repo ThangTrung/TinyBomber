@@ -78,6 +78,7 @@ namespace GameServer
 
                         ThreadManager.EnqueueAction(() =>
                         {
+                            if (Server.clients[id].tcp != this) return;
                             ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
                         });
                     }
@@ -88,6 +89,7 @@ namespace GameServer
 
                         ThreadManager.EnqueueAction(() =>
                         {
+                            if (Server.clients[id].tcp != this) return;
                             ServerHandle.PlayerMovement(id, _x, _y);
                         });
                     }
@@ -101,7 +103,7 @@ namespace GameServer
                     int _byteLength = stream.EndRead(_result);
                     if (_byteLength <= 0)
                     {
-                        //disconnect
+                        ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                         return;
                     }
 
@@ -112,6 +114,7 @@ namespace GameServer
                 catch (Exception _ex)
                 {
                     Console.WriteLine($"Loi nhan du lieu tu ID {id}: {_ex}");
+                    ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                 }
             }
         }
@@ -163,6 +166,7 @@ namespace GameServer
 
                             ThreadManager.EnqueueAction(() =>
                             {
+                                if (Server.clients[id].udp != this) return;
                                 ServerHandle.PlayerMovement(id, _x, _y);
                             });
                         }

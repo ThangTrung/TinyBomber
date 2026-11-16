@@ -16,7 +16,9 @@ namespace GameServer
         private static TcpListener tcpListener = null!;
         private static UdpClient udpSocket = null!;
         private static Thread updateThread = null!;
-        private static bool isRunning = false;
+        private static volatile bool isRunning = false;
+        private static volatile bool stopping;
+        private static readonly object slotLock = new object();
 
         public static void Start(int _maxPlayers, int _port)
         {
@@ -68,17 +70,24 @@ namespace GameServer
                     return;
                 }
 
-                if (clients[_clientId].udp.endPoint == null)
+                Client.UDP udp;
+                lock (slotLock)
                 {
-                    clients[_clientId].udp.Connect(_clientEndPoint);
-                    return;
+                    Client slot = clients[_clientId];
+                    if (slot.tcp.socket == null) return;
+                    udp = slot.udp;
+                    if (udp.endPoint == null)
+                    {
+                        if (_data.Length == sizeof(int)) udp.Connect(_clientEndPoint);
+                        return;
+                    }
                 }
 
-                if (clients[_clientId].udp.endPoint!.ToString() == _clientEndPoint.ToString())
+                if (udp.endPoint.Equals(_clientEndPoint) && _data.Length > sizeof(int))
                 {
                     byte[] _encryptedPayload = new byte[_data.Length - 4];
                     Array.Copy(_data, 4, _encryptedPayload, 0, _encryptedPayload.Length);
-                    clients[_clientId].udp.HandleData(_encryptedPayload);
+                    udp.HandleData(_encryptedPayload);
                 }
             }
             catch (Exception _ex)
@@ -135,6 +144,7 @@ namespace GameServer
         public static void Shutdown()
         {
             Console.WriteLine("[INFO] Dang tat may chu...");
+            stopping = true;
             isRunning = false;
 
             if (updateThread != null && updateThread.IsAlive)
@@ -144,24 +154,76 @@ namespace GameServer
 
             tcpListener?.Stop();
             udpSocket?.Close();
+            lock (slotLock)
+            {
+                foreach (var slot in clients.Values) slot.tcp.socket?.Close();
+            }
             Console.WriteLine("[INFO] May chu da tat.");
         }
 
         private static void TCPConnectCallback(IAsyncResult _result)
         {
-            TcpClient _client = tcpListener.EndAcceptTcpClient(_result);
-            tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
+            TcpClient _client;
+            try
+            {
+                _client = tcpListener.EndAcceptTcpClient(_result);
+            }
+            catch (Exception) when (!isRunning)
+            {
+                return;
+            }
+            try
+            {
+                tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
+            }
+            catch (Exception) when (!isRunning)
+            {
+                _client.Close();
+                return;
+            }
             Console.WriteLine($"[KẾT NỐI MỚI] Co nguoi vua truy cap tu IP: {_client.Client.RemoteEndPoint}");
 
-            for (int i = 1; i <= MaxPlayers; i++)
+            lock (slotLock)
             {
-                if (clients[i].tcp.socket == null)
+                if (stopping)
                 {
-                    clients[i].tcp.Connect(_client);
+                    _client.Close();
                     return;
+                }
+                for (int i = 1; i <= MaxPlayers; i++)
+                {
+                    if (clients[i].tcp.socket == null)
+                    {
+                        try { clients[i].tcp.Connect(_client); }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"TCP setup failed for slot {i}: {ex.Message}");
+                            var failed = clients[i].tcp;
+                            int failedId = i;
+                            ThreadManager.EnqueueAction(() => Disconnect(failedId, failed));
+                        }
+                        return;
+                    }
                 }
             }
             Console.WriteLine($"[TỪ CHỐI] Server da day, khong the nhan them {_client.Client.RemoteEndPoint}");
+            _client.Close();
+        }
+
+        public static void Disconnect(int id, Client.TCP connection)
+        {
+            bool hadPlayer;
+            lock (slotLock)
+            {
+                Client slot = clients[id];
+                if (slot.tcp != connection) return;
+                connection.socket?.Close();
+                hadPlayer = slot.player != null;
+                slot.player = null;
+                slot.tcp = new Client.TCP(id);
+                slot.udp = new Client.UDP(id);
+            }
+            if (hadPlayer) ServerSend.PlayerDisconnected(id);
         }
 
         private static void InitializeServerData()

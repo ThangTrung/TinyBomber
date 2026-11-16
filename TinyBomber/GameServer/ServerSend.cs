@@ -54,6 +54,18 @@ namespace GameServer
             }
         }
 
+        public static void PlayerDisconnected(int id)
+        {
+            using var packet = new Packet((int)ServerPackets.playerDisconnected);
+            packet.Write(id);
+            packet.WriteLength();
+            packet.EncryptPayload();
+            foreach (var slot in Server.clients.Values)
+            {
+                if (slot.id != id && slot.player != null) slot.tcp.SendData(packet);
+            }
+        }
+
         public static void BroadcastPlayerPosition(int _playerId, float _x, float _y)
         {
             using (Packet _packet = new Packet((int)ServerPackets.playerPosition))
