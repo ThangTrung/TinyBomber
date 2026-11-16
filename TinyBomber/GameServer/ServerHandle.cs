@@ -25,19 +25,8 @@ namespace GameServer
             // Đồng bộ với người chơi khác
             for (int i = 1; i <= Server.MaxPlayers; i++)
             {
-                if (i != _fromClient && Server.clients[i].player != null)
+                if (i != _fromClient && Server.clients[i].player is Player other)
                 {
-                    Player other = Server.clients[i].player;
-                    ServerSend.SpawnPlayer(i, _fromClient, newPlayer.x, newPlayer.y);
-                    ServerSend.SpawnPlayer(_fromClient, i, other.x, other.y);
-                }
-            }
-
-            for (int i = 1; i <= Server.MaxPlayers; i++)
-            {
-                if (i != _fromClient && Server.clients[i].player != null)
-                {
-                    Player other = Server.clients[i].player!;
                     ServerSend.SpawnPlayer(i, _fromClient, newPlayer.x, newPlayer.y);
                     ServerSend.SpawnPlayer(_fromClient, i, other.x, other.y);
                 }
