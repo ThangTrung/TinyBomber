@@ -82,6 +82,14 @@ namespace GameServer
                             ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
                         });
                     }
+                    else if (_packetId == (int)ClientPackets.placeBomb)
+                    {
+                        ThreadManager.EnqueueAction(() =>
+                        {
+                            Client slot = Server.clients[id];
+                            if (slot.tcp == this && slot.player is Player player) GameLogic.PlaceBomb(player);
+                        });
+                    }
                     else if (_packetId == (int)ClientPackets.playerMovement)
                     {
                         float _x = _packet.ReadFloat();

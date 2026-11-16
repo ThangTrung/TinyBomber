@@ -77,6 +77,43 @@ namespace GameServer
             }
         }
 
+        public static void BombPlaced(int col, int row, int? recipient = null)
+        {
+            using var packet = new Packet((int)ServerPackets.bombPlaced);
+            packet.Write(col);
+            packet.Write(row);
+            if (recipient.HasValue) SendTCPData(recipient.Value, packet);
+            else BroadcastTCP(packet);
+        }
+
+        public static void BombExploded(int col, int row, List<(int, int)> affected, List<(int, int)> destroyed)
+        {
+            using var packet = new Packet((int)ServerPackets.bombExploded);
+            packet.Write(col);
+            packet.Write(row);
+            WriteCells(packet, affected);
+            WriteCells(packet, destroyed);
+            BroadcastTCP(packet);
+        }
+
+        private static void WriteCells(Packet packet, List<(int, int)> cells)
+        {
+            packet.Write(cells.Count);
+            foreach (var (col, row) in cells)
+            {
+                packet.Write(col);
+                packet.Write(row);
+            }
+        }
+
+        private static void BroadcastTCP(Packet packet)
+        {
+            packet.WriteLength();
+            packet.EncryptPayload();
+            foreach (var slot in Server.clients.Values)
+                if (slot.player != null) slot.tcp.SendData(packet);
+        }
+
         public static void SendMapData(int _toClient)
         {
             using (Packet _packet = new Packet((int)ServerPackets.mapData))

@@ -16,6 +16,7 @@ namespace GameServer
             }
 
             ServerSend.SendMapData(_fromClient);
+            GameLogic.SendActiveBombs(_fromClient);
             Player newPlayer = new Player(_fromClient, _username);
             Server.clients[_fromClient].player = newPlayer;
 
@@ -38,7 +39,7 @@ namespace GameServer
             Player? player = Server.clients[_fromClient].player;
             if (player == null || !player.isAlive) return;
 
-            if (GameLogic.CanMoveTo(_x, _y))
+            if (GameLogic.CanMove(player, _x, _y))
             {
                 player.x = _x;
                 player.y = _y;

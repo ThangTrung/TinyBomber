@@ -138,6 +138,7 @@ namespace GameServer
             while (isRunning)
             {
                 ThreadManager.UpdateMain();
+                GameLogic.UpdateBombs();
             }
         }
 

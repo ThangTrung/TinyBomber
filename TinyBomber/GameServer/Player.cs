@@ -10,6 +10,8 @@ namespace GameServer
         public float y;
         public int hp = 1;
         public bool isAlive = true;
+        public int maxActiveBombs = 1;
+        public int blastRange = 1;
 
         private static readonly (float x, float y)[] SpawnPoints = new[]
         {
