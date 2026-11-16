@@ -33,6 +33,23 @@ public class GameManager : MonoBehaviour
         players.Add(_id, _player);
     }
 
+    public static void RemovePlayer(int id)
+    {
+        if (!players.TryGetValue(id, out var player)) return;
+        players.Remove(id);
+        if (player != null) Destroy(player);
+    }
+
+    public static void ClearSession()
+    {
+        foreach (var player in players.Values)
+            if (player != null) Destroy(player);
+        players.Clear();
+        foreach (var block in softBlocks.Values)
+            if (block != null) Destroy(block);
+        softBlocks.Clear();
+    }
+
     public void BuildMap(int[,] _mapData)
     {
         foreach (var block in softBlocks.Values) Destroy(block);

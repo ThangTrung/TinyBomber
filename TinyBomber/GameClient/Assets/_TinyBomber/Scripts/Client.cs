@@ -29,14 +29,30 @@ public class Client : MonoBehaviour
 
     private void Start()
     {
-        tcp = new TCP();
-        udp = new UDP();
         ConnectToServer();
     }
 
     public void ConnectToServer()
     {
+        if (tcp != null) Disconnect();
+        tcp = new TCP();
+        udp = new UDP();
         tcp.Connect();
+    }
+
+    private void Disconnect()
+    {
+        tcp?.Close();
+        udp?.Close();
+        myId = 0;
+        GameManager.ClearSession();
+    }
+
+    private void OnDestroy()
+    {
+        if (instance != this) return;
+        Disconnect();
+        instance = null;
     }
 
     public class TCP
@@ -45,6 +61,23 @@ public class Client : MonoBehaviour
         private NetworkStream stream;
         private byte[] receiveBuffer;
         private TcpFrameReader frameReader;
+        private volatile bool closed;
+
+        public void Close()
+        {
+            closed = true;
+            socket?.Close();
+        }
+
+        private void RequestDisconnect()
+        {
+            if (closed) return;
+            ThreadManager.ExecuteOnMainThread(() =>
+            {
+                if (!closed && instance != null && instance.tcp == this)
+                    instance.Disconnect();
+            });
+        }
 
         public void Connect()
         {
@@ -62,25 +95,26 @@ public class Client : MonoBehaviour
 
         private void ConnectCallback(IAsyncResult _result)
         {
-            socket.EndConnect(_result);
-
-            if (!socket.Connected)
+            try
             {
-                return;
+                socket.EndConnect(_result);
+                if (closed) return;
+                stream = socket.GetStream();
+                Debug.Log($"[THÀNH CÔNG] Đã kết nối tới Server {socket.Client.RemoteEndPoint}");
+                stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
             }
-
-            stream = socket.GetStream();
-
-            Debug.Log($"[THÀNH CÔNG] Đã kết nối tới Server {instance.ip}:{instance.port}");
-
-            stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
+            catch (Exception ex)
+            {
+                if (!closed) Debug.Log($"Lỗi kết nối TCP: {ex.Message}");
+                RequestDisconnect();
+            }
         }
 
         public void SendData(Packet _packet)
         {
             try
             {
-                if (socket != null)
+                if (!closed && socket != null)
                 {
                     stream.BeginWrite(_packet.ToArray(), 0, _packet.Length(), null, null);
                 }
@@ -95,6 +129,7 @@ public class Client : MonoBehaviour
         {
             ThreadManager.ExecuteOnMainThread(() =>
             {
+                if (closed || instance == null || instance.tcp != this) return;
                 using (Packet _packet = new Packet(_data))
                 {
                     _packet.DecryptPayload();
@@ -118,6 +153,10 @@ public class Client : MonoBehaviour
                     {
                         ClientHandle.MapData(_packet);
                     }
+                    else if (_packetId == (int)ServerPackets.playerDisconnected)
+                    {
+                        ClientHandle.PlayerDisconnected(_packet);
+                    }
                 }
             });
         }
@@ -129,7 +168,7 @@ public class Client : MonoBehaviour
                 int _byteLength = stream.EndRead(_result);
                 if (_byteLength <= 0)
                 {
-                    // disconnect
+                    RequestDisconnect();
                     return;
                 }
 
@@ -139,8 +178,8 @@ public class Client : MonoBehaviour
             }
             catch (Exception _ex)
             {
-                Debug.Log($"Lỗi khi nhận dữ liệu TCP: {_ex}");
-                // Disconnect();
+                if (!closed) Debug.Log($"Lỗi khi nhận dữ liệu TCP: {_ex}");
+                RequestDisconnect();
             }
         }
     }
@@ -149,6 +188,13 @@ public class Client : MonoBehaviour
     {
         public UdpClient socket;
         public IPEndPoint endPoint;
+        private volatile bool closed;
+
+        public void Close()
+        {
+            closed = true;
+            socket?.Close();
+        }
 
         public UDP()
         {
@@ -172,7 +218,7 @@ public class Client : MonoBehaviour
             try
             {
                 _packet.InsertInt(instance.myId);
-                if (socket != null)
+                if (!closed && socket != null)
                 {
                     socket.BeginSend(_packet.ToArray(), _packet.Length(), null, null);
                 }
@@ -194,6 +240,7 @@ public class Client : MonoBehaviour
 
                 ThreadManager.ExecuteOnMainThread(() =>
                 {
+                    if (closed || instance == null || instance.udp != this) return;
                     using (Packet _packet = new Packet(_data))
                     {
                         _packet.DecryptPayload();
@@ -209,7 +256,7 @@ public class Client : MonoBehaviour
             }
             catch (Exception _ex)
             {
-                Debug.Log($"Lỗi nhận UDP: {_ex}");
+                if (!closed) Debug.Log($"Lỗi nhận UDP: {_ex}");
             }
         }
     }

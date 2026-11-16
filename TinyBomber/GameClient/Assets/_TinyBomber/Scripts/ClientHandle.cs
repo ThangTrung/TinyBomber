@@ -50,6 +50,11 @@ public class ClientHandle : MonoBehaviour
         }
     }
 
+    public static void PlayerDisconnected(Packet packet)
+    {
+        GameManager.RemovePlayer(packet.ReadInt());
+    }
+
     public static void MapData(Packet _packet)
     {
         int[,] _map = new int[Constants.MAP_WIDTH, Constants.MAP_HEIGHT];
