@@ -76,14 +76,22 @@ namespace GameServer
                     Client slot = clients[_clientId];
                     if (slot.tcp.socket == null) return;
                     udp = slot.udp;
-                    if (udp.endPoint == null)
-                    {
-                        if (_data.Length == sizeof(int)) udp.Connect(_clientEndPoint);
-                        return;
-                    }
                 }
 
-                if (udp.endPoint.Equals(_clientEndPoint) && _data.Length > sizeof(int))
+                if (_data.Length == sizeof(int))
+                {
+                    ThreadManager.EnqueueAction(() =>
+                    {
+                        Client slot = clients[_clientId];
+                        if (slot.udp != udp || slot.Username == null || slot.UdpConfirmed) return;
+
+                        if (udp.endPoint == null) udp.Connect(_clientEndPoint);
+                        if (_clientEndPoint.Equals(udp.endPoint)) ServerSend.UdpProbe(slot);
+                    });
+                    return;
+                }
+
+                if (_clientEndPoint.Equals(udp.endPoint))
                 {
                     byte[] _encryptedPayload = new byte[_data.Length - 4];
                     Array.Copy(_data, 4, _encryptedPayload, 0, _encryptedPayload.Length);
@@ -138,7 +146,7 @@ namespace GameServer
             while (isRunning)
             {
                 ThreadManager.UpdateMain();
-                GameLogic.UpdateBombs();
+                GameLogic.UpdateRound(System.Diagnostics.Stopwatch.GetTimestamp());
             }
         }
 
@@ -214,17 +222,22 @@ namespace GameServer
         public static void Disconnect(int id, Client.TCP connection)
         {
             bool hadPlayer;
+            bool hadHandshake;
             lock (slotLock)
             {
                 Client slot = clients[id];
                 if (slot.tcp != connection) return;
                 connection.socket?.Close();
                 hadPlayer = slot.player != null;
+                hadHandshake = slot.Username != null;
+                slot.Username = null;
+                slot.UdpConfirmed = false;
                 slot.player = null;
                 slot.tcp = new Client.TCP(id);
                 slot.udp = new Client.UDP(id);
             }
             if (hadPlayer) ServerSend.PlayerDisconnected(id);
+            if (hadHandshake) ServerSend.MatchState();
         }
 
         private static void InitializeServerData()

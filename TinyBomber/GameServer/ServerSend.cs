@@ -19,9 +19,9 @@ namespace GameServer
 
             for (int i = 1; i <= Server.MaxPlayers; i++)
             {
-                if (i != _exceptClient && Server.clients[i].tcp.socket != null)
+                if (i != _exceptClient && Server.clients[i].player != null)
                 {
-                    if (Server.clients[i].udp.IsConnected())
+                    if (Server.clients[i].UdpConfirmed)
                     {
                         Server.clients[i].udp.SendData(_packet);
                     }
@@ -43,10 +43,54 @@ namespace GameServer
             }
         }
 
+        internal static void UdpProbe(Client slot)
+        {
+            using var packet = new Packet((int)ServerPackets.udpProbe);
+            packet.Write(slot.tcp.UdpChallenge);
+            packet.WriteLength();
+            packet.EncryptPayload();
+            slot.udp.SendData(packet);
+        }
+
+        internal static void MatchState()
+        {
+            int readyCount = Server.clients.Values.Count(slot => slot.IsReady);
+            foreach (var slot in Server.clients.Values)
+            {
+                if (slot.Username == null) continue;
+
+                using var packet = new Packet((int)ServerPackets.matchState);
+                packet.Write(GameLogic.RoundId);
+                packet.Write((int)GameLogic.Phase);
+                packet.Write(readyCount);
+                packet.Write(GameLogic.WinnerId);
+                packet.Write(slot.IsReady);
+                SendTCPData(slot.id, packet);
+            }
+        }
+
+        internal static void RoundBegin(int recipient, Client[] participants)
+        {
+            using var packet = new Packet((int)ServerPackets.roundBegin);
+            packet.Write(GameLogic.RoundId);
+            packet.Write(participants.Length);
+            foreach (var slot in participants) packet.Write(slot.id);
+            SendTCPData(recipient, packet);
+        }
+
+        internal static void PlayerEliminated(int id)
+        {
+            using var packet = new Packet((int)ServerPackets.playerEliminated);
+            packet.Write(GameLogic.RoundId);
+            packet.Write(id);
+            BroadcastTCP(packet);
+        }
+
         public static void SpawnPlayer(int _toClient, int _playerToSpawnId, float _x, float _y)
         {
             using (Packet _packet = new Packet((int)ServerPackets.spawnPlayer))
             {
+                _packet.Write(GameLogic.RoundId);
                 _packet.Write(_playerToSpawnId);
                 _packet.Write(_x);
                 _packet.Write(_y);
@@ -70,6 +114,7 @@ namespace GameServer
         {
             using (Packet _packet = new Packet((int)ServerPackets.playerPosition))
             {
+                _packet.Write(GameLogic.RoundId);
                 _packet.Write(_playerId);
                 _packet.Write(_x);
                 _packet.Write(_y);
@@ -77,18 +122,19 @@ namespace GameServer
             }
         }
 
-        public static void BombPlaced(int col, int row, int? recipient = null)
+        public static void BombPlaced(int col, int row)
         {
             using var packet = new Packet((int)ServerPackets.bombPlaced);
+            packet.Write(GameLogic.RoundId);
             packet.Write(col);
             packet.Write(row);
-            if (recipient.HasValue) SendTCPData(recipient.Value, packet);
-            else BroadcastTCP(packet);
+            BroadcastTCP(packet);
         }
 
         public static void BombExploded(int col, int row, List<(int, int)> affected, List<(int, int)> destroyed)
         {
             using var packet = new Packet((int)ServerPackets.bombExploded);
+            packet.Write(GameLogic.RoundId);
             packet.Write(col);
             packet.Write(row);
             WriteCells(packet, affected);
@@ -118,6 +164,7 @@ namespace GameServer
         {
             using (Packet _packet = new Packet((int)ServerPackets.mapData))
             {
+                _packet.Write(GameLogic.RoundId);
                 for (int col = 0; col < Constants.MAP_WIDTH; col++)
                 {
                     for (int row = 0; row < Constants.MAP_HEIGHT; row++)
@@ -133,6 +180,7 @@ namespace GameServer
         {
             using (Packet _packet = new Packet((int)ServerPackets.playerPosition))
             {
+                _packet.Write(GameLogic.RoundId);
                 _packet.Write(_toClient);
                 _packet.Write(_x);
                 _packet.Write(_y);

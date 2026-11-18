@@ -16,6 +16,12 @@ public class PlayerController : MonoBehaviour
 
     private void Update()
     {
+        if (!GameManager.instance.CanControl)
+        {
+            moveDir = Vector2.zero;
+            return;
+        }
+
         if (Input.GetKeyDown(KeyCode.Space)) ClientSend.PlaceBomb();
         float x = Input.GetAxisRaw("Horizontal");
         float y = Input.GetAxisRaw("Vertical");
@@ -24,6 +30,12 @@ public class PlayerController : MonoBehaviour
 
     private void FixedUpdate()
     {
+        if (!GameManager.instance.CanControl)
+        {
+            anim.SetBool("IsMoving", false);
+            return;
+        }
+
         Vector2 start = transform.position;
         Vector2 target = GameManager.instance.ResolveMovement(start, moveDir * speed * Time.fixedDeltaTime);
         bool moving = target != start;

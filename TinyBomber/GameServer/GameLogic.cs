@@ -11,6 +11,41 @@ namespace GameServer
         private static readonly List<Bomb> bombs = new();
         private static readonly (int dx, int dy)[] directions = { (1, 0), (-1, 0), (0, 1), (0, -1) };
 
+        internal static MatchPhase Phase { get; private set; }
+        internal static int RoundId { get; private set; }
+        internal static int WinnerId { get; private set; }
+
+        internal static bool AcceptsInput(Player? player, int roundId) =>
+            Phase == MatchPhase.Playing && roundId == RoundId && player is { isAlive: true };
+
+        internal static void StartRound(Client requester, int expectedRoundId)
+        {
+            if (Phase == MatchPhase.Playing || expectedRoundId != RoundId || !requester.IsReady)
+                return;
+
+            var participants = Server.clients.Values.Where(slot => slot.IsReady).ToArray();
+            if (participants.Length < 2) return;
+
+            RoundId++;
+            WinnerId = 0;
+            InitializeMap();
+            foreach (var slot in Server.clients.Values) slot.player = null;
+            foreach (var slot in participants) slot.player = new Player(slot.id, slot.Username!);
+            Phase = MatchPhase.Playing;
+
+            foreach (var slot in participants)
+            {
+                ServerSend.RoundBegin(slot.id, participants);
+                ServerSend.SendMapData(slot.id);
+                foreach (var participant in participants)
+                {
+                    var player = participant.player!;
+                    ServerSend.SpawnPlayer(slot.id, player.id, player.x, player.y);
+                }
+            }
+            ServerSend.MatchState();
+        }
+
         internal static void PlaceBomb(Player player)
         {
             var (col, row) = WorldToGrid(player.x, player.y);
@@ -23,14 +58,13 @@ namespace GameServer
             ServerSend.BombPlaced(col, row);
         }
 
-        internal static void SendActiveBombs(int clientId)
+        internal static void UpdateRound(long now)
         {
-            foreach (var bomb in bombs) ServerSend.BombPlaced(bomb.Col, bomb.Row, clientId);
-        }
+            if (Phase != MatchPhase.Playing) return;
 
-        internal static void UpdateBombs()
-        {
-            long now = Stopwatch.GetTimestamp();
+            var alive = Server.clients.Values.Select(slot => slot.player)
+                .OfType<Player>().Where(player => player.isAlive).ToList();
+            var hit = new HashSet<Player>();
             // With a fixed fuse, insertion order is deadline order.
             while (bombs.Count > 0 && bombs[0].Deadline <= now)
             {
@@ -53,8 +87,28 @@ namespace GameServer
                         }
                     }
                 }
+                foreach (var player in alive)
+                {
+                    if (affected.Contains(WorldToGrid(player.x, player.y))) hit.Add(player);
+                }
+
                 ServerSend.BombExploded(bomb.Col, bomb.Row, affected, destroyed);
             }
+
+            foreach (var player in hit)
+            {
+                player.hp = 0;
+                player.isAlive = false;
+                ServerSend.PlayerEliminated(player.id);
+            }
+
+            alive.RemoveAll(hit.Contains);
+            if (alive.Count > 1) return;
+
+            WinnerId = alive.Count == 1 ? alive[0].id : 0;
+            Phase = MatchPhase.Finished;
+            bombs.Clear();
+            ServerSend.MatchState();
         }
 
         private static bool InBounds(int col, int row) =>

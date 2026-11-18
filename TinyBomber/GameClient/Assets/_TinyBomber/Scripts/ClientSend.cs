@@ -19,7 +19,29 @@ public class ClientSend : MonoBehaviour
 
     public static void PlaceBomb()
     {
-        using (var packet = new Packet((int)ClientPackets.placeBomb)) SendTCPData(packet);
+        using (var packet = new Packet((int)ClientPackets.placeBomb))
+        {
+            packet.Write(GameManager.instance.ActiveRoundId);
+            SendTCPData(packet);
+        }
+    }
+
+    public static void ConfirmUdp(int challenge)
+    {
+        using (var packet = new Packet((int)ClientPackets.udpReady))
+        {
+            packet.Write(challenge);
+            SendTCPData(packet);
+        }
+    }
+
+    public static void RequestStart(int roundId)
+    {
+        using (var packet = new Packet((int)ClientPackets.requestStart))
+        {
+            packet.Write(roundId);
+            SendTCPData(packet);
+        }
     }
 
     public static void WelcomeReceived()
@@ -36,6 +58,7 @@ public class ClientSend : MonoBehaviour
     {
         using (Packet _packet = new Packet((int)ClientPackets.playerMovement))
         {
+            _packet.Write(GameManager.instance.ActiveRoundId);
             _packet.Write(_position.x);
             _packet.Write(_position.y);
             SendUDPData(_packet);

@@ -60,13 +60,26 @@ namespace GameShared
         playerDisconnected,
         mapData,
         bombPlaced,
-        bombExploded
+        bombExploded,
+        udpProbe,
+        matchState,
+        roundBegin,
+        playerEliminated
     }
 
     public enum ClientPackets
     {
         welcomeReceived = 1,
         playerMovement,
-        placeBomb
+        placeBomb,
+        udpReady,
+        requestStart
+    }
+
+    public enum MatchPhase
+    {
+        Waiting,
+        Playing,
+        Finished
     }
 }

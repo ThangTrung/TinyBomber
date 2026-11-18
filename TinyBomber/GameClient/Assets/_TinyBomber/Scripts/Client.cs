@@ -32,6 +32,12 @@ public class Client : MonoBehaviour
         ConnectToServer();
     }
 
+    private void Update()
+    {
+        if (myId != 0 && GameManager.instance && !GameManager.instance.IsReady)
+            udp?.RetryRegistration();
+    }
+
     public void ConnectToServer()
     {
         if (tcp != null) Disconnect();
@@ -165,6 +171,18 @@ public class Client : MonoBehaviour
                     {
                         ClientHandle.BombExploded(_packet);
                     }
+                    else if (_packetId == (int)ServerPackets.roundBegin)
+                    {
+                        ClientHandle.RoundBegin(_packet);
+                    }
+                    else if (_packetId == (int)ServerPackets.matchState)
+                    {
+                        ClientHandle.MatchState(_packet);
+                    }
+                    else if (_packetId == (int)ServerPackets.playerEliminated)
+                    {
+                        ClientHandle.PlayerEliminated(_packet);
+                    }
                 }
             });
         }
@@ -197,6 +215,7 @@ public class Client : MonoBehaviour
         public UdpClient socket;
         public IPEndPoint endPoint;
         private volatile bool closed;
+        private float nextRegistrationAt;
 
         public void Close()
         {
@@ -215,10 +234,15 @@ public class Client : MonoBehaviour
             socket.Connect(endPoint);
             socket.BeginReceive(ReceiveCallback, null);
 
-            using (Packet _packet = new Packet())
-            {
-                SendData(_packet);
-            }
+            RetryRegistration();
+        }
+
+        public void RetryRegistration()
+        {
+            if (closed || socket == null || Time.unscaledTime < nextRegistrationAt) return;
+
+            nextRegistrationAt = Time.unscaledTime + 1f;
+            using (var packet = new Packet()) SendData(packet);
         }
 
         public void SendData(Packet _packet)
@@ -258,6 +282,10 @@ public class Client : MonoBehaviour
                         if (_packetId == (int)ServerPackets.playerPosition)
                         {
                             ClientHandle.PlayerPosition(_packet);
+                        }
+                        else if (_packetId == (int)ServerPackets.udpProbe)
+                        {
+                            ClientSend.ConfirmUdp(_packet.ReadInt());
                         }
                     }
                 });

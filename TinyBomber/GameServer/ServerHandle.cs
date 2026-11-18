@@ -15,29 +15,25 @@ namespace GameServer
                 return;
             }
 
-            ServerSend.SendMapData(_fromClient);
-            GameLogic.SendActiveBombs(_fromClient);
-            Player newPlayer = new Player(_fromClient, _username);
-            Server.clients[_fromClient].player = newPlayer;
-
-            // Báo cho chính người đó vị trí sinh ra (Lấy từ x, y của class Player)
-            ServerSend.SpawnPlayer(_fromClient, _fromClient, newPlayer.x, newPlayer.y);
-
-            // Đồng bộ với người chơi khác
-            for (int i = 1; i <= Server.MaxPlayers; i++)
-            {
-                if (i != _fromClient && Server.clients[i].player is Player other)
-                {
-                    ServerSend.SpawnPlayer(i, _fromClient, newPlayer.x, newPlayer.y);
-                    ServerSend.SpawnPlayer(_fromClient, i, other.x, other.y);
-                }
-            }
+            Client slot = Server.clients[_fromClient];
+            if (slot.Username != null) return;
+            slot.Username = _username;
+            ServerSend.MatchState();
         }
 
-        public static void PlayerMovement(int _fromClient, float _x, float _y)
+        internal static void ConfirmUdp(Client slot, int challenge)
+        {
+            if (slot.Username == null || slot.UdpConfirmed || slot.udp.endPoint == null ||
+                challenge != slot.tcp.UdpChallenge) return;
+
+            slot.UdpConfirmed = true;
+            ServerSend.MatchState();
+        }
+
+        public static void PlayerMovement(int _fromClient, int roundId, float _x, float _y)
         {
             Player? player = Server.clients[_fromClient].player;
-            if (player == null || !player.isAlive) return;
+            if (player == null || !GameLogic.AcceptsInput(player, roundId)) return;
 
             if (GameLogic.CanMove(player, _x, _y))
             {

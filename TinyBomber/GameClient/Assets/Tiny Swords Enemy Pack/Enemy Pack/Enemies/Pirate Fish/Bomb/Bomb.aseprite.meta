@@ -2,7 +2,22 @@ fileFormatVersion: 2
 guid: ab684d5a63e494c48b5643ece7bc2c65
 ScriptedImporter:
   internalIDToNameTable: []
-  externalObjects: {}
+  externalObjects:
+  - first:
+      type: UnityEngine:AnimationClip
+      assembly: UnityEngine.AnimationModule
+      name: FuseLit
+    second: {fileID: 7400000, guid: 428374c17f606c04aa3ed6e34cb36250, type: 2}
+  - first:
+      type: UnityEngine:AnimationClip
+      assembly: UnityEngine.AnimationModule
+      name: Idle
+    second: {fileID: 7400000, guid: 2c6b222bcd7054d40b350426767e6976, type: 2}
+  - first:
+      type: UnityEngine:AnimationClip
+      assembly: UnityEngine.AnimationModule
+      name: Spining
+    second: {fileID: 7400000, guid: b17424e21280b90469c15cabb9091e72, type: 2}
   serializedVersion: 2
   userData: 
   assetBundleName: 
@@ -98,7 +113,7 @@ ScriptedImporter:
     addSortingGroup: 1
     addShadowCasters: 0
   importFileNodeState: 1
-  platformSettingsDirtyTick: 639304568829602553
+  platformSettingsDirtyTick: 639306167940430549
   textureAssetName: 
   singleSpriteImportData:
   - name: 

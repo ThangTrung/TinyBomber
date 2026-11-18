@@ -17,8 +17,43 @@ public class ClientHandle : MonoBehaviour
         Client.instance.udp.Connect(_localPort);
     }
 
+    public static void RoundBegin(Packet packet)
+    {
+        int roundId = packet.ReadInt();
+        int count = packet.ReadInt();
+        if (count < 2 || count > Constants.MAX_PLAYERS || count > packet.UnreadLength() / sizeof(int))
+            throw new System.IO.InvalidDataException("Invalid round roster");
+
+        var roster = new int[count];
+        for (int i = 0; i < count; i++) roster[i] = packet.ReadInt();
+        GameManager.instance.BeginRound(roundId, roster);
+    }
+
+    public static void MatchState(Packet packet)
+    {
+        int roundId = packet.ReadInt();
+        var phase = (MatchPhase)packet.ReadInt();
+        int readyCount = packet.ReadInt();
+        int winner = packet.ReadInt();
+        bool localReady = packet.ReadBool();
+        GameManager.instance.ApplyMatchState(roundId, phase, readyCount, winner, localReady);
+    }
+
+    public static void PlayerEliminated(Packet packet)
+    {
+        if (!IsCurrentRound(packet)) return;
+        GameManager.RemovePlayer(packet.ReadInt());
+    }
+
+    private static bool IsCurrentRound(Packet packet)
+    {
+        int roundId = packet.ReadInt();
+        return roundId > 0 && roundId == GameManager.instance.ActiveRoundId;
+    }
+
     public static void SpawnPlayer(Packet _packet)
     {
+        if (!IsCurrentRound(_packet)) return;
         int _id = _packet.ReadInt();
         float _x = _packet.ReadFloat();
         float _y = _packet.ReadFloat();
@@ -29,6 +64,7 @@ public class ClientHandle : MonoBehaviour
 
     public static void PlayerPosition(Packet _packet)
     {
+        if (!IsCurrentRound(_packet) || !GameManager.instance.IsPlaying) return;
         int _id = _packet.ReadInt();
         float _x = _packet.ReadFloat();
         float _y = _packet.ReadFloat();
@@ -57,11 +93,12 @@ public class ClientHandle : MonoBehaviour
 
     public static void BombPlaced(Packet packet)
     {
-        GameManager.instance.ShowBomb(ReadCell(packet));
+        if (IsCurrentRound(packet)) GameManager.instance.ShowBomb(ReadCell(packet));
     }
 
     public static void BombExploded(Packet packet)
     {
+        if (!IsCurrentRound(packet)) return;
         var origin = ReadCell(packet);
         var affected = ReadCells(packet);
         var destroyed = ReadCells(packet);
@@ -88,6 +125,7 @@ public class ClientHandle : MonoBehaviour
 
     public static void MapData(Packet _packet)
     {
+        if (!IsCurrentRound(_packet)) return;
         int[,] _map = new int[Constants.MAP_WIDTH, Constants.MAP_HEIGHT];
         for (int col = 0; col < Constants.MAP_WIDTH; col++)
         {

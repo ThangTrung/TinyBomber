@@ -9,6 +9,9 @@ namespace GameServer
     {
         public int id;
         public Player? player;
+        internal string? Username { get; set; }
+        internal bool UdpConfirmed { get; set; }
+        internal bool IsReady => Username != null && UdpConfirmed;
         public TCP tcp;
         public UDP udp;
 
@@ -26,6 +29,10 @@ namespace GameServer
             private NetworkStream stream = null!;
             private byte[] receiveBuffer = null!;
             private TcpFrameReader frameReader = null!;
+            private readonly Queue<byte[]> pendingWrites = new();
+            private bool writing;
+            internal int UdpChallenge { get; } =
+                System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue);
 
             public TCP(int _id)
             {
@@ -47,18 +54,43 @@ namespace GameServer
                 ServerSend.Welcome(id, "Chao mung ban den voi may chu Tiny Bomber!");
             }
 
-            public void SendData(Packet _packet)
+            public void SendData(Packet packet)
+            {
+                if (socket == null) return;
+
+                lock (pendingWrites)
+                {
+                    pendingWrites.Enqueue(packet.ToArray());
+                    if (writing) return;
+                    writing = true;
+                }
+
+                _ = WritePending();
+            }
+
+            private async Task WritePending()
             {
                 try
                 {
-                    if (socket != null)
+                    while (true)
                     {
-                        stream.BeginWrite(_packet.ToArray(), 0, _packet.Length(), null, null);
+                        byte[] frame;
+                        lock (pendingWrites)
+                        {
+                            if (!pendingWrites.TryDequeue(out frame!))
+                            {
+                                writing = false;
+                                return;
+                            }
+                        }
+
+                        await stream.WriteAsync(frame.AsMemory()).ConfigureAwait(false);
                     }
                 }
-                catch (Exception _ex)
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {_ex}");
+                    Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {ex.Message}");
+                    ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                 }
             }
 
@@ -76,32 +108,44 @@ namespace GameServer
                         int _clientIdCheck = _packet.ReadInt();
                         string _username = _packet.ReadString();
 
-                        ThreadManager.EnqueueAction(() =>
-                        {
-                            if (Server.clients[id].tcp != this) return;
-                            ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
-                        });
+                        EnqueueCurrent(_ => ServerHandle.WelcomeReceived(id, _clientIdCheck, _username));
                     }
                     else if (_packetId == (int)ClientPackets.placeBomb)
                     {
-                        ThreadManager.EnqueueAction(() =>
+                        int roundId = _packet.ReadInt();
+                        EnqueueCurrent(slot =>
                         {
-                            Client slot = Server.clients[id];
-                            if (slot.tcp == this && slot.player is Player player) GameLogic.PlaceBomb(player);
+                            if (slot.player is Player player && GameLogic.AcceptsInput(player, roundId))
+                                GameLogic.PlaceBomb(player);
                         });
                     }
                     else if (_packetId == (int)ClientPackets.playerMovement)
                     {
+                        int roundId = _packet.ReadInt();
                         float _x = _packet.ReadFloat();
                         float _y = _packet.ReadFloat();
-
-                        ThreadManager.EnqueueAction(() =>
-                        {
-                            if (Server.clients[id].tcp != this) return;
-                            ServerHandle.PlayerMovement(id, _x, _y);
-                        });
+                        EnqueueCurrent(_ => ServerHandle.PlayerMovement(id, roundId, _x, _y));
+                    }
+                    else if (_packetId == (int)ClientPackets.udpReady)
+                    {
+                        int challenge = _packet.ReadInt();
+                        EnqueueCurrent(slot => ServerHandle.ConfirmUdp(slot, challenge));
+                    }
+                    else if (_packetId == (int)ClientPackets.requestStart)
+                    {
+                        int roundId = _packet.ReadInt();
+                        EnqueueCurrent(slot => GameLogic.StartRound(slot, roundId));
                     }
                 }
+            }
+
+            private void EnqueueCurrent(Action<Client> action)
+            {
+                ThreadManager.EnqueueAction(() =>
+                {
+                    Client slot = Server.clients[id];
+                    if (slot.tcp == this) action(slot);
+                });
             }
 
             private void ReceiveCallback(IAsyncResult _result)
@@ -128,7 +172,7 @@ namespace GameServer
         }
         public class UDP
         {
-            public IPEndPoint? endPoint;
+            public volatile IPEndPoint? endPoint;
             private readonly int id;
 
             public UDP(int _id)
@@ -142,17 +186,10 @@ namespace GameServer
                 Console.WriteLine($"[UDP] Client {id} UDP endpoint discovered: {endPoint}");
             }
 
-            public bool IsConnected()
-            {
-                return endPoint != null;
-            }
-
             public void SendData(Packet _packet)
             {
-                if (endPoint != null)
-                {
-                    Server.SendUDPData(endPoint, _packet);
-                }
+                var recipient = endPoint;
+                if (recipient != null) Server.SendUDPData(recipient, _packet);
             }
 
             public void HandleData(byte[] _packetData)
@@ -169,13 +206,14 @@ namespace GameServer
                         if (_packetId == (int)ClientPackets.playerMovement)
                         {
                             // Bóc tách dữ liệu nguyên thủy ngay trên luồng mạng trước khi Packet bị Dispose
+                            int roundId = _packet.ReadInt();
                             float _x = _packet.ReadFloat();
                             float _y = _packet.ReadFloat();
 
                             ThreadManager.EnqueueAction(() =>
                             {
                                 if (Server.clients[id].udp != this) return;
-                                ServerHandle.PlayerMovement(id, _x, _y);
+                                ServerHandle.PlayerMovement(id, roundId, _x, _y);
                             });
                         }
                     }
