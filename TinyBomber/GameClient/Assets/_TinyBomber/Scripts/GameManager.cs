@@ -14,8 +14,30 @@ public class GameManager : MonoBehaviour
     public GameObject bombPrefab;
     private readonly Dictionary<Vector2Int, GameObject> bombs = new Dictionary<Vector2Int, GameObject>();
     private Sprite blastSprite;
+    private int[,] terrain;
 
     private static Vector2 CellCenter(Vector2Int cell) => new Vector2(cell.x - 8.5f, cell.y - 7.5f);
+
+    public Vector2 ResolveMovement(Vector2 start, Vector2 step)
+    {
+        if (terrain == null || step == Vector2.zero) return start;
+        Vector2 target = start + step;
+        if (CanStep(start, target)) return target;
+        if (step.x == 0f || step.y == 0f) return start;
+
+        Vector2 alongX = new Vector2(target.x, start.y);
+        Vector2 alongY = new Vector2(start.x, target.y);
+        bool preferX = Mathf.Abs(step.x) >= Mathf.Abs(step.y);
+        Vector2 first = preferX ? alongX : alongY;
+        Vector2 second = preferX ? alongY : alongX;
+        if (CanStep(start, first)) return first;
+        return CanStep(start, second) ? second : start;
+    }
+
+    private bool CanStep(Vector2 start, Vector2 target)
+    {
+        return TerrainCollision.CanStandAt(terrain, target.x, target.y) && !BombBlocksStep(start, target);
+    }
 
     public bool BombBlocksStep(Vector2 start, Vector2 target)
     {
@@ -40,6 +62,7 @@ public class GameManager : MonoBehaviour
         }
         foreach (var cell in destroyed)
         {
+            if (terrain != null) terrain[cell.x, cell.y] = 0;
             if (!softBlocks.TryGetValue(cell, out var block)) continue;
             softBlocks.Remove(cell);
             Destroy(block);
@@ -96,6 +119,7 @@ public class GameManager : MonoBehaviour
     {
         if (instance)
         {
+            instance.terrain = null;
             foreach (var bomb in instance.bombs.Values)
                 if (bomb) Destroy(bomb);
             instance.bombs.Clear();
@@ -110,6 +134,7 @@ public class GameManager : MonoBehaviour
 
     public void BuildMap(int[,] _mapData)
     {
+        terrain = _mapData;
         foreach (var block in softBlocks.Values) Destroy(block);
         softBlocks.Clear();
 

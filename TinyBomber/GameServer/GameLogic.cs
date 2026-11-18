@@ -136,9 +136,7 @@ namespace GameServer
 
         public static (int col, int row) WorldToGrid(float worldX, float worldY)
         {
-            int col = (int)Math.Floor(worldX) + 9;
-            int row = (int)Math.Floor(worldY) + 8;
-            return (col, row);
+            return TerrainCollision.WorldToGrid(worldX, worldY);
         }
 
         public static (float x, float y) GridToWorld(int col, int row)
@@ -148,19 +146,7 @@ namespace GameServer
 
         public static bool CanMoveTo(float targetX, float targetY)
         {
-            float r = BombCollision.PlayerRadius;
-            return IsWalkable(targetX - r, targetY - r) &&
-                   IsWalkable(targetX + r, targetY - r) &&
-                   IsWalkable(targetX - r, targetY + r) &&
-                   IsWalkable(targetX + r, targetY + r);
-        }
-
-        private static bool IsWalkable(float wx, float wy)
-        {
-            var (col, row) = WorldToGrid(wx, wy);
-            if (col < 0 || col >= Constants.MAP_WIDTH || row < 0 || row >= Constants.MAP_HEIGHT)
-                return false;
-            return mapData[col, row] == 0;
+            return TerrainCollision.CanStandAt(mapData, targetX, targetY);
         }
     }
 }
