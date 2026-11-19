@@ -4,32 +4,38 @@ using UnityEngine.UI;
 
 internal sealed class RoomLobbyUi
 {
+    private readonly GameObject connectionControls;
+    private readonly InputField addressInput;
+    private readonly Button connectButton;
     private readonly GameObject lobbyControls;
     private readonly GameObject roomControls;
     private readonly Button createButton;
+    private readonly Button changeServer;
     private readonly Button joinButton;
     private readonly Button leaveButton;
     private readonly InputField codeInput;
     private readonly Text roomCode;
 
-    public RoomLobbyUi(Transform canvas, Action create, Action<string> join, Action leave)
+    public RoomLobbyUi(Transform canvas, Client client, Action create, Action<string> join, Action leave)
     {
+        connectionControls = new GameObject("Server Selection", typeof(RectTransform));
+        Place(connectionControls, canvas, 16, -68, 320, 90);
+        addressInput = AddInput("Địa chỉ server", connectionControls.transform, 0, 0, 320);
+        addressInput.characterLimit = 253;
+        addressInput.text = client.ip;
+        connectButton = AddButton("Kết nối", connectionControls.transform, 0, -48, 160);
+        connectButton.onClick.AddListener(() => client.ConnectToServer(addressInput.text));
+
         lobbyControls = new GameObject("Lobby Controls", typeof(RectTransform));
         Place(lobbyControls, canvas, 16, -68, 272, 100);
         createButton = AddButton("Tạo phòng", lobbyControls.transform, 0, 0, 160);
         createButton.onClick.AddListener(() => create());
 
-        var input = DefaultControls.CreateInputField(default);
-        input.name = "Room Code Input";
-        Place(input, lobbyControls.transform, 0, -48, 136, 40);
-        codeInput = input.GetComponent<InputField>();
+        changeServer = AddButton("Đổi server", lobbyControls.transform, 172, 0, 128);
+        changeServer.onClick.AddListener(client.ReturnToServerSelection);
+        codeInput = AddInput("Mã phòng", lobbyControls.transform, 0, -48, 136);
         codeInput.contentType = InputField.ContentType.IntegerNumber;
         codeInput.characterLimit = 10;
-        codeInput.textComponent.fontSize = 18;
-        var placeholder = (Text)codeInput.placeholder;
-        placeholder.font = codeInput.textComponent.font;
-        placeholder.text = "Mã phòng";
-        placeholder.fontSize = 18;
 
         joinButton = AddButton("Vào phòng", lobbyControls.transform, 144, -48, 128);
         joinButton.onClick.AddListener(() => join(codeInput.text));
@@ -49,12 +55,16 @@ internal sealed class RoomLobbyUi
         roomCode.raycastTarget = false;
     }
 
-    public void Refresh(bool connected, int roomId, bool requestPending)
+    public void Refresh(bool connected, int roomId, bool requestPending, bool connecting)
     {
         bool inRoom = roomId > 0;
-        lobbyControls.SetActive(!inRoom);
-        roomControls.SetActive(inRoom);
-        createButton.interactable = connected && !requestPending;
+        connectionControls.SetActive(!connected);
+        addressInput.interactable = !connecting;
+        connectButton.interactable = !connecting;
+        lobbyControls.SetActive(connected && !inRoom);
+        roomControls.SetActive(connected && inRoom);
+        createButton.interactable = !requestPending;
+        changeServer.interactable = !requestPending;
         joinButton.interactable = createButton.interactable;
         codeInput.interactable = createButton.interactable;
         leaveButton.interactable = !requestPending;
@@ -63,8 +73,23 @@ internal sealed class RoomLobbyUi
 
     public void Destroy()
     {
+        UnityEngine.Object.Destroy(connectionControls);
         UnityEngine.Object.Destroy(lobbyControls);
         UnityEngine.Object.Destroy(roomControls);
+    }
+
+    private static InputField AddInput(string hint, Transform parent, float x, float y, float width)
+    {
+        var control = DefaultControls.CreateInputField(default);
+        control.name = hint;
+        Place(control, parent, x, y, width, 40);
+        var input = control.GetComponent<InputField>();
+        input.textComponent.fontSize = 18;
+        var placeholder = (Text)input.placeholder;
+        placeholder.font = input.textComponent.font;
+        placeholder.text = hint;
+        placeholder.fontSize = 18;
+        return input;
     }
 
     private static Button AddButton(string caption, Transform parent, float x, float y, float width)

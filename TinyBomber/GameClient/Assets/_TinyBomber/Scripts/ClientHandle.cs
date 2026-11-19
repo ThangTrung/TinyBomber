@@ -1,5 +1,4 @@
-﻿using System.Net;
-using UnityEngine;
+﻿using UnityEngine;
 using GameShared;
 
 public class ClientHandle : MonoBehaviour
@@ -10,11 +9,7 @@ public class ClientHandle : MonoBehaviour
         int _myId = _packet.ReadInt();
 
         Debug.Log($"[SERVER NÓI]: {_msg}");
-        Client.instance.myId = _myId;
-        ClientSend.WelcomeReceived();
-
-        int _localPort = ((IPEndPoint)Client.instance.tcp.socket.Client.LocalEndPoint).Port;
-        Client.instance.udp.Connect(_localPort);
+        Client.instance.BeginUdpHandshake(_myId);
     }
 
     public static void RoundBegin(Packet packet)

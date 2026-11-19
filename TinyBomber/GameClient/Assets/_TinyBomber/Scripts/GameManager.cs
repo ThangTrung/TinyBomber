@@ -29,6 +29,7 @@ public class GameManager : MonoBehaviour
     private RoomLobbyUi roomUi;
     private bool roomRequestPending;
     private string roomError;
+    private string connectionStatus = "Nhập địa chỉ server.";
 
     public int RoomId { get; private set; }
     public int ActiveRoundId { get; private set; }
@@ -39,6 +40,12 @@ public class GameManager : MonoBehaviour
         players.ContainsKey(Client.instance.myId);
     private bool CanRequestStart => RoomId > 0 && !roomRequestPending &&
         readyCount >= 2 && phase != MatchPhase.Playing;
+
+    public void SetConnectionStatus(string status)
+    {
+        connectionStatus = status;
+        RefreshMatchUi();
+    }
 
     public void ConfirmLobbyReady()
     {
@@ -139,7 +146,8 @@ public class GameManager : MonoBehaviour
 
     private void RefreshMatchUi()
     {
-        roomUi?.Refresh(IsReady, RoomId, roomRequestPending);
+        roomUi?.Refresh(IsReady, RoomId, roomRequestPending,
+            Client.instance && Client.instance.IsConnecting);
         if (matchButton)
         {
             matchButton.gameObject.SetActive(RoomId > 0 && phase != MatchPhase.Playing);
@@ -148,7 +156,7 @@ public class GameManager : MonoBehaviour
         if (matchButtonLabel) matchButtonLabel.text = phase == MatchPhase.Finished ? "Chơi lại" : "Bắt đầu";
         if (!matchStatus) return;
 
-        if (!IsReady) matchStatus.text = "Đang kết nối…";
+        if (!IsReady) matchStatus.text = connectionStatus;
         else if (roomRequestPending) matchStatus.text = RoomId == 0 ? "Đang vào phòng…" : "Đang rời phòng…";
         else if (roomError != null) matchStatus.text = roomError;
         else if (RoomId == 0) matchStatus.text = "Tạo phòng hoặc nhập mã";
@@ -252,12 +260,17 @@ public class GameManager : MonoBehaviour
         }
 
         instance = this;
-        if (matchButton)
-        {
-            matchButton.onClick.AddListener(RequestStartOrReplay);
-            var canvas = matchButton.GetComponentInParent<Canvas>();
-            if (canvas) roomUi = new RoomLobbyUi(canvas.transform, CreateRoom, JoinRoom, LeaveRoom);
-        }
+        if (matchButton) matchButton.onClick.AddListener(RequestStartOrReplay);
+        RefreshMatchUi();
+    }
+
+    private void Start()
+    {
+        if (instance != this || !matchButton || !Client.instance) return;
+
+        var canvas = matchButton.GetComponentInParent<Canvas>();
+        if (canvas)
+            roomUi = new RoomLobbyUi(canvas.transform, Client.instance, CreateRoom, JoinRoom, LeaveRoom);
         RefreshMatchUi();
     }
 
@@ -290,11 +303,12 @@ public class GameManager : MonoBehaviour
         if (instance) instance.RefreshMatchUi();
     }
 
-    public static void ClearSession()
+    public static void ClearSession(string status)
     {
         if (!instance) return;
 
         instance.IsReady = false;
+        instance.connectionStatus = status;
         instance.ChangeRoom(0);
     }
 

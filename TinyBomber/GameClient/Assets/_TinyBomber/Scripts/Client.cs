@@ -13,6 +13,10 @@ public class Client : MonoBehaviour
 
     public TCP tcp;
     public UDP udp;
+    public bool IsConnecting { get; private set; }
+
+    private const float ConnectionTimeout = 8f;
+    private float handshakeDeadline;
 
     private void Awake()
     {
@@ -27,37 +31,99 @@ public class Client : MonoBehaviour
         }
     }
 
-    private void Start()
-    {
-        ConnectToServer();
-    }
-
     private void Update()
     {
-        if (myId != 0 && GameManager.instance && !GameManager.instance.IsReady)
-            udp?.RetryRegistration();
+        if (!IsConnecting) return;
+
+        if (Time.realtimeSinceStartup >= handshakeDeadline)
+        {
+            Disconnect(myId == 0
+                ? "Máy chủ không phản hồi qua TCP."
+                : "Máy chủ chưa xác nhận kết nối UDP.");
+            return;
+        }
+
+        udp?.RetryRegistration();
     }
 
-    public void ConnectToServer()
+    public void ConnectToServer(string address)
     {
-        if (tcp != null) Disconnect();
+        if (tcp != null || !GameManager.instance) return;
+
+        address = address.Trim();
+        UriHostNameType hostType = Uri.CheckHostName(address);
+        if (hostType != UriHostNameType.IPv4 && hostType != UriHostNameType.Dns)
+        {
+            GameManager.instance.SetConnectionStatus("Nhập địa chỉ IPv4 hoặc tên máy chủ hợp lệ.");
+            return;
+        }
+
+        IsConnecting = true;
+        handshakeDeadline = Time.realtimeSinceStartup + ConnectionTimeout;
+        GameManager.instance.SetConnectionStatus("Đang kết nối TCP…");
         tcp = new TCP();
-        udp = new UDP();
-        tcp.Connect();
+        try
+        {
+            tcp.Connect(address, port);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"Lỗi kết nối TCP: {ex.Message}");
+            Disconnect("Không kết nối được tới máy chủ.");
+        }
     }
 
-    private void Disconnect()
+    public void BeginUdpHandshake(int clientId)
     {
+        if (!IsConnecting || udp != null) return;
+
+        myId = clientId;
+        ClientSend.WelcomeReceived();
+        handshakeDeadline = Time.realtimeSinceStartup + ConnectionTimeout;
+        GameManager.instance.SetConnectionStatus("Đang xác nhận UDP…");
+
+        try
+        {
+            // Use the actual IPv4 peer selected by TCP, including when connecting by hostname.
+            var server = (IPEndPoint)tcp.socket.Client.RemoteEndPoint;
+            udp = new UDP(server.Address);
+            udp.Connect();
+        }
+        catch (SocketException ex)
+        {
+            Debug.LogWarning($"Lỗi khởi tạo UDP: {ex.Message}");
+            Disconnect("Không mở được kết nối UDP.");
+        }
+    }
+
+    private void FinishHandshake()
+    {
+        if (!IsConnecting || udp == null) return;
+
+        IsConnecting = false;
+        GameManager.instance.ConfirmLobbyReady();
+    }
+
+    public void ReturnToServerSelection()
+    {
+        Disconnect("Nhập địa chỉ server.");
+    }
+
+    private void Disconnect(string status)
+    {
+        IsConnecting = false;
         tcp?.Close();
         udp?.Close();
+        tcp = null;
+        udp = null;
         myId = 0;
-        GameManager.ClearSession();
+        GameManager.ClearSession(status);
     }
 
     private void OnDestroy()
     {
         if (instance != this) return;
-        Disconnect();
+        Disconnect("Đã ngắt kết nối với máy chủ.");
         instance = null;
     }
 
@@ -75,19 +141,19 @@ public class Client : MonoBehaviour
             socket?.Close();
         }
 
-        private void RequestDisconnect()
+        private void RequestDisconnect(string status)
         {
             if (closed) return;
             ThreadManager.ExecuteOnMainThread(() =>
             {
                 if (!closed && instance != null && instance.tcp == this)
-                    instance.Disconnect();
+                    instance.Disconnect(status);
             });
         }
 
-        public void Connect()
+        public void Connect(string address, int port)
         {
-            socket = new TcpClient
+            socket = new TcpClient(AddressFamily.InterNetwork)
             {
                 ReceiveBufferSize = Constants.DATA_BUFFER_SIZE,
                 SendBufferSize = Constants.DATA_BUFFER_SIZE
@@ -96,7 +162,7 @@ public class Client : MonoBehaviour
             receiveBuffer = new byte[Constants.DATA_BUFFER_SIZE];
             frameReader = new TcpFrameReader();
 
-            socket.BeginConnect(instance.ip, instance.port, ConnectCallback, socket);
+            socket.BeginConnect(address, port, ConnectCallback, null);
         }
 
         private void ConnectCallback(IAsyncResult _result)
@@ -112,7 +178,7 @@ public class Client : MonoBehaviour
             catch (Exception ex)
             {
                 if (!closed) Debug.Log($"Lỗi kết nối TCP: {ex.Message}");
-                RequestDisconnect();
+                RequestDisconnect("Không kết nối được tới máy chủ.");
             }
         }
 
@@ -127,7 +193,8 @@ public class Client : MonoBehaviour
             }
             catch (Exception _ex)
             {
-                Debug.Log($"Lỗi gửi dữ liệu TCP tới server: {_ex}");
+                if (!closed) Debug.Log($"Lỗi gửi dữ liệu TCP tới server: {_ex}");
+                RequestDisconnect("Đã mất kết nối với máy chủ.");
             }
         }
 
@@ -185,7 +252,7 @@ public class Client : MonoBehaviour
                     }
                     else if (_packetId == (int)ServerPackets.lobbyReady)
                     {
-                        GameManager.instance.ConfirmLobbyReady();
+                        instance.FinishHandshake();
                     }
                     else if (_packetId == (int)ServerPackets.roomChanged)
                     {
@@ -206,7 +273,7 @@ public class Client : MonoBehaviour
                 int _byteLength = stream.EndRead(_result);
                 if (_byteLength <= 0)
                 {
-                    RequestDisconnect();
+                    RequestDisconnect("Máy chủ đã đóng kết nối.");
                     return;
                 }
 
@@ -217,7 +284,7 @@ public class Client : MonoBehaviour
             catch (Exception _ex)
             {
                 if (!closed) Debug.Log($"Lỗi khi nhận dữ liệu TCP: {_ex}");
-                RequestDisconnect();
+                RequestDisconnect("Đã mất kết nối với máy chủ.");
             }
         }
     }
@@ -225,7 +292,7 @@ public class Client : MonoBehaviour
     public class UDP
     {
         public UdpClient socket;
-        public IPEndPoint endPoint;
+        private readonly IPEndPoint serverEndPoint;
         private volatile bool closed;
         private float nextRegistrationAt;
 
@@ -235,15 +302,15 @@ public class Client : MonoBehaviour
             socket?.Close();
         }
 
-        public UDP()
+        public UDP(IPAddress address)
         {
-            endPoint = new IPEndPoint(IPAddress.Parse(instance.ip), Constants.UDP_PORT);
+            serverEndPoint = new IPEndPoint(address, Constants.UDP_PORT);
         }
 
-        public void Connect(int _localPort)
+        public void Connect()
         {
-            socket = new UdpClient(_localPort);
-            socket.Connect(endPoint);
+            socket = new UdpClient(0);
+            socket.Connect(serverEndPoint);
             socket.BeginReceive(ReceiveCallback, null);
 
             RetryRegistration();
@@ -277,7 +344,8 @@ public class Client : MonoBehaviour
         {
             try
             {
-                byte[] _data = socket.EndReceive(_result, ref endPoint);
+                IPEndPoint sender = null;
+                byte[] _data = socket.EndReceive(_result, ref sender);
                 socket.BeginReceive(ReceiveCallback, null);
 
                 if (_data.Length < 4) return;
