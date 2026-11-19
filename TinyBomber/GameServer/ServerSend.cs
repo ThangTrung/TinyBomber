@@ -1,145 +1,119 @@
-﻿using System;
 using GameShared;
 
 namespace GameServer
 {
-    class ServerSend
+    static class ServerSend
     {
-        private static void SendTCPData(int _toClient, Packet _packet)
+        private static void SendTCPData(Client.TCP connection, Packet packet)
         {
-            _packet.WriteLength();
-            _packet.EncryptPayload();
-            Server.clients[_toClient].tcp.SendData(_packet);
+            Prepare(packet);
+            connection.SendData(packet);
         }
 
-        private static void SendUDPDataToAll(int _exceptClient, Packet _packet)
+        private static void Prepare(Packet packet)
         {
-            _packet.WriteLength();
-            _packet.EncryptPayload();
-
-            for (int i = 1; i <= Server.MaxPlayers; i++)
-            {
-                if (i != _exceptClient && Server.clients[i].player != null)
-                {
-                    if (Server.clients[i].UdpConfirmed)
-                    {
-                        Server.clients[i].udp.SendData(_packet);
-                    }
-                    else
-                    {
-                        Server.clients[i].tcp.SendData(_packet);
-                    }
-                }
-            }
+            packet.WriteLength();
+            packet.EncryptPayload();
         }
 
-        public static void Welcome(int _toClient, string _msg)
+        public static void Welcome(Client.TCP connection, int clientId, string message)
         {
-            using (Packet _packet = new Packet((int)ServerPackets.welcome))
-            {
-                _packet.Write(_msg);
-                _packet.Write(_toClient);
-                SendTCPData(_toClient, _packet);
-            }
+            using var packet = new Packet((int)ServerPackets.welcome);
+            packet.Write(message);
+            packet.Write(clientId);
+            SendTCPData(connection, packet);
         }
 
         internal static void UdpProbe(Client slot)
         {
             using var packet = new Packet((int)ServerPackets.udpProbe);
             packet.Write(slot.tcp.UdpChallenge);
-            packet.WriteLength();
-            packet.EncryptPayload();
+            Prepare(packet);
             slot.udp.SendData(packet);
         }
 
-        internal static void MatchState()
+        internal static void MatchState(GameLogic room)
         {
-            int readyCount = Server.clients.Values.Count(slot => slot.IsReady);
-            foreach (var slot in Server.clients.Values)
+            int readyCount = room.Members.Count(slot => slot.IsReady);
+            foreach (var slot in room.Members)
             {
                 if (slot.Username == null) continue;
 
                 using var packet = new Packet((int)ServerPackets.matchState);
-                packet.Write(GameLogic.RoundId);
-                packet.Write((int)GameLogic.Phase);
+                packet.Write(room.RoundId);
+                packet.Write((int)room.Phase);
                 packet.Write(readyCount);
-                packet.Write(GameLogic.WinnerId);
+                packet.Write(room.WinnerId);
                 packet.Write(slot.IsReady);
-                SendTCPData(slot.id, packet);
+                SendTCPData(slot.tcp, packet);
             }
         }
 
-        internal static void RoundBegin(int recipient, Client[] participants)
+        internal static void RoundBegin(GameLogic room, Client recipient, Client[] participants)
         {
             using var packet = new Packet((int)ServerPackets.roundBegin);
-            packet.Write(GameLogic.RoundId);
+            packet.Write(room.RoundId);
             packet.Write(participants.Length);
             foreach (var slot in participants) packet.Write(slot.id);
-            SendTCPData(recipient, packet);
+            SendTCPData(recipient.tcp, packet);
         }
 
-        internal static void PlayerEliminated(int id)
+        internal static void PlayerEliminated(GameLogic room, int id)
         {
             using var packet = new Packet((int)ServerPackets.playerEliminated);
-            packet.Write(GameLogic.RoundId);
+            packet.Write(room.RoundId);
             packet.Write(id);
-            BroadcastTCP(packet);
+            BroadcastTCP(room, packet);
         }
 
-        public static void SpawnPlayer(int _toClient, int _playerToSpawnId, float _x, float _y)
+        internal static void SpawnPlayer(GameLogic room, Client recipient, Player player)
         {
-            using (Packet _packet = new Packet((int)ServerPackets.spawnPlayer))
-            {
-                _packet.Write(GameLogic.RoundId);
-                _packet.Write(_playerToSpawnId);
-                _packet.Write(_x);
-                _packet.Write(_y);
-                SendTCPData(_toClient, _packet);
-            }
+            using var packet = new Packet((int)ServerPackets.spawnPlayer);
+            WritePosition(packet, room, player);
+            SendTCPData(recipient.tcp, packet);
         }
 
-        public static void PlayerDisconnected(int id)
+        internal static void PlayerDisconnected(GameLogic room, int id)
         {
             using var packet = new Packet((int)ServerPackets.playerDisconnected);
             packet.Write(id);
-            packet.WriteLength();
-            packet.EncryptPayload();
-            foreach (var slot in Server.clients.Values)
-            {
-                if (slot.id != id && slot.player != null) slot.tcp.SendData(packet);
-            }
+            BroadcastTCP(room, packet);
         }
 
-        public static void BroadcastPlayerPosition(int _playerId, float _x, float _y)
+        internal static void BroadcastPlayerPosition(GameLogic room, Player player)
         {
-            using (Packet _packet = new Packet((int)ServerPackets.playerPosition))
+            using var packet = new Packet((int)ServerPackets.playerPosition);
+            WritePosition(packet, room, player);
+            Prepare(packet);
+
+            foreach (var slot in room.Members)
             {
-                _packet.Write(GameLogic.RoundId);
-                _packet.Write(_playerId);
-                _packet.Write(_x);
-                _packet.Write(_y);
-                SendUDPDataToAll(_playerId, _packet);
+                if (slot.id == player.id || slot.player == null) continue;
+
+                if (slot.UdpConfirmed) slot.udp.SendData(packet);
+                else slot.tcp.SendData(packet);
             }
         }
 
-        public static void BombPlaced(int col, int row)
+        internal static void BombPlaced(GameLogic room, int col, int row)
         {
             using var packet = new Packet((int)ServerPackets.bombPlaced);
-            packet.Write(GameLogic.RoundId);
+            packet.Write(room.RoundId);
             packet.Write(col);
             packet.Write(row);
-            BroadcastTCP(packet);
+            BroadcastTCP(room, packet);
         }
 
-        public static void BombExploded(int col, int row, List<(int, int)> affected, List<(int, int)> destroyed)
+        internal static void BombExploded(GameLogic room, int col, int row,
+            List<(int, int)> affected, List<(int, int)> destroyed)
         {
             using var packet = new Packet((int)ServerPackets.bombExploded);
-            packet.Write(GameLogic.RoundId);
+            packet.Write(room.RoundId);
             packet.Write(col);
             packet.Write(row);
             WriteCells(packet, affected);
             WriteCells(packet, destroyed);
-            BroadcastTCP(packet);
+            BroadcastTCP(room, packet);
         }
 
         private static void WriteCells(Packet packet, List<(int, int)> cells)
@@ -152,40 +126,38 @@ namespace GameServer
             }
         }
 
-        private static void BroadcastTCP(Packet packet)
+        private static void BroadcastTCP(GameLogic room, Packet packet)
         {
-            packet.WriteLength();
-            packet.EncryptPayload();
-            foreach (var slot in Server.clients.Values)
+            Prepare(packet);
+            foreach (var slot in room.Members)
                 if (slot.player != null) slot.tcp.SendData(packet);
         }
 
-        public static void SendMapData(int _toClient)
+        internal static void SendMapData(GameLogic room, Client recipient)
         {
-            using (Packet _packet = new Packet((int)ServerPackets.mapData))
+            using var packet = new Packet((int)ServerPackets.mapData);
+            packet.Write(room.RoundId);
+            for (int col = 0; col < Constants.MAP_WIDTH; col++)
             {
-                _packet.Write(GameLogic.RoundId);
-                for (int col = 0; col < Constants.MAP_WIDTH; col++)
-                {
-                    for (int row = 0; row < Constants.MAP_HEIGHT; row++)
-                    {
-                        _packet.Write(GameLogic.mapData[col, row]);
-                    }
-                }
-                SendTCPData(_toClient, _packet);
+                for (int row = 0; row < Constants.MAP_HEIGHT; row++)
+                    packet.Write(room.mapData[col, row]);
             }
+            SendTCPData(recipient.tcp, packet);
         }
 
-        public static void SnapPlayerPosition(int _toClient, float _x, float _y)
+        internal static void SnapPlayerPosition(GameLogic room, Client recipient, Player player)
         {
-            using (Packet _packet = new Packet((int)ServerPackets.playerPosition))
-            {
-                _packet.Write(GameLogic.RoundId);
-                _packet.Write(_toClient);
-                _packet.Write(_x);
-                _packet.Write(_y);
-                SendTCPData(_toClient, _packet);
-            }
+            using var packet = new Packet((int)ServerPackets.playerPosition);
+            WritePosition(packet, room, player);
+            SendTCPData(recipient.tcp, packet);
+        }
+
+        private static void WritePosition(Packet packet, GameLogic room, Player player)
+        {
+            packet.Write(room.RoundId);
+            packet.Write(player.id);
+            packet.Write(player.x);
+            packet.Write(player.y);
         }
     }
 }

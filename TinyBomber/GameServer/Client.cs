@@ -9,6 +9,7 @@ namespace GameServer
     {
         public int id;
         public Player? player;
+        internal GameLogic? Room { get; set; }
         internal string? Username { get; set; }
         internal bool UdpConfirmed { get; set; }
         internal bool IsReady => Username != null && UdpConfirmed;
@@ -51,7 +52,7 @@ namespace GameServer
 
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
 
-                ServerSend.Welcome(id, "Chao mung ban den voi may chu Tiny Bomber!");
+                ServerSend.Welcome(this, id, "Chao mung ban den voi may chu Tiny Bomber!");
             }
 
             public void SendData(Packet packet)
@@ -108,23 +109,19 @@ namespace GameServer
                         int _clientIdCheck = _packet.ReadInt();
                         string _username = _packet.ReadString();
 
-                        EnqueueCurrent(_ => ServerHandle.WelcomeReceived(id, _clientIdCheck, _username));
+                        EnqueueCurrent(slot => ServerHandle.WelcomeReceived(slot, _clientIdCheck, _username));
                     }
                     else if (_packetId == (int)ClientPackets.placeBomb)
                     {
                         int roundId = _packet.ReadInt();
-                        EnqueueCurrent(slot =>
-                        {
-                            if (slot.player is Player player && GameLogic.AcceptsInput(player, roundId))
-                                GameLogic.PlaceBomb(player);
-                        });
+                        EnqueueCurrent(slot => slot.Room?.PlaceBomb(slot, roundId));
                     }
                     else if (_packetId == (int)ClientPackets.playerMovement)
                     {
                         int roundId = _packet.ReadInt();
                         float _x = _packet.ReadFloat();
                         float _y = _packet.ReadFloat();
-                        EnqueueCurrent(_ => ServerHandle.PlayerMovement(id, roundId, _x, _y));
+                        EnqueueCurrent(slot => ServerHandle.PlayerMovement(slot, roundId, _x, _y));
                     }
                     else if (_packetId == (int)ClientPackets.udpReady)
                     {
@@ -134,7 +131,7 @@ namespace GameServer
                     else if (_packetId == (int)ClientPackets.requestStart)
                     {
                         int roundId = _packet.ReadInt();
-                        EnqueueCurrent(slot => GameLogic.StartRound(slot, roundId));
+                        EnqueueCurrent(slot => slot.Room?.StartRound(slot, roundId));
                     }
                 }
             }
@@ -212,8 +209,9 @@ namespace GameServer
 
                             ThreadManager.EnqueueAction(() =>
                             {
-                                if (Server.clients[id].udp != this) return;
-                                ServerHandle.PlayerMovement(id, roundId, _x, _y);
+                                Client slot = Server.clients[id];
+                                if (slot.udp != this) return;
+                                ServerHandle.PlayerMovement(slot, roundId, _x, _y);
                             });
                         }
                     }

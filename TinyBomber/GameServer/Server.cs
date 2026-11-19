@@ -13,6 +13,17 @@ namespace GameServer
         public static int Port { get; private set; }
         public static Dictionary<int, Client> clients = new Dictionary<int, Client>();
 
+        // Register rooms before starting the loop or from the update thread.
+        private static readonly List<GameLogic> rooms = new();
+        internal static GameLogic DefaultRoom { get; } = CreateRoom();
+
+        internal static GameLogic CreateRoom()
+        {
+            var room = new GameLogic();
+            rooms.Add(room);
+            return room;
+        }
+
         private static TcpListener tcpListener = null!;
         private static UdpClient udpSocket = null!;
         private static Thread updateThread = null!;
@@ -28,7 +39,6 @@ namespace GameServer
             Console.WriteLine("Dang khoi dong may chu Tiny Bomber...");
             ThreadManager.Initialize();
             InitializeServerData();
-            GameLogic.InitializeMap();
 
             tcpListener = new TcpListener(IPAddress.Any, Port);
             tcpListener.Start();
@@ -146,7 +156,8 @@ namespace GameServer
             while (isRunning)
             {
                 ThreadManager.UpdateMain();
-                GameLogic.UpdateRound(System.Diagnostics.Stopwatch.GetTimestamp());
+                long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                foreach (var room in rooms) room.UpdateRound(now);
             }
         }
 
@@ -221,23 +232,17 @@ namespace GameServer
 
         public static void Disconnect(int id, Client.TCP connection)
         {
-            bool hadPlayer;
-            bool hadHandshake;
+            Client slot = clients[id];
             lock (slotLock)
             {
-                Client slot = clients[id];
                 if (slot.tcp != connection) return;
                 connection.socket?.Close();
-                hadPlayer = slot.player != null;
-                hadHandshake = slot.Username != null;
                 slot.Username = null;
                 slot.UdpConfirmed = false;
-                slot.player = null;
                 slot.tcp = new Client.TCP(id);
                 slot.udp = new Client.UDP(id);
             }
-            if (hadPlayer) ServerSend.PlayerDisconnected(id);
-            if (hadHandshake) ServerSend.MatchState();
+            slot.Room?.RemoveMember(slot);
         }
 
         private static void InitializeServerData()

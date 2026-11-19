@@ -3,21 +3,16 @@ using Xunit;
 
 namespace GameServer.Tests;
 
-public sealed class MatchLifecycleTests : IDisposable
+public sealed class MatchLifecycleTests
 {
+    private readonly GameLogic room = new();
     private readonly Client first = new(1) { Username = "First", UdpConfirmed = true };
     private readonly Client second = new(2) { Username = "Second", UdpConfirmed = true };
 
     public MatchLifecycleTests()
     {
-        Server.clients.Add(first.id, first);
-        Server.clients.Add(second.id, second);
-    }
-
-    public void Dispose()
-    {
-        Server.clients.Clear();
-        GameLogic.UpdateRound(long.MaxValue);
+        Assert.True(room.TryAddMember(first));
+        Assert.True(room.TryAddMember(second));
     }
 
     [Fact]
@@ -29,20 +24,20 @@ public sealed class MatchLifecycleTests : IDisposable
         b.blastRange = 3;
         Put(a, 2, 1);
         Put(b, 4, 1);
-        GameLogic.mapData[3, 1] = 0;
-        GameLogic.PlaceBomb(a);
-        GameLogic.PlaceBomb(b);
+        room.mapData[3, 1] = 0;
+        room.PlaceBomb(first, room.RoundId);
+        room.PlaceBomb(second, room.RoundId);
 
-        GameLogic.UpdateRound(long.MaxValue);
+        room.UpdateRound(long.MaxValue);
 
         Assert.Equal(0, a.hp);
         Assert.Equal(0, b.hp);
         Assert.False(a.isAlive);
         Assert.False(b.isAlive);
-        Assert.Equal(MatchPhase.Finished, GameLogic.Phase);
-        Assert.Equal(0, GameLogic.WinnerId);
-        GameLogic.UpdateRound(long.MaxValue);
-        Assert.Equal(0, GameLogic.WinnerId);
+        Assert.Equal(MatchPhase.Finished, room.Phase);
+        Assert.Equal(0, room.WinnerId);
+        room.UpdateRound(long.MaxValue);
+        Assert.Equal(0, room.WinnerId);
     }
 
     [Theory]
@@ -56,17 +51,17 @@ public sealed class MatchLifecycleTests : IDisposable
         a.blastRange = 3;
         Put(a, 2, 1);
         Put(b, 4, 1);
-        GameLogic.mapData[3, 1] = block;
-        GameLogic.PlaceBomb(a);
+        room.mapData[3, 1] = block;
+        room.PlaceBomb(first, room.RoundId);
 
-        GameLogic.UpdateRound(long.MaxValue);
+        room.UpdateRound(long.MaxValue);
 
         Assert.False(a.isAlive);
         Assert.True(b.isAlive);
-        Assert.False(GameLogic.AcceptsInput(a, GameLogic.RoundId));
-        Assert.Equal(block == 1 ? 1 : 0, GameLogic.mapData[3, 1]);
-        Assert.Equal(MatchPhase.Finished, GameLogic.Phase);
-        Assert.Equal(b.id, GameLogic.WinnerId);
+        Assert.False(room.AcceptsInput(first, room.RoundId));
+        Assert.Equal(block == 1 ? 1 : 0, room.mapData[3, 1]);
+        Assert.Equal(MatchPhase.Finished, room.Phase);
+        Assert.Equal(b.id, room.WinnerId);
     }
 
     [Fact]
@@ -75,65 +70,122 @@ public sealed class MatchLifecycleTests : IDisposable
         StartRound();
         Put(first.player!, 2, 1);
         Put(second.player!, 3, 1);
-        GameLogic.PlaceBomb(first.player!);
+        room.PlaceBomb(first, room.RoundId);
 
-        Server.Disconnect(first.id, first.tcp);
-        Assert.Equal(MatchPhase.Playing, GameLogic.Phase);
-        GameLogic.UpdateRound(long.MaxValue);
+        room.RemoveMember(first);
+        Assert.Equal(MatchPhase.Playing, room.Phase);
+        room.UpdateRound(long.MaxValue);
 
         Assert.False(second.player!.isAlive);
-        Assert.Equal(MatchPhase.Finished, GameLogic.Phase);
-        Assert.Equal(0, GameLogic.WinnerId);
+        Assert.Equal(MatchPhase.Finished, room.Phase);
+        Assert.Equal(0, room.WinnerId);
     }
 
     [Fact]
     public void ReplayUsesNewPlayersAndRejectsOldRound()
     {
         StartRound();
-        int previousRound = GameLogic.RoundId;
+        int previousRound = room.RoundId;
         Player previousPlayer = first.player!;
-        GameLogic.PlaceBomb(previousPlayer);
-        GameLogic.UpdateRound(long.MaxValue);
+        room.PlaceBomb(first, previousRound);
+        room.UpdateRound(long.MaxValue);
         Assert.False(previousPlayer.isAlive);
 
-        GameLogic.StartRound(second, previousRound);
-        GameLogic.StartRound(first, previousRound);
+        room.StartRound(second, previousRound);
+        room.StartRound(first, previousRound);
 
-        Assert.Equal(previousRound + 1, GameLogic.RoundId);
+        Assert.Equal(previousRound + 1, room.RoundId);
         Assert.NotSame(previousPlayer, first.player);
         Assert.Equal(1, first.player!.hp);
-        Assert.False(GameLogic.AcceptsInput(first.player, previousRound));
-        Assert.True(GameLogic.AcceptsInput(first.player, GameLogic.RoundId));
-        GameLogic.UpdateRound(long.MaxValue);
-        Assert.Equal(MatchPhase.Playing, GameLogic.Phase);
+        Assert.False(room.AcceptsInput(first, previousRound));
+        Assert.True(room.AcceptsInput(first, room.RoundId));
+        room.UpdateRound(long.MaxValue);
+        Assert.Equal(MatchPhase.Playing, room.Phase);
     }
 
     [Fact]
     public void TcpOnlyClientIsNotCountedAndLateClientWaitsForReplay()
     {
-        int previousRound = GameLogic.RoundId;
+        int previousRound = room.RoundId;
         second.UdpConfirmed = false;
-        GameLogic.StartRound(first, previousRound);
-        Assert.Equal(previousRound, GameLogic.RoundId);
+        room.StartRound(first, previousRound);
+        Assert.Equal(previousRound, room.RoundId);
         Assert.Null(second.player);
 
         second.UdpConfirmed = true;
         StartRound();
         var late = new Client(3) { Username = "Late", UdpConfirmed = true };
-        Server.clients.Add(late.id, late);
+        Assert.True(room.TryAddMember(late));
         Assert.Null(late.player);
 
-        GameLogic.PlaceBomb(first.player!);
-        GameLogic.UpdateRound(long.MaxValue);
-        GameLogic.StartRound(first, GameLogic.RoundId);
+        room.PlaceBomb(first, room.RoundId);
+        room.UpdateRound(long.MaxValue);
+        room.StartRound(first, room.RoundId);
         Assert.NotNull(late.player);
     }
 
-    private void StartRound() => GameLogic.StartRound(first, GameLogic.RoundId);
-
-    private static void Put(Player player, int col, int row)
+    [Fact]
+    public void StartingAndReplayingOneRoomKeepsTheOtherMatchIntact()
     {
-        GameLogic.mapData[col, row] = 0;
+        var otherRoom = new GameLogic();
+        var third = new Client(3) { Username = "Third", UdpConfirmed = true };
+        var fourth = new Client(4) { Username = "Fourth", UdpConfirmed = true };
+        Assert.True(otherRoom.TryAddMember(third));
+        Assert.True(otherRoom.TryAddMember(fourth));
+        otherRoom.StartRound(third, 0);
+
+        Player otherPlayer = third.player!;
+        Player otherBombOwner = fourth.player!;
+        int otherRoundId = otherRoom.RoundId;
+        var otherMap = (int[,])otherRoom.mapData.Clone();
+        otherRoom.PlaceBomb(fourth, otherRoundId);
+
+        StartRound();
+        Assert.Equal(otherRoundId, room.RoundId);
+        Assert.False(room.AcceptsInput(third, room.RoundId));
+        Assert.False(otherRoom.AcceptsInput(first, otherRoundId));
+        room.PlaceBomb(first, room.RoundId);
+        room.UpdateRound(long.MaxValue);
+        Assert.Equal(second.id, room.WinnerId);
+
+        room.StartRound(second, room.RoundId);
+        Assert.Equal(MatchPhase.Playing, room.Phase);
+        Assert.Equal(MatchPhase.Playing, otherRoom.Phase);
+        Assert.Equal(otherRoundId, otherRoom.RoundId);
+        Assert.Equal(0, otherRoom.WinnerId);
+        Assert.Same(otherPlayer, third.player);
+        Assert.Same(otherBombOwner, fourth.player);
+        Assert.Equal(otherMap.Cast<int>(), otherRoom.mapData.Cast<int>());
+
+        var (x, y) = GameLogic.GridToWorld(2, 13);
+        ServerHandle.PlayerMovement(third, otherRoundId, x, y);
+        Assert.Equal((x, y), (otherPlayer.x, otherPlayer.y));
+
+        otherRoom.UpdateRound(long.MaxValue);
+        Assert.Equal(MatchPhase.Finished, otherRoom.Phase);
+        Assert.Equal(third.id, otherRoom.WinnerId);
+        Assert.Equal(MatchPhase.Playing, room.Phase);
+    }
+
+    [Fact]
+    public void MembershipIsExclusiveAndCapacityIsPerRoom()
+    {
+        var otherRoom = new GameLogic();
+        Assert.False(otherRoom.TryAddMember(first));
+
+        for (int id = 3; id <= Constants.MAX_PLAYERS; id++)
+            Assert.True(room.TryAddMember(new Client(id)));
+
+        var next = new Client(Constants.MAX_PLAYERS + 1);
+        Assert.False(room.TryAddMember(next));
+        Assert.True(otherRoom.TryAddMember(next));
+    }
+
+    private void StartRound() => room.StartRound(first, room.RoundId);
+
+    private void Put(Player player, int col, int row)
+    {
+        room.mapData[col, row] = 0;
         (player.x, player.y) = GameLogic.GridToWorld(col, row);
     }
 }

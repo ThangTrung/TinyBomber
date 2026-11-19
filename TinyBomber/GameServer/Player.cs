@@ -21,12 +21,11 @@ namespace GameServer
             (6.5f, -6.5f)
         };
 
-        public Player(int _id, string _username)
+        internal Player(int _id, string _username, int spawnIndex)
         {
             id = _id;
             username = _username;
 
-            int spawnIndex = (_id - 1) % SpawnPoints.Length;
             x = SpawnPoints[spawnIndex].x;
             y = SpawnPoints[spawnIndex].y;
         }
