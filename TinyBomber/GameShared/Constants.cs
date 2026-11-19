@@ -64,7 +64,10 @@ namespace GameShared
         udpProbe,
         matchState,
         roundBegin,
-        playerEliminated
+        playerEliminated,
+        lobbyReady,
+        roomChanged,
+        roomError
     }
 
     public enum ClientPackets
@@ -73,7 +76,19 @@ namespace GameShared
         playerMovement,
         placeBomb,
         udpReady,
-        requestStart
+        requestStart,
+        createRoom,
+        joinRoom,
+        leaveRoom
+    }
+
+    public enum RoomError
+    {
+        NotReady,
+        AlreadyInRoom,
+        RoomNotFound,
+        RoomFull,
+        RoomMismatch
     }
 
     public enum MatchPhase

@@ -9,19 +9,29 @@ namespace GameServer
 {
     class Server
     {
-        public static int MaxPlayers { get; private set; }
+        public static int MaxConnections { get; private set; }
         public static int Port { get; private set; }
         public static Dictionary<int, Client> clients = new Dictionary<int, Client>();
 
-        // Register rooms before starting the loop or from the update thread.
-        private static readonly List<GameLogic> rooms = new();
-        internal static GameLogic DefaultRoom { get; } = CreateRoom();
+        // Lobby membership and room lifecycles are owned by the update thread.
+        private static readonly Dictionary<int, GameLogic> rooms = new();
+        private static int lastRoomId;
 
         internal static GameLogic CreateRoom()
         {
-            var room = new GameLogic();
-            rooms.Add(room);
+            var room = new GameLogic(checked(++lastRoomId));
+            rooms.Add(room.Id, room);
             return room;
+        }
+
+        internal static GameLogic? FindRoom(int id) => rooms.GetValueOrDefault(id);
+
+        internal static void RemoveFromRoom(Client slot)
+        {
+            if (slot.Room is not GameLogic room) return;
+
+            room.RemoveMember(slot);
+            if (room.Members.Count == 0) rooms.Remove(room.Id);
         }
 
         private static TcpListener tcpListener = null!;
@@ -31,9 +41,9 @@ namespace GameServer
         private static volatile bool stopping;
         private static readonly object slotLock = new object();
 
-        public static void Start(int _maxPlayers, int _port)
+        public static void Start(int maxConnections, int _port)
         {
-            MaxPlayers = _maxPlayers;
+            MaxConnections = maxConnections;
             Port = _port;
 
             Console.WriteLine("Dang khoi dong may chu Tiny Bomber...");
@@ -75,7 +85,7 @@ namespace GameServer
                 }
 
                 int _clientId = BitConverter.ToInt32(_data, 0);
-                if (_clientId < 1 || _clientId > MaxPlayers)
+                if (_clientId < 1 || _clientId > MaxConnections)
                 {
                     return;
                 }
@@ -157,7 +167,7 @@ namespace GameServer
             {
                 ThreadManager.UpdateMain();
                 long now = System.Diagnostics.Stopwatch.GetTimestamp();
-                foreach (var room in rooms) room.UpdateRound(now);
+                foreach (var room in rooms.Values) room.UpdateRound(now);
             }
         }
 
@@ -210,7 +220,7 @@ namespace GameServer
                     _client.Close();
                     return;
                 }
-                for (int i = 1; i <= MaxPlayers; i++)
+                for (int i = 1; i <= MaxConnections; i++)
                 {
                     if (clients[i].tcp.socket == null)
                     {
@@ -242,12 +252,12 @@ namespace GameServer
                 slot.tcp = new Client.TCP(id);
                 slot.udp = new Client.UDP(id);
             }
-            slot.Room?.RemoveMember(slot);
+            RemoveFromRoom(slot);
         }
 
         private static void InitializeServerData()
         {
-            for (int i = 1; i <= MaxPlayers; i++)
+            for (int i = 1; i <= MaxConnections; i++)
             {
                 clients.Add(i, new Client(i));
             }

@@ -113,15 +113,17 @@ namespace GameServer
                     }
                     else if (_packetId == (int)ClientPackets.placeBomb)
                     {
+                        int roomId = _packet.ReadInt();
                         int roundId = _packet.ReadInt();
-                        EnqueueCurrent(slot => slot.Room?.PlaceBomb(slot, roundId));
+                        EnqueueCurrent(slot => slot.Room?.PlaceBomb(slot, roomId, roundId));
                     }
                     else if (_packetId == (int)ClientPackets.playerMovement)
                     {
+                        int roomId = _packet.ReadInt();
                         int roundId = _packet.ReadInt();
                         float _x = _packet.ReadFloat();
                         float _y = _packet.ReadFloat();
-                        EnqueueCurrent(slot => ServerHandle.PlayerMovement(slot, roundId, _x, _y));
+                        EnqueueCurrent(slot => ServerHandle.PlayerMovement(slot, roomId, roundId, _x, _y));
                     }
                     else if (_packetId == (int)ClientPackets.udpReady)
                     {
@@ -130,8 +132,23 @@ namespace GameServer
                     }
                     else if (_packetId == (int)ClientPackets.requestStart)
                     {
+                        int roomId = _packet.ReadInt();
                         int roundId = _packet.ReadInt();
-                        EnqueueCurrent(slot => slot.Room?.StartRound(slot, roundId));
+                        EnqueueCurrent(slot => slot.Room?.StartRound(slot, roomId, roundId));
+                    }
+                    else if (_packetId == (int)ClientPackets.createRoom)
+                    {
+                        EnqueueCurrent(ServerHandle.CreateRoom);
+                    }
+                    else if (_packetId == (int)ClientPackets.joinRoom)
+                    {
+                        int roomId = _packet.ReadInt();
+                        EnqueueCurrent(slot => ServerHandle.JoinRoom(slot, roomId));
+                    }
+                    else if (_packetId == (int)ClientPackets.leaveRoom)
+                    {
+                        int roomId = _packet.ReadInt();
+                        EnqueueCurrent(slot => ServerHandle.LeaveRoom(slot, roomId));
                     }
                 }
             }
@@ -203,6 +220,7 @@ namespace GameServer
                         if (_packetId == (int)ClientPackets.playerMovement)
                         {
                             // Bóc tách dữ liệu nguyên thủy ngay trên luồng mạng trước khi Packet bị Dispose
+                            int roomId = _packet.ReadInt();
                             int roundId = _packet.ReadInt();
                             float _x = _packet.ReadFloat();
                             float _y = _packet.ReadFloat();
@@ -211,7 +229,7 @@ namespace GameServer
                             {
                                 Client slot = Server.clients[id];
                                 if (slot.udp != this) return;
-                                ServerHandle.PlayerMovement(slot, roundId, _x, _y);
+                                ServerHandle.PlayerMovement(slot, roomId, roundId, _x, _y);
                             });
                         }
                     }

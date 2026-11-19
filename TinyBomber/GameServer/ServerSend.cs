@@ -32,6 +32,26 @@ namespace GameServer
             slot.udp.SendData(packet);
         }
 
+        internal static void LobbyReady(Client slot)
+        {
+            using var packet = new Packet((int)ServerPackets.lobbyReady);
+            SendTCPData(slot.tcp, packet);
+        }
+
+        internal static void RoomChanged(Client slot, int roomId)
+        {
+            using var packet = new Packet((int)ServerPackets.roomChanged);
+            packet.Write(roomId);
+            SendTCPData(slot.tcp, packet);
+        }
+
+        internal static void RoomFailure(Client slot, RoomError error)
+        {
+            using var packet = new Packet((int)ServerPackets.roomError);
+            packet.Write((int)error);
+            SendTCPData(slot.tcp, packet);
+        }
+
         internal static void MatchState(GameLogic room)
         {
             int readyCount = room.Members.Count(slot => slot.IsReady);
@@ -40,11 +60,10 @@ namespace GameServer
                 if (slot.Username == null) continue;
 
                 using var packet = new Packet((int)ServerPackets.matchState);
-                packet.Write(room.RoundId);
+                WriteRound(packet, room);
                 packet.Write((int)room.Phase);
                 packet.Write(readyCount);
                 packet.Write(room.WinnerId);
-                packet.Write(slot.IsReady);
                 SendTCPData(slot.tcp, packet);
             }
         }
@@ -52,7 +71,7 @@ namespace GameServer
         internal static void RoundBegin(GameLogic room, Client recipient, Client[] participants)
         {
             using var packet = new Packet((int)ServerPackets.roundBegin);
-            packet.Write(room.RoundId);
+            WriteRound(packet, room);
             packet.Write(participants.Length);
             foreach (var slot in participants) packet.Write(slot.id);
             SendTCPData(recipient.tcp, packet);
@@ -61,7 +80,7 @@ namespace GameServer
         internal static void PlayerEliminated(GameLogic room, int id)
         {
             using var packet = new Packet((int)ServerPackets.playerEliminated);
-            packet.Write(room.RoundId);
+            WriteRound(packet, room);
             packet.Write(id);
             BroadcastTCP(room, packet);
         }
@@ -76,6 +95,7 @@ namespace GameServer
         internal static void PlayerDisconnected(GameLogic room, int id)
         {
             using var packet = new Packet((int)ServerPackets.playerDisconnected);
+            WriteRound(packet, room);
             packet.Write(id);
             BroadcastTCP(room, packet);
         }
@@ -98,7 +118,7 @@ namespace GameServer
         internal static void BombPlaced(GameLogic room, int col, int row)
         {
             using var packet = new Packet((int)ServerPackets.bombPlaced);
-            packet.Write(room.RoundId);
+            WriteRound(packet, room);
             packet.Write(col);
             packet.Write(row);
             BroadcastTCP(room, packet);
@@ -108,7 +128,7 @@ namespace GameServer
             List<(int, int)> affected, List<(int, int)> destroyed)
         {
             using var packet = new Packet((int)ServerPackets.bombExploded);
-            packet.Write(room.RoundId);
+            WriteRound(packet, room);
             packet.Write(col);
             packet.Write(row);
             WriteCells(packet, affected);
@@ -136,7 +156,7 @@ namespace GameServer
         internal static void SendMapData(GameLogic room, Client recipient)
         {
             using var packet = new Packet((int)ServerPackets.mapData);
-            packet.Write(room.RoundId);
+            WriteRound(packet, room);
             for (int col = 0; col < Constants.MAP_WIDTH; col++)
             {
                 for (int row = 0; row < Constants.MAP_HEIGHT; row++)
@@ -152,9 +172,15 @@ namespace GameServer
             SendTCPData(recipient.tcp, packet);
         }
 
+        private static void WriteRound(Packet packet, GameLogic room)
+        {
+            packet.Write(room.Id);
+            packet.Write(room.RoundId);
+        }
+
         private static void WritePosition(Packet packet, GameLogic room, Player player)
         {
-            packet.Write(room.RoundId);
+            WriteRound(packet, room);
             packet.Write(player.id);
             packet.Write(player.x);
             packet.Write(player.y);

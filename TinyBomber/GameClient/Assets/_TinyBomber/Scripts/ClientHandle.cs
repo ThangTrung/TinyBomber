@@ -19,6 +19,7 @@ public class ClientHandle : MonoBehaviour
 
     public static void RoundBegin(Packet packet)
     {
+        if (!IsCurrentRoom(packet)) return;
         int roundId = packet.ReadInt();
         int count = packet.ReadInt();
         if (count < 2 || count > Constants.MAX_PLAYERS || count > packet.UnreadLength() / sizeof(int))
@@ -31,12 +32,12 @@ public class ClientHandle : MonoBehaviour
 
     public static void MatchState(Packet packet)
     {
+        if (!IsCurrentRoom(packet)) return;
         int roundId = packet.ReadInt();
         var phase = (MatchPhase)packet.ReadInt();
         int readyCount = packet.ReadInt();
         int winner = packet.ReadInt();
-        bool localReady = packet.ReadBool();
-        GameManager.instance.ApplyMatchState(roundId, phase, readyCount, winner, localReady);
+        GameManager.instance.ApplyMatchState(roundId, phase, readyCount, winner);
     }
 
     public static void PlayerEliminated(Packet packet)
@@ -45,8 +46,15 @@ public class ClientHandle : MonoBehaviour
         GameManager.RemovePlayer(packet.ReadInt());
     }
 
+    private static bool IsCurrentRoom(Packet packet)
+    {
+        int roomId = packet.ReadInt();
+        return roomId > 0 && roomId == GameManager.instance.RoomId;
+    }
+
     private static bool IsCurrentRound(Packet packet)
     {
+        if (!IsCurrentRoom(packet)) return false;
         int roundId = packet.ReadInt();
         return roundId > 0 && roundId == GameManager.instance.ActiveRoundId;
     }
@@ -88,7 +96,7 @@ public class ClientHandle : MonoBehaviour
 
     public static void PlayerDisconnected(Packet packet)
     {
-        GameManager.RemovePlayer(packet.ReadInt());
+        if (IsCurrentRound(packet)) GameManager.RemovePlayer(packet.ReadInt());
     }
 
     public static void BombPlaced(Packet packet)

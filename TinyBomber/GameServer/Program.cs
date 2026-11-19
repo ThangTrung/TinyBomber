@@ -47,7 +47,8 @@ namespace GameServer
             Console.OutputEncoding = System.Text.Encoding.UTF8;
             Console.Title = "Tiny Bomber Server";
             //TestEncryption();
-            Server.Start(Constants.MAX_PLAYERS, Constants.PORT);
+            const int maxConnections = 8;
+            Server.Start(maxConnections, Constants.PORT);
             Console.WriteLine("\nNhan phim bat ky de tat may chu...\n");
             Console.ReadKey();
             Server.Shutdown();

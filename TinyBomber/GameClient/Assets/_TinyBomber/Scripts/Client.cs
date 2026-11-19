@@ -183,6 +183,18 @@ public class Client : MonoBehaviour
                     {
                         ClientHandle.PlayerEliminated(_packet);
                     }
+                    else if (_packetId == (int)ServerPackets.lobbyReady)
+                    {
+                        GameManager.instance.ConfirmLobbyReady();
+                    }
+                    else if (_packetId == (int)ServerPackets.roomChanged)
+                    {
+                        GameManager.instance.ChangeRoom(_packet.ReadInt());
+                    }
+                    else if (_packetId == (int)ServerPackets.roomError)
+                    {
+                        GameManager.instance.ApplyRoomError((RoomError)_packet.ReadInt());
+                    }
                 }
             });
         }

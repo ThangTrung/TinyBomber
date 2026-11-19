@@ -13,6 +13,9 @@ namespace GameServer
         private readonly List<Bomb> bombs = new();
         private static readonly (int dx, int dy)[] directions = { (1, 0), (-1, 0), (0, 1), (0, -1) };
 
+        internal GameLogic(int id) => Id = id;
+
+        internal int Id { get; }
         internal MatchPhase Phase { get; private set; }
         internal int RoundId { get; private set; }
         internal int WinnerId { get; private set; }
@@ -37,13 +40,13 @@ namespace GameServer
             ServerSend.MatchState(this);
         }
 
-        internal bool AcceptsInput(Client slot, int roundId) =>
-            slot.Room == this && Phase == MatchPhase.Playing && roundId == RoundId &&
+        internal bool AcceptsInput(Client slot, int roomId, int roundId) =>
+            slot.Room == this && roomId == Id && Phase == MatchPhase.Playing && roundId == RoundId &&
             slot.player is { isAlive: true };
 
-        internal void StartRound(Client requester, int expectedRoundId)
+        internal void StartRound(Client requester, int roomId, int expectedRoundId)
         {
-            if (requester.Room != this || Phase == MatchPhase.Playing ||
+            if (requester.Room != this || roomId != Id || Phase == MatchPhase.Playing ||
                 expectedRoundId != RoundId || !requester.IsReady)
                 return;
 
@@ -74,9 +77,9 @@ namespace GameServer
             ServerSend.MatchState(this);
         }
 
-        internal void PlaceBomb(Client slot, int roundId)
+        internal void PlaceBomb(Client slot, int roomId, int roundId)
         {
-            if (!AcceptsInput(slot, roundId)) return;
+            if (!AcceptsInput(slot, roomId, roundId)) return;
 
             Player player = slot.player!;
             var (col, row) = WorldToGrid(player.x, player.y);

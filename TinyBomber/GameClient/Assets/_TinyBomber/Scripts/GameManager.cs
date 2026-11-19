@@ -26,18 +26,93 @@ public class GameManager : MonoBehaviour
     private int displayedRoundId;
     private int readyCount;
     private int winnerId;
+    private RoomLobbyUi roomUi;
+    private bool roomRequestPending;
+    private string roomError;
 
+    public int RoomId { get; private set; }
     public int ActiveRoundId { get; private set; }
     public bool IsReady { get; private set; }
     public bool IsPlaying => phase == MatchPhase.Playing &&
         ActiveRoundId > 0 && ActiveRoundId == displayedRoundId;
-    public bool CanControl => IsPlaying && terrain != null && pendingSpawns.Count == 0 &&
+    public bool CanControl => IsPlaying && !roomRequestPending && terrain != null && pendingSpawns.Count == 0 &&
         players.ContainsKey(Client.instance.myId);
-    private bool CanRequestStart => IsReady && readyCount >= 2 && phase != MatchPhase.Playing;
+    private bool CanRequestStart => RoomId > 0 && !roomRequestPending &&
+        readyCount >= 2 && phase != MatchPhase.Playing;
+
+    public void ConfirmLobbyReady()
+    {
+        IsReady = true;
+        RefreshMatchUi();
+    }
+
+    public void ChangeRoom(int roomId)
+    {
+        ClearRound();
+        RoomId = roomId;
+        displayedRoundId = 0;
+        phase = MatchPhase.Waiting;
+        readyCount = 0;
+        winnerId = 0;
+        roomRequestPending = false;
+        roomError = null;
+        RefreshMatchUi();
+    }
+
+    public void ApplyRoomError(RoomError error)
+    {
+        roomRequestPending = false;
+        roomError = error switch
+        {
+            RoomError.NotReady => "Kết nối chưa sẵn sàng.",
+            RoomError.AlreadyInRoom => "Bạn đang ở trong một phòng.",
+            RoomError.RoomNotFound => "Không tìm thấy phòng.",
+            RoomError.RoomFull => "Phòng đã đủ 4 người.",
+            _ => "Bạn không ở trong phòng này."
+        };
+        RefreshMatchUi();
+    }
+
+    private void CreateRoom()
+    {
+        if (!IsReady || RoomId != 0 || roomRequestPending) return;
+
+        BeginRoomRequest();
+        ClientSend.CreateRoom();
+    }
+
+    private void JoinRoom(string code)
+    {
+        if (!IsReady || RoomId != 0 || roomRequestPending) return;
+        if (!int.TryParse(code, out int roomId) || roomId <= 0)
+        {
+            roomError = "Nhập mã phòng hợp lệ.";
+            RefreshMatchUi();
+            return;
+        }
+
+        BeginRoomRequest();
+        ClientSend.JoinRoom(roomId);
+    }
+
+    private void LeaveRoom()
+    {
+        if (RoomId == 0 || roomRequestPending) return;
+
+        BeginRoomRequest();
+        ClientSend.LeaveRoom(RoomId);
+    }
+
+    private void BeginRoomRequest()
+    {
+        roomRequestPending = true;
+        roomError = null;
+        RefreshMatchUi();
+    }
 
     public void RequestStartOrReplay()
     {
-        if (CanRequestStart) ClientSend.RequestStart(displayedRoundId);
+        if (CanRequestStart) ClientSend.RequestStart(RoomId, displayedRoundId);
     }
 
     public void BeginRound(int roundId, int[] roster)
@@ -50,7 +125,7 @@ public class GameManager : MonoBehaviour
         RefreshMatchUi();
     }
 
-    public void ApplyMatchState(int roundId, MatchPhase matchPhase, int count, int winner, bool localReady)
+    public void ApplyMatchState(int roundId, MatchPhase matchPhase, int count, int winner)
     {
         if (roundId < displayedRoundId || roundId < ActiveRoundId) return;
 
@@ -58,22 +133,25 @@ public class GameManager : MonoBehaviour
         phase = matchPhase;
         readyCount = count;
         winnerId = winner;
-        IsReady = localReady;
         if (phase == MatchPhase.Finished) ClearBombs();
         RefreshMatchUi();
     }
 
     private void RefreshMatchUi()
     {
+        roomUi?.Refresh(IsReady, RoomId, roomRequestPending);
         if (matchButton)
         {
-            matchButton.gameObject.SetActive(phase != MatchPhase.Playing);
+            matchButton.gameObject.SetActive(RoomId > 0 && phase != MatchPhase.Playing);
             matchButton.interactable = CanRequestStart;
         }
         if (matchButtonLabel) matchButtonLabel.text = phase == MatchPhase.Finished ? "Chơi lại" : "Bắt đầu";
         if (!matchStatus) return;
 
         if (!IsReady) matchStatus.text = "Đang kết nối…";
+        else if (roomRequestPending) matchStatus.text = RoomId == 0 ? "Đang vào phòng…" : "Đang rời phòng…";
+        else if (roomError != null) matchStatus.text = roomError;
+        else if (RoomId == 0) matchStatus.text = "Tạo phòng hoặc nhập mã";
         else if (phase == MatchPhase.Finished)
         {
             if (winnerId == 0) matchStatus.text = "Hòa!";
@@ -159,6 +237,7 @@ public class GameManager : MonoBehaviour
         if (instance != this) return;
 
         ClearRound();
+        roomUi?.Destroy();
         instance = null;
         if (matchButton) matchButton.onClick.RemoveListener(RequestStartOrReplay);
         if (blastSprite) Destroy(blastSprite);
@@ -173,7 +252,12 @@ public class GameManager : MonoBehaviour
         }
 
         instance = this;
-        if (matchButton) matchButton.onClick.AddListener(RequestStartOrReplay);
+        if (matchButton)
+        {
+            matchButton.onClick.AddListener(RequestStartOrReplay);
+            var canvas = matchButton.GetComponentInParent<Canvas>();
+            if (canvas) roomUi = new RoomLobbyUi(canvas.transform, CreateRoom, JoinRoom, LeaveRoom);
+        }
         RefreshMatchUi();
     }
 
@@ -210,13 +294,8 @@ public class GameManager : MonoBehaviour
     {
         if (!instance) return;
 
-        instance.ClearRound();
-        instance.displayedRoundId = 0;
-        instance.phase = MatchPhase.Waiting;
-        instance.readyCount = 0;
-        instance.winnerId = 0;
         instance.IsReady = false;
-        instance.RefreshMatchUi();
+        instance.ChangeRoom(0);
     }
 
     private void ClearRound()
