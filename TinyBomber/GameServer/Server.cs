@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -40,6 +41,10 @@ namespace GameServer
         private static volatile bool isRunning = false;
         private static volatile bool stopping;
         private static readonly object slotLock = new object();
+        private static ServerMetrics metrics = null!;
+        private static ProcessMetricsSampler processMetrics = null!;
+        internal static ServerMetricsSnapshot? LatestMetrics => metrics?.Latest;
+        internal static string? MetricsCaptureError => metrics?.CaptureError;
 
         public static void Start(int maxConnections, int _port)
         {
@@ -151,6 +156,9 @@ namespace GameServer
                 return;
             }
 
+            metrics = new ServerMetrics(Stopwatch.GetTimestamp());
+            processMetrics = new ProcessMetricsSampler();
+            processMetrics.Start();
             isRunning = true;
             updateThread = new Thread(UpdateLoop)
             {
@@ -165,9 +173,37 @@ namespace GameServer
         {
             while (isRunning)
             {
+                metrics.BeginTick(Stopwatch.GetTimestamp());
                 ThreadManager.UpdateMain();
-                long now = System.Diagnostics.Stopwatch.GetTimestamp();
+                long roomStarted = Stopwatch.GetTimestamp();
+                long now = roomStarted;
                 foreach (var room in rooms.Values) room.UpdateRound(now);
+                metrics.EndGameplay(ThreadManager.LastBatchMetrics,
+                    Stopwatch.GetElapsedTime(roomStarted).TotalMilliseconds);
+                if (metrics.IsSnapshotDue(Stopwatch.GetTimestamp()))
+                    CaptureMetrics();
+            }
+        }
+
+        private static void CaptureMetrics()
+        {
+            try
+            {
+                long captureStarted = Stopwatch.GetTimestamp();
+                int connected;
+                lock (slotLock)
+                    connected = clients.Values.Count(slot => slot.tcp.socket != null);
+                int ready = clients.Values.Count(slot => slot.IsReady);
+                var roomMetrics = rooms.Values.Select(RoomMetrics.Capture).ToArray();
+                int waiting = ThreadManager.GetWaitingActionCount();
+                var process = processMetrics.Latest;
+                metrics.Publish(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow,
+                    connected, ready, roomMetrics, waiting, captureStarted, process);
+            }
+            catch (Exception ex)
+            {
+                // Keep the previous snapshot and expose the failure without doing I/O on this thread.
+                metrics.RecordCaptureFailure(ex);
             }
         }
 
@@ -176,6 +212,7 @@ namespace GameServer
             Console.WriteLine("[INFO] Dang tat may chu...");
             stopping = true;
             isRunning = false;
+            processMetrics?.Dispose();
 
             if (updateThread != null && updateThread.IsAlive)
             {
