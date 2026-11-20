@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 using UnityEngine;
 using GameShared;
 
@@ -134,10 +136,17 @@ public class Client : MonoBehaviour
         private byte[] receiveBuffer;
         private TcpFrameReader frameReader;
         private volatile bool closed;
+        private readonly Queue<byte[]> pendingWrites = new Queue<byte[]>();
+        private bool writing;
+        private bool sendFailed;
 
         public void Close()
         {
-            closed = true;
+            lock (pendingWrites)
+            {
+                closed = true;
+                pendingWrites.Clear();
+            }
             socket?.Close();
         }
 
@@ -186,16 +195,64 @@ public class Client : MonoBehaviour
         {
             try
             {
-                if (!closed && socket != null)
+                lock (pendingWrites)
                 {
-                    stream.BeginWrite(_packet.ToArray(), 0, _packet.Length(), null, null);
+                    if (closed || sendFailed || socket == null) return;
+
+                    pendingWrites.Enqueue(_packet.ToArray());
+                    if (writing) return;
+                    writing = true;
                 }
             }
-            catch (Exception _ex)
+            catch (Exception ex)
             {
-                if (!closed) Debug.Log($"Lỗi gửi dữ liệu TCP tới server: {_ex}");
-                RequestDisconnect("Đã mất kết nối với máy chủ.");
+                FailWrites(ex);
+                return;
             }
+
+            _ = WritePendingAsync();
+        }
+
+        private async Task WritePendingAsync()
+        {
+            try
+            {
+                while (true)
+                {
+                    byte[] frame;
+                    lock (pendingWrites)
+                    {
+                        if (closed || pendingWrites.Count == 0)
+                        {
+                            writing = false;
+                            return;
+                        }
+                        frame = pendingWrites.Dequeue();
+                    }
+
+                    await stream.WriteAsync(frame, 0, frame.Length).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                FailWrites(ex);
+            }
+        }
+
+        private void FailWrites(Exception ex)
+        {
+            bool notify;
+            lock (pendingWrites)
+            {
+                notify = !closed && !sendFailed;
+                sendFailed = true;
+                writing = false;
+                pendingWrites.Clear();
+            }
+
+            if (!notify) return;
+            Debug.Log($"Lỗi gửi dữ liệu TCP tới server: {ex}");
+            RequestDisconnect("Đã mất kết nối với máy chủ.");
         }
 
         private void HandleFrame(byte[] _data)
