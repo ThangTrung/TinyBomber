@@ -113,19 +113,24 @@ public class Client : MonoBehaviour
 
     private void Disconnect(string status)
     {
+        CloseConnection();
+        GameManager.ClearSession(status);
+    }
+
+    private void CloseConnection()
+    {
         IsConnecting = false;
         tcp?.Close();
         udp?.Close();
         tcp = null;
         udp = null;
         myId = 0;
-        GameManager.ClearSession(status);
     }
 
     private void OnDestroy()
     {
         if (instance != this) return;
-        Disconnect("Đã ngắt kết nối với máy chủ.");
+        CloseConnection();
         instance = null;
     }
 
