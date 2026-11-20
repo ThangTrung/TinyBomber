@@ -31,7 +31,8 @@ internal sealed record ServerMetricsSnapshot(
     long SuccessfulActions, long FailedActions, MetricSummary ActionProcessingMs,
     MetricSummary RoomUpdateMs, MetricSummary GameplayWorkMs, MetricSummary SleepElapsedMs,
     MetricSummary TickIntervalMs, MetricSummary TickNonSleepWallMs, double? TickRate,
-    double SnapshotCaptureMs, ProcessMetricsSample? Process, double? ProcessSampleAgeMs)
+    double SnapshotCaptureMs, ProcessMetricsSample? Process, double? ProcessSampleAgeMs,
+    NetworkMetricsSnapshot? Network = null)
 {
     public int RoomCount => Rooms.Count;
     public int WaitingRooms => Rooms.Count(room => room.Phase == MatchPhase.Waiting);
@@ -122,7 +123,8 @@ internal sealed class ServerMetrics
 
     internal ServerMetricsSnapshot Publish(long timestamp, DateTimeOffset utc,
         int connectedClients, int readyClients, IEnumerable<RoomMetrics> roomMetrics,
-        int waitingActions, long captureStarted, ProcessMetricsSample? process)
+        int waitingActions, long captureStarted, ProcessMetricsSample? process,
+        NetworkMetricsSnapshot? network = null)
     {
         double windowSeconds = Stopwatch.GetElapsedTime(windowStart, timestamp).TotalSeconds;
         var copiedRooms = Array.AsReadOnly(roomMetrics.ToArray());
@@ -134,7 +136,7 @@ internal sealed class ServerMetrics
             tickIntervals.Samples == 0 || tickIntervals.Average <= 0
                 ? null : 1000.0 / tickIntervals.Average,
             captureMs, process, process == null ? null :
-                Stopwatch.GetElapsedTime(process.Timestamp, timestamp).TotalMilliseconds);
+                Stopwatch.GetElapsedTime(process.Timestamp, timestamp).TotalMilliseconds, network);
         largestBatch = 0;
         successful = failed = 0;
         windowStart = timestamp;

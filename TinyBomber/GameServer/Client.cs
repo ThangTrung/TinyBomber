@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net;
 using System.Net.Sockets;
 using GameShared;
@@ -85,7 +85,16 @@ namespace GameServer
                             }
                         }
 
-                        await stream.WriteAsync(frame.AsMemory()).ConfigureAwait(false);
+                        try
+                        {
+                            await stream.WriteAsync(frame.AsMemory()).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            Server.Network.RecordTcpSendError();
+                            throw;
+                        }
+                        Server.Network.RecordTcpWrite(frame.Length);
                     }
                 }
                 catch (Exception ex)
@@ -167,6 +176,7 @@ namespace GameServer
                 try
                 {
                     int _byteLength = stream.EndRead(_result);
+                    if (_byteLength > 0) Server.Network.RecordTcpReceive(_byteLength);
                     if (_byteLength <= 0)
                     {
                         ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));

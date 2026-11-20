@@ -45,6 +45,8 @@ namespace GameServer
         private static ProcessMetricsSampler processMetrics = null!;
         internal static ServerMetricsSnapshot? LatestMetrics => metrics?.Latest;
         internal static string? MetricsCaptureError => metrics?.CaptureError;
+        // One collector for the server process, including late socket completions.
+        internal static NetworkMetrics Network { get; } = new();
 
         public static void Start(int maxConnections, int _port)
         {
@@ -82,6 +84,7 @@ namespace GameServer
             {
                 IPEndPoint _clientEndPoint = new IPEndPoint(IPAddress.Any, 0);
                 byte[] _data = udpSocket.EndReceive(_result, ref _clientEndPoint!);
+                Network.RecordUdpReceive(_data.Length);
                 udpSocket.BeginReceive(UDPReceiveCallback, null);
 
                 if (_data.Length < 4)
@@ -135,16 +138,40 @@ namespace GameServer
 
         public static void SendUDPData(IPEndPoint _clientEndPoint, Packet _packet)
         {
+            var sender = udpSocket;
+            var counters = Network;
+            if (_clientEndPoint == null || sender == null) return;
+
             try
             {
-                if (_clientEndPoint != null && udpSocket != null)
+                byte[] data = _packet.ToArray();
+                try
                 {
-                    udpSocket.BeginSend(_packet.ToArray(), _packet.Length(), _clientEndPoint, null, null);
+                    sender.BeginSend(data, data.Length, _clientEndPoint, UdpSendCallback, (sender, counters));
+                }
+                catch
+                {
+                    counters.RecordUdpSendError();
+                    throw;
                 }
             }
             catch (Exception _ex)
             {
                 Console.WriteLine($"[ERROR] Loi gui UDP toi {_clientEndPoint}: {_ex.Message}");
+            }
+        }
+
+        private static void UdpSendCallback(IAsyncResult result)
+        {
+            var (sender, counters) = ((UdpClient, NetworkMetrics))result.AsyncState!;
+            try
+            {
+                counters.RecordUdpSend(sender.EndSend(result));
+            }
+            catch (Exception)
+            {
+                // Completion belongs to this socket operation, independent of client slots.
+                counters.RecordUdpSendError();
             }
         }
 
@@ -197,8 +224,9 @@ namespace GameServer
                 var roomMetrics = rooms.Values.Select(RoomMetrics.Capture).ToArray();
                 int waiting = ThreadManager.GetWaitingActionCount();
                 var process = processMetrics.Latest;
+                var network = Network.Capture(Stopwatch.GetTimestamp());
                 metrics.Publish(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow,
-                    connected, ready, roomMetrics, waiting, captureStarted, process);
+                    connected, ready, roomMetrics, waiting, captureStarted, process, network);
             }
             catch (Exception ex)
             {
