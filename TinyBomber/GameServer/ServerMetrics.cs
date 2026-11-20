@@ -32,7 +32,7 @@ internal sealed record ServerMetricsSnapshot(
     MetricSummary RoomUpdateMs, MetricSummary GameplayWorkMs, MetricSummary SleepElapsedMs,
     MetricSummary TickIntervalMs, MetricSummary TickNonSleepWallMs, double? TickRate,
     double SnapshotCaptureMs, ProcessMetricsSample? Process, double? ProcessSampleAgeMs,
-    NetworkMetricsSnapshot? Network = null)
+    NetworkMetricsSnapshot? Network = null, long SampleId = 0)
 {
     public int RoomCount => Rooms.Count;
     public int WaitingRooms => Rooms.Count(room => room.Phase == MatchPhase.Waiting);
@@ -84,6 +84,7 @@ internal sealed class ServerMetrics
     private long failed;
     private ServerMetricsSnapshot? latest;
     private string? captureError;
+    private long sampleId;
 
     internal ServerMetrics(long startTimestamp) => windowStart = startTimestamp;
     internal ServerMetricsSnapshot? Latest => Volatile.Read(ref latest);
@@ -136,7 +137,7 @@ internal sealed class ServerMetrics
             tickIntervals.Samples == 0 || tickIntervals.Average <= 0
                 ? null : 1000.0 / tickIntervals.Average,
             captureMs, process, process == null ? null :
-                Stopwatch.GetElapsedTime(process.Timestamp, timestamp).TotalMilliseconds, network);
+                Stopwatch.GetElapsedTime(process.Timestamp, timestamp).TotalMilliseconds, network, ++sampleId);
         largestBatch = 0;
         successful = failed = 0;
         windowStart = timestamp;

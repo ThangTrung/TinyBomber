@@ -43,6 +43,9 @@ namespace GameServer
         private static readonly object slotLock = new object();
         private static ServerMetrics metrics = null!;
         private static ProcessMetricsSampler processMetrics = null!;
+        private static MetricsExporter exporter = null!;
+        internal static MetricsExporterStatus? ExporterStatus => exporter?.ReadStatus();
+        internal static MetricsExporterStopResult? LastExporterStopResult { get; private set; }
         internal static ServerMetricsSnapshot? LatestMetrics => metrics?.Latest;
         internal static string? MetricsCaptureError => metrics?.CaptureError;
         // One collector for the server process, including late socket completions.
@@ -186,6 +189,7 @@ namespace GameServer
             metrics = new ServerMetrics(Stopwatch.GetTimestamp());
             processMetrics = new ProcessMetricsSampler();
             processMetrics.Start();
+            exporter = new MetricsExporter(Path.Combine(AppContext.BaseDirectory, "metrics"));
             isRunning = true;
             updateThread = new Thread(UpdateLoop)
             {
@@ -225,8 +229,9 @@ namespace GameServer
                 int waiting = ThreadManager.GetWaitingActionCount();
                 var process = processMetrics.Latest;
                 var network = Network.Capture(Stopwatch.GetTimestamp());
-                metrics.Publish(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow,
+                var snapshot = metrics.Publish(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow,
                     connected, ready, roomMetrics, waiting, captureStarted, process, network);
+                exporter.TryEnqueue(snapshot);
             }
             catch (Exception ex)
             {
@@ -252,6 +257,12 @@ namespace GameServer
             lock (slotLock)
             {
                 foreach (var slot in clients.Values) slot.tcp.socket?.Close();
+            }
+            if (exporter != null)
+            {
+                LastExporterStopResult = exporter.StopAsync().GetAwaiter().GetResult();
+                try { Console.Error.WriteLine(MetricsExporter.FormatStopResult(LastExporterStopResult)); }
+                catch (Exception) { /* The shutdown result remains available to the host/debugger. */ }
             }
             Console.WriteLine("[INFO] May chu da tat.");
         }
