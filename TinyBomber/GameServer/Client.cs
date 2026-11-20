@@ -8,6 +8,11 @@ namespace GameServer
     class Client
     {
         public int id;
+        public Player? player;
+        internal GameLogic? Room { get; set; }
+        internal string? Username { get; set; }
+        internal bool UdpConfirmed { get; set; }
+        internal bool IsReady => Username != null && UdpConfirmed;
         public TCP tcp;
         public UDP udp;
 
@@ -24,6 +29,11 @@ namespace GameServer
             private readonly int id;
             private NetworkStream stream = null!;
             private byte[] receiveBuffer = null!;
+            private TcpFrameReader frameReader = null!;
+            private readonly Queue<byte[]> pendingWrites = new();
+            private bool writing;
+            internal int UdpChallenge { get; } =
+                System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue);
 
             public TCP(int _id)
             {
@@ -38,25 +48,118 @@ namespace GameServer
 
                 stream = socket.GetStream();
                 receiveBuffer = new byte[Constants.DATA_BUFFER_SIZE];
+                frameReader = new TcpFrameReader();
 
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
 
-                ServerSend.Welcome(id, "Chao mung ban den voi may chu Tiny Bomber!");
+                ServerSend.Welcome(this, id, "Chao mung ban den voi may chu Tiny Bomber!");
             }
 
-            public void SendData(Packet _packet)
+            public void SendData(Packet packet)
+            {
+                if (socket == null) return;
+
+                lock (pendingWrites)
+                {
+                    pendingWrites.Enqueue(packet.ToArray());
+                    if (writing) return;
+                    writing = true;
+                }
+
+                _ = WritePending();
+            }
+
+            private async Task WritePending()
             {
                 try
                 {
-                    if (socket != null)
+                    while (true)
                     {
-                        stream.BeginWrite(_packet.ToArray(), 0, _packet.Length(), null, null);
+                        byte[] frame;
+                        lock (pendingWrites)
+                        {
+                            if (!pendingWrites.TryDequeue(out frame!))
+                            {
+                                writing = false;
+                                return;
+                            }
+                        }
+
+                        await stream.WriteAsync(frame.AsMemory()).ConfigureAwait(false);
                     }
                 }
-                catch (Exception _ex)
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {_ex}");
+                    Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {ex.Message}");
+                    ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                 }
+            }
+
+            private void HandleFrame(byte[] _data)
+            {
+                using (Packet _packet = new Packet(_data))
+                {
+                    _packet.DecryptPayload();
+
+                    int _packetLength = _packet.ReadInt();
+                    int _packetId = _packet.ReadInt();
+
+                    if (_packetId == (int)ClientPackets.welcomeReceived)
+                    {
+                        int _clientIdCheck = _packet.ReadInt();
+                        string _username = _packet.ReadString();
+
+                        EnqueueCurrent(slot => ServerHandle.WelcomeReceived(slot, _clientIdCheck, _username));
+                    }
+                    else if (_packetId == (int)ClientPackets.placeBomb)
+                    {
+                        int roomId = _packet.ReadInt();
+                        int roundId = _packet.ReadInt();
+                        EnqueueCurrent(slot => slot.Room?.PlaceBomb(slot, roomId, roundId));
+                    }
+                    else if (_packetId == (int)ClientPackets.playerMovement)
+                    {
+                        int roomId = _packet.ReadInt();
+                        int roundId = _packet.ReadInt();
+                        float _x = _packet.ReadFloat();
+                        float _y = _packet.ReadFloat();
+                        EnqueueCurrent(slot => ServerHandle.PlayerMovement(slot, roomId, roundId, _x, _y));
+                    }
+                    else if (_packetId == (int)ClientPackets.udpReady)
+                    {
+                        int challenge = _packet.ReadInt();
+                        EnqueueCurrent(slot => ServerHandle.ConfirmUdp(slot, challenge));
+                    }
+                    else if (_packetId == (int)ClientPackets.requestStart)
+                    {
+                        int roomId = _packet.ReadInt();
+                        int roundId = _packet.ReadInt();
+                        EnqueueCurrent(slot => slot.Room?.StartRound(slot, roomId, roundId));
+                    }
+                    else if (_packetId == (int)ClientPackets.createRoom)
+                    {
+                        EnqueueCurrent(ServerHandle.CreateRoom);
+                    }
+                    else if (_packetId == (int)ClientPackets.joinRoom)
+                    {
+                        int roomId = _packet.ReadInt();
+                        EnqueueCurrent(slot => ServerHandle.JoinRoom(slot, roomId));
+                    }
+                    else if (_packetId == (int)ClientPackets.leaveRoom)
+                    {
+                        int roomId = _packet.ReadInt();
+                        EnqueueCurrent(slot => ServerHandle.LeaveRoom(slot, roomId));
+                    }
+                }
+            }
+
+            private void EnqueueCurrent(Action<Client> action)
+            {
+                ThreadManager.EnqueueAction(() =>
+                {
+                    Client slot = Server.clients[id];
+                    if (slot.tcp == this) action(slot);
+                });
             }
 
             private void ReceiveCallback(IAsyncResult _result)
@@ -66,53 +169,24 @@ namespace GameServer
                     int _byteLength = stream.EndRead(_result);
                     if (_byteLength <= 0)
                     {
-                        //disconnect
+                        ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                         return;
                     }
 
-                    byte[] _data = new byte[_byteLength];
-                    Array.Copy(receiveBuffer, _data, _byteLength);
-
-                    using (Packet _packet = new Packet(_data))
-                    {
-                        _packet.DecryptPayload();
-
-                        int _packetLength = _packet.ReadInt();
-                        int _packetId = _packet.ReadInt();
-
-                        if (_packetId == (int)ClientPackets.welcomeReceived)
-                        {
-                            int _clientIdCheck = _packet.ReadInt();
-                            string _username = _packet.ReadString();
-
-                            ThreadManager.EnqueueAction(() =>
-                            {
-                                ServerHandle.WelcomeReceived(id, _clientIdCheck, _username);
-                            });
-                        }
-                        else if (_packetId == (int)ClientPackets.playerMovement)
-                        {
-                            float _x = _packet.ReadFloat();
-                            float _y = _packet.ReadFloat();
-
-                            ThreadManager.EnqueueAction(() =>
-                            {
-                                ServerHandle.PlayerMovement(id, _x, _y);
-                            });
-                        }
-                    }
+                    frameReader.Feed(receiveBuffer.AsSpan(0, _byteLength), HandleFrame);
 
                     stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
                 }
                 catch (Exception _ex)
                 {
                     Console.WriteLine($"Loi nhan du lieu tu ID {id}: {_ex}");
+                    ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                 }
             }
         }
         public class UDP
         {
-            public IPEndPoint? endPoint;
+            public volatile IPEndPoint? endPoint;
             private readonly int id;
 
             public UDP(int _id)
@@ -126,17 +200,10 @@ namespace GameServer
                 Console.WriteLine($"[UDP] Client {id} UDP endpoint discovered: {endPoint}");
             }
 
-            public bool IsConnected()
-            {
-                return endPoint != null;
-            }
-
             public void SendData(Packet _packet)
             {
-                if (endPoint != null)
-                {
-                    Server.SendUDPData(endPoint, _packet);
-                }
+                var recipient = endPoint;
+                if (recipient != null) Server.SendUDPData(recipient, _packet);
             }
 
             public void HandleData(byte[] _packetData)
@@ -153,12 +220,16 @@ namespace GameServer
                         if (_packetId == (int)ClientPackets.playerMovement)
                         {
                             // Bóc tách dữ liệu nguyên thủy ngay trên luồng mạng trước khi Packet bị Dispose
+                            int roomId = _packet.ReadInt();
+                            int roundId = _packet.ReadInt();
                             float _x = _packet.ReadFloat();
                             float _y = _packet.ReadFloat();
 
                             ThreadManager.EnqueueAction(() =>
                             {
-                                ServerHandle.PlayerMovement(id, _x, _y);
+                                Client slot = Server.clients[id];
+                                if (slot.udp != this) return;
+                                ServerHandle.PlayerMovement(slot, roomId, roundId, _x, _y);
                             });
                         }
                     }

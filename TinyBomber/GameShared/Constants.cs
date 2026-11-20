@@ -8,9 +8,13 @@ namespace GameShared
         public const int MS_PER_TICK = 1000 / TICKS_PER_SEC;
 
         public const int PORT = 26950;
+        public const int UDP_PORT = PORT + 1;
         public const int MAX_PLAYERS = 4;
 
         public const int DATA_BUFFER_SIZE = 4096;
+
+        public const int MAP_WIDTH = 17;
+        public const int MAP_HEIGHT = 15;   
 
         public static readonly byte[] ENCRYPTION_KEY = new byte[16]
         {
@@ -20,8 +24,32 @@ namespace GameShared
 
         public const int AES_IV_SIZE = 16;
         public const int HMAC_SIZE = 32;
+    }
 
-        public const int UDP_PORT = PORT + 1;
+    public static class BombCollision
+    {
+        public const float PlayerRadius = 0.3f;
+
+        // Sweep the player's centre against the bomb cell expanded by the player's footprint.
+        public static bool BlocksStep(int col, int row, float x, float y, float nextX, float nextY)
+        {
+            float offsetX = x - (col - 8.5f), offsetY = y - (row - 7.5f);
+            float extent = 0.5f + PlayerRadius;
+            if (Math.Abs(offsetX) < extent && Math.Abs(offsetY) < extent)
+                return false; // Already overlapping: allow the player to leave.
+            float enter = 0f, exit = 1f;
+            return ClipAxis(offsetX, nextX - x, extent, ref enter, ref exit)
+                && ClipAxis(offsetY, nextY - y, extent, ref enter, ref exit);
+        }
+
+        private static bool ClipAxis(float start, float delta, float extent, ref float enter, ref float exit)
+        {
+            if (delta == 0f) return Math.Abs(start) < extent;
+            float a = (-extent - start) / delta, b = (extent - start) / delta;
+            enter = Math.Max(enter, Math.Min(a, b));
+            exit = Math.Min(exit, Math.Max(a, b));
+            return enter < exit;
+        }
     }
 
     public enum ServerPackets
@@ -29,12 +57,44 @@ namespace GameShared
         welcome = 1,
         spawnPlayer,
         playerPosition,
-        playerDisconnected
+        playerDisconnected,
+        mapData,
+        bombPlaced,
+        bombExploded,
+        udpProbe,
+        matchState,
+        roundBegin,
+        playerEliminated,
+        lobbyReady,
+        roomChanged,
+        roomError
     }
 
     public enum ClientPackets
     {
         welcomeReceived = 1,
-        playerMovement
+        playerMovement,
+        placeBomb,
+        udpReady,
+        requestStart,
+        createRoom,
+        joinRoom,
+        leaveRoom
+    }
+
+    public enum RoomError
+    {
+        NotReady,
+        AlreadyInRoom,
+        RoomNotFound,
+        RoomFull,
+        RoomMismatch
+    }
+
+    public enum MatchPhase
+    {
+        Waiting,
+        Playing,
+        Finished
     }
 }

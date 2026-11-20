@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\GameShared\GameShared.csproj" />
+    <InternalsVisibleTo Include="GameServer.Tests" />
   </ItemGroup>
 
 </Project>
