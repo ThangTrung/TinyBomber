@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net;
 using System.Net.Sockets;
 using UnityEngine;
@@ -203,67 +203,85 @@ public class Client : MonoBehaviour
             ThreadManager.ExecuteOnMainThread(() =>
             {
                 if (closed || instance == null || instance.tcp != this) return;
-                using (Packet _packet = new Packet(_data))
+                try
                 {
-                    _packet.DecryptPayload();
-                    int _packetLength = _packet.ReadInt();
-                    int _packetId = _packet.ReadInt();
-
-                    // Điều hướng
-                    if (_packetId == (int)ServerPackets.welcome)
-                    {
-                        ClientHandle.Welcome(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.spawnPlayer)
-                    {
-                        ClientHandle.SpawnPlayer(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.playerPosition)
-                    {
-                        ClientHandle.PlayerPosition(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.mapData)
-                    {
-                        ClientHandle.MapData(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.playerDisconnected)
-                    {
-                        ClientHandle.PlayerDisconnected(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.bombPlaced)
-                    {
-                        ClientHandle.BombPlaced(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.bombExploded)
-                    {
-                        ClientHandle.BombExploded(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.roundBegin)
-                    {
-                        ClientHandle.RoundBegin(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.matchState)
-                    {
-                        ClientHandle.MatchState(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.playerEliminated)
-                    {
-                        ClientHandle.PlayerEliminated(_packet);
-                    }
-                    else if (_packetId == (int)ServerPackets.lobbyReady)
-                    {
-                        instance.FinishHandshake();
-                    }
-                    else if (_packetId == (int)ServerPackets.roomChanged)
-                    {
-                        GameManager.instance.ChangeRoom(_packet.ReadInt());
-                    }
-                    else if (_packetId == (int)ServerPackets.roomError)
-                    {
-                        GameManager.instance.ApplyRoomError((RoomError)_packet.ReadInt());
-                    }
+                    HandlePacket(_data);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                    if (!closed && instance != null && instance.tcp == this)
+                        instance.Disconnect("Không xử lý được dữ liệu TCP từ máy chủ.");
                 }
             });
+        }
+
+        private void HandlePacket(byte[] _data)
+        {
+            using (Packet _packet = new Packet(_data))
+            {
+                _packet.DecryptPayload();
+                int _packetLength = _packet.ReadInt();
+                int _packetId = _packet.ReadInt();
+
+                // Điều hướng
+                if (_packetId == (int)ServerPackets.welcome)
+                {
+                    ClientHandle.Welcome(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.spawnPlayer)
+                {
+                    ClientHandle.SpawnPlayer(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.playerPosition)
+                {
+                    ClientHandle.PlayerPosition(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.mapData)
+                {
+                    ClientHandle.MapData(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.playerDisconnected)
+                {
+                    ClientHandle.PlayerDisconnected(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.bombPlaced)
+                {
+                    ClientHandle.BombPlaced(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.bombExploded)
+                {
+                    ClientHandle.BombExploded(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.roundBegin)
+                {
+                    ClientHandle.RoundBegin(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.matchState)
+                {
+                    ClientHandle.MatchState(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.playerEliminated)
+                {
+                    ClientHandle.PlayerEliminated(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.lobbyReady)
+                {
+                    instance.FinishHandshake();
+                }
+                else if (_packetId == (int)ServerPackets.roomChanged)
+                {
+                    GameManager.instance.ChangeRoom(_packet.ReadInt());
+                }
+                else if (_packetId == (int)ServerPackets.roomError)
+                {
+                    GameManager.instance.ApplyRoomError((RoomError)_packet.ReadInt());
+                }
+                else
+                {
+                    throw new System.IO.InvalidDataException($"Không nhận diện được TCP packet ID {_packetId}.");
+                }
+            }
         }
 
         private void ReceiveCallback(IAsyncResult _result)
@@ -353,26 +371,62 @@ public class Client : MonoBehaviour
                 ThreadManager.ExecuteOnMainThread(() =>
                 {
                     if (closed || instance == null || instance.udp != this) return;
-                    using (Packet _packet = new Packet(_data))
-                    {
-                        _packet.DecryptPayload();
-                        int _packetLength = _packet.ReadInt();
-                        int _packetId = _packet.ReadInt();
-
-                        if (_packetId == (int)ServerPackets.playerPosition)
-                        {
-                            ClientHandle.PlayerPosition(_packet);
-                        }
-                        else if (_packetId == (int)ServerPackets.udpProbe)
-                        {
-                            ClientSend.ConfirmUdp(_packet.ReadInt());
-                        }
-                    }
+                    HandleData(_data);
                 });
             }
             catch (Exception _ex)
             {
                 if (!closed) Debug.Log($"Lỗi nhận UDP: {_ex}");
+            }
+        }
+
+        private void HandleData(byte[] data)
+        {
+            using (Packet packet = new Packet(data))
+            {
+                int packetId;
+                try
+                {
+                    if (data.Length < sizeof(int) || BitConverter.ToInt32(data, 0) != data.Length - sizeof(int))
+                        throw new System.IO.InvalidDataException("Header độ dài UDP không khớp datagram.");
+                    packet.DecryptPayload();
+                    packet.ReadInt();
+                    packetId = packet.ReadInt();
+                    // Validate the datagram structure before calling a handler that can change state.
+                    if (packetId == (int)ServerPackets.playerPosition)
+                    {
+                        if (packet.UnreadLength() != 3 * sizeof(int) + 2 * sizeof(float))
+                            throw new System.IO.InvalidDataException("Độ dài UDP playerPosition không hợp lệ.");
+                    }
+                    else if (packetId == (int)ServerPackets.udpProbe)
+                    {
+                        if (packet.UnreadLength() != sizeof(int))
+                            throw new System.IO.InvalidDataException("Độ dài UDP udpProbe không hợp lệ.");
+                    }
+                    else
+                    {
+                        throw new System.IO.InvalidDataException($"Không nhận diện được UDP packet ID {packetId}.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning($"Bỏ gói UDP không hợp lệ: {ex}");
+                    return;
+                }
+
+                try
+                {
+                    if (packetId == (int)ServerPackets.playerPosition)
+                        ClientHandle.PlayerPosition(packet);
+                    else
+                        ClientSend.ConfirmUdp(packet.ReadInt());
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                    if (!closed && instance != null && instance.udp == this)
+                        instance.Disconnect("Không áp dụng được dữ liệu UDP từ máy chủ.");
+                }
             }
         }
     }
