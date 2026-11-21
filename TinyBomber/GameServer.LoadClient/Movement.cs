@@ -64,27 +64,30 @@ internal sealed class MovementTrace
     private readonly object sync = new();
     private readonly Dictionary<Position, Entry> recent = new();
     private readonly Queue<Position> order = new();
-    private int sent;
-    private int observed;
-    private double lagTotal;
-    private double lagMax;
-    private float maxStep;
-    private MovementEvidence? firstMatch;
+    private int warmupSent;
+    private int warmupObserved;
+    private int measuredSent;
+    private int measuredObserved;
+    private double measuredLagTotal;
+    private double measuredLagMax;
+    private float measuredMaxStep;
+    private MovementEvidence? firstMeasuredMatch;
 
-    private sealed class Entry(Position origin, Position target)
+    private sealed class Entry(Position origin, Position target, bool measured)
     {
         internal Position Origin { get; } = origin;
         internal Position Target { get; } = target;
+        internal bool Measured { get; } = measured;
         internal bool Sent { get; set; }
         internal int ObserverId { get; set; }
         internal Position Observed { get; set; }
     }
 
-    internal void Prepare(Position origin, Position target)
+    internal void Prepare(Position origin, Position target, bool measured)
     {
         lock (sync)
         {
-            recent.Add(target, new Entry(origin, target));
+            recent.Add(target, new Entry(origin, target, measured));
             order.Enqueue(target);
             if (order.Count > RecentLimit) recent.Remove(order.Dequeue());
         }
@@ -96,10 +99,17 @@ internal sealed class MovementTrace
         {
             Entry entry = recent[target];
             entry.Sent = true;
-            sent++;
-            lagTotal += lagMs;
-            lagMax = Math.Max(lagMax, lagMs);
-            maxStep = Math.Max(maxStep, entry.Origin.DistanceTo(target));
+            if (entry.Measured)
+            {
+                measuredSent++;
+                measuredLagTotal += lagMs;
+                measuredLagMax = Math.Max(measuredLagMax, lagMs);
+                measuredMaxStep = Math.Max(measuredMaxStep, entry.Origin.DistanceTo(target));
+            }
+            else
+            {
+                warmupSent++;
+            }
             if (entry.ObserverId != 0) CountMatch(entry);
         }
     }
@@ -117,15 +127,24 @@ internal sealed class MovementTrace
 
     private void CountMatch(Entry entry)
     {
-        observed++;
-        firstMatch ??= new MovementEvidence(entry.ObserverId, entry.Origin, entry.Target, entry.Observed);
+        // A late observation belongs to the input's send window.
+        if (!entry.Measured)
+        {
+            warmupObserved++;
+            return;
+        }
+        measuredObserved++;
+        firstMeasuredMatch ??= new MovementEvidence(entry.ObserverId, entry.Origin, entry.Target, entry.Observed);
     }
 
     internal MovementCounts Read()
     {
-        lock (sync) return new MovementCounts(sent, observed, lagTotal, lagMax, maxStep, firstMatch);
+        lock (sync)
+            return new MovementCounts(measuredSent, measuredObserved, measuredLagTotal, measuredLagMax,
+                measuredMaxStep, firstMeasuredMatch, warmupSent, warmupObserved);
     }
 }
 
 internal sealed record MovementCounts(
-    int Sent, int Observed, double LagTotalMs, double LagMaxMs, float MaxStep, MovementEvidence? FirstMatch);
+    int Sent, int Observed, double LagTotalMs, double LagMaxMs, float MaxStep, MovementEvidence? FirstMatch,
+    int WarmupSent, int WarmupObserved);

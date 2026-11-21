@@ -9,7 +9,8 @@ internal sealed record LoadOptions(
     int Clients = 8,
     WorkloadMode Mode = WorkloadMode.LobbyIdle,
     int MovementHz = 20,
-    int Seconds = 10)
+    int Seconds = 10,
+    int WarmupSeconds = 0)
 {
     internal const int MaxMovementHz = 50; // Unity's 0.02 s fixed timestep.
     internal const int MaxSeconds = 600; // Keeps unique movement targets inside one spawn cell.
@@ -17,7 +18,9 @@ internal sealed record LoadOptions(
     internal const string Usage = """
         GameServer.LoadClient [--server <IPv4 hoặc hostname>] [--clients <1-2048>]
            [--mode lobby-idle|gameplay-idle|gameplay-active] [--movement-hz <1-50>] [--seconds <1-600>]
-        Mặc định: 127.0.0.1, 8 client, lobby-idle, 20 Hz, 10 giây.
+           [--warmup-seconds <0-599>]
+        Mặc định: 127.0.0.1, 8 client, lobby-idle, 20 Hz, đo 10 giây, warm-up 0 giây.
+        Tổng thời gian warm-up và đo tối đa 600 giây.
         Chế độ gameplay cần ít nhất 2 client. Phòng được chia đều, tối đa 4 client/phòng.
         """;
 
@@ -38,6 +41,7 @@ internal sealed record LoadOptions(
                 "--clients" => options with { Clients = ParseInt(option, value, 2048) },
                 "--movement-hz" => options with { MovementHz = ParseInt(option, value, MaxMovementHz) },
                 "--seconds" => options with { Seconds = ParseInt(option, value, MaxSeconds) },
+                "--warmup-seconds" => options with { WarmupSeconds = ParseInt(option, value, MaxSeconds - 1, minimum: 0) },
                 "--mode" => options with
                 {
                     Mode = value switch
@@ -53,14 +57,16 @@ internal sealed record LoadOptions(
         }
         if (options.Mode != WorkloadMode.LobbyIdle && options.Clients < 2)
             throw new ArgumentException("Chế độ gameplay cần ít nhất 2 client.");
+        if (options.WarmupSeconds + options.Seconds > MaxSeconds)
+            throw new ArgumentException($"Tổng thời gian warm-up và đo tối đa {MaxSeconds} giây.");
         return options;
     }
 
-    private static int ParseInt(string option, string value, int maximum)
+    private static int ParseInt(string option, string value, int maximum, int minimum = 1)
     {
         if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out int parsed) ||
-            parsed < 1 || parsed > maximum)
-            throw new ArgumentException($"{option} cần số nguyên từ 1 đến {maximum}.");
+            parsed < minimum || parsed > maximum)
+            throw new ArgumentException($"{option} cần số nguyên từ {minimum} đến {maximum}.");
         return parsed;
     }
 }

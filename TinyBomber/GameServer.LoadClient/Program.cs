@@ -9,6 +9,16 @@ namespace GameServer.LoadClient;
 
 internal enum ErrorKind { Connection, Send, Receive, Timeout, Workload }
 
+internal readonly record struct WorkloadWindow(
+    long StartsAt, DateTimeOffset StartsUtc, int WarmupSeconds, int MeasurementSeconds)
+{
+    internal int TotalSeconds => WarmupSeconds + MeasurementSeconds;
+    internal long MeasurementStartsAt => StartsAt + WarmupSeconds * Stopwatch.Frequency;
+    internal long EndsAt => StartsAt + TotalSeconds * Stopwatch.Frequency;
+    internal bool ContainsMeasurement(long timestamp) => timestamp >= MeasurementStartsAt && timestamp < EndsAt;
+    internal DateTimeOffset UtcAt(long timestamp) => StartsUtc + Stopwatch.GetElapsedTime(StartsAt, timestamp);
+}
+
 internal sealed class RunErrors
 {
     private const int DetailLimit = 12;
@@ -70,6 +80,7 @@ internal static class Program
         DateTimeOffset? measurementStartUtc = null;
         DateTimeOffset? measurementEndUtc = null;
         double? cpuPercent = null;
+        double? processSampleSeconds = null;
         long? workingSetBytes = null;
         using var process = Process.GetCurrentProcess();
         try
@@ -87,26 +98,43 @@ internal static class Program
             if (gameplay)
                 await SetUpRoomsAsync(clients, rounds, active, errors, stop);
             RequireHealthy(clients, errors, rounds);
-            Console.Error.WriteLine($"Bắt đầu workload {options.Seconds}s. Phòng đang chơi: {rounds.Values.Select(state => state.RoomId).Distinct().Count()}.");
+            Console.Error.WriteLine($"Warm-up {options.WarmupSeconds}s, đo {options.Seconds}s. Phòng đang chơi: {rounds.Values.Select(state => state.RoomId).Distinct().Count()}.");
 
-            process.Refresh();
-            TimeSpan cpuStart = process.TotalProcessorTime;
-            var duration = TimeSpan.FromSeconds(options.Seconds);
-            measurementStartUtc = DateTimeOffset.UtcNow;
-            long start = Stopwatch.GetTimestamp();
+            var workload = new WorkloadWindow(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow,
+                options.WarmupSeconds, options.Seconds);
+            TimeSpan? cpuAtMeasurementStart = null;
+            long processSampleStart = 0;
+            void SampleMeasurementStart()
+            {
+                measurementStartUtc = workload.UtcAt(workload.MeasurementStartsAt);
+                process.Refresh();
+                cpuAtMeasurementStart = process.TotalProcessorTime;
+                processSampleStart = Stopwatch.GetTimestamp();
+            }
             try
             {
-                await RunWindowAsync(clients, rounds, active, options.MovementHz, start, duration, errors, stop);
+                await RunWindowAsync(clients, rounds, active, options.MovementHz, workload,
+                    SampleMeasurementStart, errors, stop);
             }
             finally
             {
-                elapsed = Stopwatch.GetElapsedTime(start).TotalSeconds;
-                measurementEndUtc = DateTimeOffset.UtcNow;
-                process.Refresh();
-                workingSetBytes = process.WorkingSet64;
-                if (elapsed > 0)
-                    cpuPercent = 100 * (process.TotalProcessorTime - cpuStart).TotalSeconds /
-                        (elapsed * Environment.ProcessorCount);
+                long finished = Stopwatch.GetTimestamp();
+                if (finished >= workload.MeasurementStartsAt)
+                {
+                    long end = Math.Min(finished, workload.EndsAt);
+                    elapsed = Stopwatch.GetElapsedTime(workload.MeasurementStartsAt, end).TotalSeconds;
+                    measurementStartUtc ??= workload.UtcAt(workload.MeasurementStartsAt);
+                    measurementEndUtc = workload.UtcAt(end);
+                    process.Refresh();
+                    workingSetBytes = process.WorkingSet64;
+                    if (cpuAtMeasurementStart is TimeSpan cpuStart && finished > processSampleStart)
+                    {
+                        double sampleSeconds = Stopwatch.GetElapsedTime(processSampleStart, finished).TotalSeconds;
+                        cpuPercent = 100 * (process.TotalProcessorTime - cpuStart).TotalSeconds /
+                            (sampleSeconds * Environment.ProcessorCount);
+                        processSampleSeconds = sampleSeconds;
+                    }
+                }
             }
 
             if (active)
@@ -158,6 +186,8 @@ internal static class Program
                 ClientsObservedByPeer = counts.Count(count => count.Observed > 0),
                 MovementSent = sent,
                 MatchedPeerPositionUpdates = counts.Sum(count => (long)count.Observed),
+                WarmupMovementSent = counts.Sum(count => (long)count.WarmupSent),
+                WarmupMatchedPeerPositionUpdates = counts.Sum(count => (long)count.WarmupObserved),
                 RequestedMovementHzPerClient = active ? options.MovementHz : 0,
                 RequestedMovementSlots = active ? (long)options.Clients * options.MovementHz * options.Seconds : 0,
                 ActualMovementHzPerRequestedClient = elapsed > 0 ? sent / (elapsed * options.Clients) : (double?)null,
@@ -165,10 +195,13 @@ internal static class Program
                 SchedulingLagMeanMs = sent > 0 ? counts.Sum(count => count.LagTotalMs) / sent : (double?)null,
                 SchedulingLagMaxMs = sent > 0 ? counts.Max(count => count.LagMaxMs) : (double?)null,
                 MaxSentStep = sent > 0 ? counts.Max(count => count.MaxStep) : (float?)null,
+                options.WarmupSeconds,
                 MeasurementSeconds = elapsed,
                 MeasurementStartUtc = measurementStartUtc,
                 MeasurementEndUtc = measurementEndUtc,
                 ProcessCpuPercentOfLogicalCapacity = cpuPercent,
+                ProcessSampleSeconds = processSampleSeconds,
+                Runtime = System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription,
                 LogicalProcessors = Environment.ProcessorCount,
                 ProcessWorkingSetBytes = workingSetBytes,
                 Errors = errors.Counts(),
@@ -262,22 +295,32 @@ internal static class Program
     }
 
     private static async Task RunWindowAsync(SimulatedClient[] clients, Dictionary<SimulatedClient, ClientState> rounds,
-        bool active, int hz, long start, TimeSpan duration, RunErrors errors, CancellationToken stop)
+        bool active, int hz, WorkloadWindow workload, Action sampleMeasurementStart,
+        RunErrors errors, CancellationToken stop)
     {
         using var window = CancellationTokenSource.CreateLinkedTokenSource(stop);
-        window.CancelAfter(duration);
+        bool measurementStarted = workload.WarmupSeconds == 0;
+        if (measurementStarted) sampleMeasurementStart();
+        window.CancelAfter(Stopwatch.GetElapsedTime(Stopwatch.GetTimestamp(), workload.EndsAt));
         var movers = active
-            ? clients.Select(client => client.MoveAsync(rounds[client], start, duration, hz, window.Token)).ToArray()
+            ? clients.Select(client => client.MoveAsync(rounds[client], workload, hz, window.Token)).ToArray()
             : Array.Empty<Task>();
         try
         {
-            TimeSpan remaining;
-            while ((remaining = duration - Stopwatch.GetElapsedTime(start)) > TimeSpan.Zero)
+            while (true)
             {
+                long now = Stopwatch.GetTimestamp();
+                if (now >= workload.EndsAt) break;
                 RequireHealthy(clients, errors, rounds);
-                await Task.Delay(remaining < TimeSpan.FromMilliseconds(100) ? remaining : TimeSpan.FromMilliseconds(100), stop);
+                if (!measurementStarted && now >= workload.MeasurementStartsAt)
+                {
+                    sampleMeasurementStart();
+                    measurementStarted = true;
+                }
+                long nextBoundary = measurementStarted ? workload.EndsAt : workload.MeasurementStartsAt;
+                double delayMs = Math.Clamp(Stopwatch.GetElapsedTime(Stopwatch.GetTimestamp(), nextBoundary).TotalMilliseconds, 1, 100);
+                await Task.Delay(TimeSpan.FromMilliseconds(delayMs), stop);
             }
-            await Task.WhenAll(movers);
         }
         finally
         {

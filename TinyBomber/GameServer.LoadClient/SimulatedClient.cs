@@ -372,15 +372,16 @@ internal sealed class SimulatedClient : IAsyncDisposable
         get { lock (stateLock) return corrected; }
     }
 
-    internal async Task MoveAsync(ClientState round, long start, TimeSpan duration, int hz, CancellationToken stop)
+    internal async Task MoveAsync(ClientState round, WorkloadWindow window, int hz, CancellationToken stop)
     {
         using var run = CancellationTokenSource.CreateLinkedTokenSource(stop, lifetime.Token);
         CancellationToken token = run.Token;
         Position position;
         MovementPath path;
         long period = (Stopwatch.Frequency + hz - 1) / hz;
-        int steps = (int)(duration.TotalSeconds * hz);
-        long end = start + (long)(duration.TotalSeconds * Stopwatch.Frequency);
+        int steps = window.TotalSeconds * hz;
+        long start = window.StartsAt;
+        long end = window.EndsAt;
         long lastWriteCompleted = 0;
         int step = 0;
         try
@@ -421,9 +422,9 @@ internal sealed class SimulatedClient : IAsyncDisposable
                 packet.EncryptPayload();
                 packet.InsertInt(round.Id);
                 byte[] data = packet.ToArray();
-                Trace.Prepare(position, target);
                 long sendAt = Stopwatch.GetTimestamp();
                 if (sendAt >= end) break;
+                Trace.Prepare(position, target, window.ContainsMeasurement(sendAt));
                 // Use the latest due slot. Never emit a burst to make up missed slots.
                 slot = (sendAt - start) / period;
                 try { await SendUdpAsync(data, token).ConfigureAwait(false); }
