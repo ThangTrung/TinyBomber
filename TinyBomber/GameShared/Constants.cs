@@ -67,7 +67,11 @@ namespace GameShared
         playerEliminated,
         lobbyReady,
         roomChanged,
-        roomError
+        roomError,
+        serverHello = 15,
+        sessionGranted = 16,
+        udpProbeV2 = 17,
+        udpPlayerPosition = 18
     }
 
     public enum ClientPackets
@@ -79,7 +83,11 @@ namespace GameShared
         requestStart,
         createRoom,
         joinRoom,
-        leaveRoom
+        leaveRoom,
+        clientHello = 9,
+        udpRegistration = 10,
+        udpConfirm = 11,
+        udpPlayerMovement = 12
     }
 
     public enum RoomError
