@@ -1,12 +1,16 @@
 ﻿using System;
+using System.Diagnostics;
+using System.Net;
 using GameShared;
 
 namespace GameServer
 {
     class ServerHandle
     {
-        public static void WelcomeReceived(Client slot, int _clientIdCheck, string _username)
+        public static void WelcomeReceived(Client slot, int _clientIdCheck, string _username, long? now = null)
         {
+            if (slot.tcp.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp())) return;
+
             if (slot.id != _clientIdCheck)
             {
                 Console.WriteLine($"[CẢNH BÁO] ID không khớp! Có dấu hiệu gian lận từ người chơi {_username}");
@@ -18,10 +22,20 @@ namespace GameServer
             Console.WriteLine($"[ĐĂNG NHẬP] Người chơi ID {slot.id} (Tên: {_username}) đã kết nối.");
         }
 
-        internal static void ConfirmUdp(Client slot, int challenge)
+        internal static bool RegisterUdp(Client slot, Client.UDP udp, IPEndPoint endpoint, long? now = null)
+        {
+            if (slot.udp != udp || slot.Username == null || slot.UdpConfirmed ||
+                slot.tcp.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp())) return false;
+
+            if (udp.endPoint == null) udp.Connect(endpoint);
+            return endpoint.Equals(udp.endPoint);
+        }
+
+        internal static void ConfirmUdp(Client slot, int challenge, long? now = null)
         {
             if (slot.Username == null || slot.UdpConfirmed || slot.udp.endPoint == null ||
-                challenge != slot.tcp.UdpChallenge) return;
+                challenge != slot.tcp.UdpChallenge ||
+                slot.tcp.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp())) return;
 
             slot.UdpConfirmed = true;
             ServerSend.LobbyReady(slot);

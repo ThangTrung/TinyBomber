@@ -51,34 +51,40 @@ namespace GameServer
         // One collector for the server process, including late socket completions.
         internal static NetworkMetrics Network { get; } = new();
 
-        public static void Start(int maxConnections, int _port)
+        public static void Start(int maxConnections, int port) =>
+            Start(maxConnections, IPAddress.Any, port, Constants.UDP_PORT);
+
+        internal static (int TcpPort, int UdpPort) Start(int maxConnections, IPAddress address, int tcpPort, int udpPort)
         {
             MaxConnections = maxConnections;
-            Port = _port;
 
             Console.WriteLine("Dang khoi dong may chu Tiny Bomber...");
             ThreadManager.Initialize();
             InitializeServerData();
 
-            tcpListener = new TcpListener(IPAddress.Any, Port);
+            tcpListener = new TcpListener(address, tcpPort);
             tcpListener.Start();
-            tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
+            Port = ((IPEndPoint)tcpListener.LocalEndpoint).Port;
             Console.WriteLine($"[THANH CONG] May chu da mo tren cong {Port}.");
 
             try
             {
-                udpSocket = new UdpClient(Constants.UDP_PORT);
+                udpSocket = new UdpClient(new IPEndPoint(address, udpPort));
                 udpSocket.DontFragment = true;
-                udpSocket.BeginReceive(UDPReceiveCallback, null);
-                Console.WriteLine($"[THANH CONG] UDP socket da mo tren cong {Constants.UDP_PORT}.");
             }
             catch (Exception ex)
             {
+                tcpListener.Stop();
                 Console.WriteLine($"[ERROR] Khong the tao UDP socket: {ex.Message}");
                 throw;
             }
 
+            int boundUdpPort = ((IPEndPoint)udpSocket.Client.LocalEndPoint!).Port;
+            Console.WriteLine($"[THANH CONG] UDP socket da mo tren cong {boundUdpPort}.");
             StartUpdateLoop();
+            tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
+            udpSocket.BeginReceive(UDPReceiveCallback, null);
+            return (Port, boundUdpPort);
         }
 
         private static void UDPReceiveCallback(IAsyncResult _result)
@@ -114,10 +120,7 @@ namespace GameServer
                     ThreadManager.EnqueueAction(() =>
                     {
                         Client slot = clients[_clientId];
-                        if (slot.udp != udp || slot.Username == null || slot.UdpConfirmed) return;
-
-                        if (udp.endPoint == null) udp.Connect(_clientEndPoint);
-                        if (_clientEndPoint.Equals(udp.endPoint)) ServerSend.UdpProbe(slot);
+                        if (ServerHandle.RegisterUdp(slot, udp, _clientEndPoint)) ServerSend.UdpProbe(slot);
                     });
                     return;
                 }
@@ -202,18 +205,45 @@ namespace GameServer
 
         private static void UpdateLoop()
         {
+            var expiredHandshakes = new List<(int Id, Client.TCP Connection)>();
             while (isRunning)
             {
-                metrics.BeginTick(Stopwatch.GetTimestamp());
+                long now = Stopwatch.GetTimestamp();
+                metrics.BeginTick(now);
+                ExpirePendingHandshakes(now, expiredHandshakes);
                 ThreadManager.UpdateMain();
                 long roomStarted = Stopwatch.GetTimestamp();
-                long now = roomStarted;
-                foreach (var room in rooms.Values) room.UpdateRound(now);
+                foreach (var room in rooms.Values) room.UpdateRound(roomStarted);
                 metrics.EndGameplay(ThreadManager.LastBatchMetrics,
                     Stopwatch.GetElapsedTime(roomStarted).TotalMilliseconds);
                 if (metrics.IsSnapshotDue(Stopwatch.GetTimestamp()))
                     CaptureMetrics();
             }
+        }
+
+        private static void ExpirePendingHandshakes(long now, List<(int Id, Client.TCP Connection)> expired)
+        {
+            lock (slotLock)
+            {
+                foreach (var slot in clients.Values)
+                {
+                    Client.TCP connection = slot.tcp;
+                    if (connection.socket != null && !slot.IsReady && connection.HandshakeHasExpired(now))
+                        expired.Add((slot.id, connection));
+                }
+            }
+
+            foreach (var (id, connection) in expired)
+                ExpireHandshake(id, connection, now);
+            expired.Clear();
+        }
+
+        // Runs on the update thread. Ignore a timeout for a TCP wrapper that has already been removed.
+        internal static void ExpireHandshake(int id, Client.TCP connection, long now)
+        {
+            Client slot = clients[id];
+            if (slot.tcp == connection && connection.socket != null && !slot.IsReady && connection.HandshakeHasExpired(now))
+                Disconnect(id, connection);
         }
 
         private static void CaptureMetrics()
@@ -322,7 +352,7 @@ namespace GameServer
             lock (slotLock)
             {
                 if (slot.tcp != connection) return;
-                connection.socket?.Close();
+                connection.Close();
                 slot.Username = null;
                 slot.UdpConfirmed = false;
                 slot.tcp = new Client.TCP(id);

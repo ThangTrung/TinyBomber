@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using GameShared;
@@ -25,13 +26,16 @@ namespace GameServer
 
         public class TCP
         {
+            private const int HandshakeTimeoutSeconds = 20;
             public TcpClient socket = null!;
             private readonly int id;
+            private long? handshakeDeadline;
             private NetworkStream stream = null!;
             private byte[] receiveBuffer = null!;
             private TcpFrameReader frameReader = null!;
             private readonly Queue<byte[]> pendingWrites = new();
             private bool writing;
+            private volatile bool closed;
             internal int UdpChallenge { get; } =
                 System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue);
 
@@ -40,9 +44,18 @@ namespace GameServer
                 id = _id;
             }
 
+            internal void StartHandshake(long now)
+            {
+                handshakeDeadline ??= now + HandshakeTimeoutSeconds * Stopwatch.Frequency;
+            }
+
+            internal bool HandshakeHasExpired(long now) =>
+                handshakeDeadline is long deadline && now >= deadline;
+
             public void Connect(TcpClient _socket)
             {
                 socket = _socket;
+                StartHandshake(Stopwatch.GetTimestamp());
                 socket.ReceiveBufferSize = Constants.DATA_BUFFER_SIZE;
                 socket.SendBufferSize = Constants.DATA_BUFFER_SIZE;
 
@@ -53,6 +66,12 @@ namespace GameServer
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
 
                 ServerSend.Welcome(this, id, "Chao mung ban den voi may chu Tiny Bomber!");
+            }
+
+            internal void Close()
+            {
+                closed = true;
+                socket?.Close();
             }
 
             public void SendData(Packet packet)
@@ -99,6 +118,7 @@ namespace GameServer
                 }
                 catch (Exception ex)
                 {
+                    if (closed) return;
                     Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {ex.Message}");
                     ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                 }
@@ -189,6 +209,7 @@ namespace GameServer
                 }
                 catch (Exception _ex)
                 {
+                    if (closed) return;
                     Console.WriteLine($"Loi nhan du lieu tu ID {id}: {_ex}");
                     ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                 }

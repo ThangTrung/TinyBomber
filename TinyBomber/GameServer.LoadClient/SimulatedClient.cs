@@ -11,7 +11,7 @@ internal readonly record struct ClientState(
 
 internal sealed class SimulatedClient : IAsyncDisposable
 {
-    private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(12);
+    private const int HandshakeTimeoutSeconds = 16;
     private readonly object stateLock = new();
     private readonly CancellationTokenSource lifetime;
     private readonly RunErrors errors;
@@ -26,6 +26,8 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private UdpClient? udp;
     private Task receiveTcp = Task.CompletedTask;
     private Task receiveUdp = Task.CompletedTask;
+    private long? handshakeDeadline;
+    private bool handshakeTimedOut;
     private bool connected;
     private bool ready;
     private bool alive;
@@ -71,9 +73,39 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     internal async Task ConnectAsync(IPAddress address)
     {
+        long deadline = Stopwatch.GetTimestamp() + HandshakeTimeoutSeconds * Stopwatch.Frequency;
+        lock (stateLock)
+        {
+            if (handshakeDeadline.HasValue)
+                throw new InvalidOperationException("Mỗi SimulatedClient chỉ dùng cho một lần kết nối.");
+            handshakeDeadline = deadline;
+        }
+
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        timeout.CancelAfter(HandshakeTimeout);
-        CancellationToken token = timeout.Token;
+        Task deadlineTask = CancelAtHandshakeDeadlineAsync(deadline, timeout);
+        try
+        {
+            await ConnectAttemptAsync(address, timeout.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            timeout.Cancel();
+            await deadlineTask.ConfigureAwait(false);
+        }
+    }
+
+    private static async Task CancelAtHandshakeDeadlineAsync(long deadline, CancellationTokenSource timeout)
+    {
+        try
+        {
+            await DelayUntilAsync(deadline, timeout.Token).ConfigureAwait(false);
+            timeout.Cancel();
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested) { }
+    }
+
+    private async Task ConnectAttemptAsync(IPAddress address, CancellationToken token)
+    {
         try
         {
             tcp = new TcpClient(AddressFamily.InterNetwork);
@@ -83,7 +115,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            if (!lifetime.IsCancellationRequested) Fail(ErrorKind.Timeout, "TCP connect quá hạn.");
+            ExpireHandshake("TCP connect quá hạn.");
             return;
         }
         catch (Exception ex) when (ex is SocketException or IOException)
@@ -120,7 +152,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            if (!lifetime.IsCancellationRequested) Fail(ErrorKind.Timeout, "Handshake TCP/UDP quá hạn.");
+            ExpireHandshake("Handshake TCP/UDP quá hạn.");
         }
         catch (Exception ex) when (ex is SocketException or IOException)
         {
@@ -206,6 +238,12 @@ internal sealed class SimulatedClient : IAsyncDisposable
         if (isUdp && type is not (ServerPackets.udpProbe or ServerPackets.playerPosition))
             throw new InvalidDataException($"Packet UDP không hợp lệ: {type}.");
 
+        if (type == ServerPackets.lobbyReady)
+        {
+            FinishHandshake();
+            return;
+        }
+
         lock (stateLock)
         {
             switch (type)
@@ -218,10 +256,6 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     break;
                 case ServerPackets.udpProbe:
                     udpChallenge.TrySetResult(packet.ReadInt());
-                    break;
-                case ServerPackets.lobbyReady:
-                    ready = true;
-                    lobbyReady.TrySetResult();
                     break;
                 case ServerPackets.roomChanged:
                     roomId = packet.ReadInt();
@@ -454,10 +488,46 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
     }
 
+    private void FinishHandshake()
+    {
+        lock (stateLock)
+        {
+            if (!connected || ready || handshakeTimedOut || lifetime.IsCancellationRequested) return;
+
+            if (Stopwatch.GetTimestamp() < handshakeDeadline!.Value)
+            {
+                ready = true;
+                lobbyReady.TrySetResult();
+                return;
+            }
+        }
+
+        ExpireHandshake("Handshake TCP/UDP quá hạn.");
+    }
+
+    private void ExpireHandshake(string message)
+    {
+        lock (stateLock)
+        {
+            if (ready || handshakeTimedOut || lifetime.IsCancellationRequested) return;
+            handshakeTimedOut = true;
+            connected = false;
+            errors.Add(ErrorKind.Timeout, $"Client {index}: {message}");
+        }
+
+        lifetime.Cancel();
+        tcp?.Dispose();
+        udp?.Dispose();
+    }
+
     private void Fail(ErrorKind kind, string message)
     {
-        errors.Add(kind, $"Client {index}: {message}");
-        lock (stateLock) connected = ready = false;
+        lock (stateLock)
+        {
+            if (handshakeTimedOut) return;
+            errors.Add(kind, $"Client {index}: {message}");
+            connected = ready = false;
+        }
         lifetime.Cancel();
     }
 

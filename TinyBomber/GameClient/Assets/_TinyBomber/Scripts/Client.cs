@@ -5,6 +5,7 @@ using System.Net.Sockets;
 using System.Threading.Tasks;
 using UnityEngine;
 using GameShared;
+using Stopwatch = System.Diagnostics.Stopwatch;
 
 public class Client : MonoBehaviour
 {
@@ -17,8 +18,7 @@ public class Client : MonoBehaviour
     public UDP udp;
     public bool IsConnecting { get; private set; }
 
-    private const float ConnectionTimeout = 8f;
-    private float handshakeDeadline;
+    private const int HandshakeTimeoutSeconds = 16;
 
     private void Awake()
     {
@@ -35,17 +35,18 @@ public class Client : MonoBehaviour
 
     private void Update()
     {
-        if (!IsConnecting) return;
-
-        if (Time.realtimeSinceStartup >= handshakeDeadline)
-        {
-            Disconnect(myId == 0
-                ? "Máy chủ không phản hồi qua TCP."
-                : "Máy chủ chưa xác nhận kết nối UDP.");
-            return;
-        }
-
+        if (!IsConnecting || CheckHandshakeDeadline()) return;
         udp?.RetryRegistration();
+    }
+
+    private bool CheckHandshakeDeadline()
+    {
+        if (!tcp.HandshakeHasExpired(Stopwatch.GetTimestamp())) return false;
+
+        Disconnect(myId == 0
+            ? "Máy chủ không phản hồi qua TCP."
+            : "Máy chủ chưa xác nhận kết nối UDP.");
+        return true;
     }
 
     public void ConnectToServer(string address)
@@ -60,10 +61,9 @@ public class Client : MonoBehaviour
             return;
         }
 
-        IsConnecting = true;
-        handshakeDeadline = Time.realtimeSinceStartup + ConnectionTimeout;
-        GameManager.instance.SetConnectionStatus("Đang kết nối TCP…");
         tcp = new TCP();
+        IsConnecting = true;
+        GameManager.instance.SetConnectionStatus("Đang kết nối TCP…");
         try
         {
             tcp.Connect(address, port);
@@ -77,11 +77,10 @@ public class Client : MonoBehaviour
 
     public void BeginUdpHandshake(int clientId)
     {
-        if (!IsConnecting || udp != null) return;
+        if (!IsConnecting || udp != null || CheckHandshakeDeadline()) return;
 
         myId = clientId;
         ClientSend.WelcomeReceived();
-        handshakeDeadline = Time.realtimeSinceStartup + ConnectionTimeout;
         GameManager.instance.SetConnectionStatus("Đang xác nhận UDP…");
 
         try
@@ -100,7 +99,7 @@ public class Client : MonoBehaviour
 
     private void FinishHandshake()
     {
-        if (!IsConnecting || udp == null) return;
+        if (!IsConnecting || udp == null || CheckHandshakeDeadline()) return;
 
         IsConnecting = false;
         GameManager.instance.ConfirmLobbyReady();
@@ -136,6 +135,8 @@ public class Client : MonoBehaviour
 
     public class TCP
     {
+        private readonly long handshakeDeadline =
+            Stopwatch.GetTimestamp() + HandshakeTimeoutSeconds * Stopwatch.Frequency;
         public TcpClient socket;
         private NetworkStream stream;
         private byte[] receiveBuffer;
@@ -144,6 +145,8 @@ public class Client : MonoBehaviour
         private readonly Queue<byte[]> pendingWrites = new Queue<byte[]>();
         private bool writing;
         private bool sendFailed;
+
+        internal bool HandshakeHasExpired(long now) => now >= handshakeDeadline;
 
         public void Close()
         {
