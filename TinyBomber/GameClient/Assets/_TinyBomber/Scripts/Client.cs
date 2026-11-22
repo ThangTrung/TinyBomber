@@ -102,6 +102,9 @@ public class Client : MonoBehaviour
         }
 
         myId = slotId;
+#if TINYBOMBER_PROTOCOL_V4
+        tcp.AcceptedProtocolVersion = version;
+#endif
         ClientSend.SendClientHello();
         GameManager.instance.SetConnectionStatus("Đang chờ cấp phiên…");
     }
@@ -173,6 +176,10 @@ public class Client : MonoBehaviour
 
     public class TCP
     {
+#if TINYBOMBER_PROTOCOL_V4
+        internal int AcceptedProtocolVersion { get; set; }
+        internal bool UsesMovementOrdering => AcceptedProtocolVersion == ProtocolV4.Version;
+#endif
         private readonly long handshakeDeadline =
             Stopwatch.GetTimestamp() + HandshakeTimeoutSeconds * Stopwatch.Frequency;
         public TcpClient socket;
@@ -367,6 +374,27 @@ public class Client : MonoBehaviour
                     return;
                 }
 
+#if TINYBOMBER_PROTOCOL_V4
+                if (UsesMovementOrdering && !instance.IsConnecting)
+                {
+                    if (_packetId == (int)ServerPackets.playerPositionV4)
+                    {
+                        var position = ProtocolV4.ReadTcpPlayerPosition(_packet);
+                        GameManager.instance.ApplyOrderedPeerPosition(position.RoomId, position.RoundId,
+                            position.PlayerId, position.AcceptedMoveSeq, new Vector2(position.X, position.Y));
+                        return;
+                    }
+                    if (_packetId == (int)ServerPackets.playerCorrectionV4)
+                    {
+                        var correction = ProtocolV4.ReadTcpPlayerCorrection(_packet);
+                        GameManager.instance.ApplyOrderedCorrection(correction.RoomId, correction.RoundId,
+                            correction.PlayerId, correction.ProcessedMoveSeq, correction.LastAcceptedMoveSeq,
+                            new Vector2(correction.X, correction.Y));
+                        return;
+                    }
+                    if (_packetId == (int)ServerPackets.playerPosition) return;
+                }
+#endif
                 _packet.ReadInt();
                 if (_packetId == (int)ServerPackets.welcome && instance.IsConnecting && instance.myId == 0)
                 {
@@ -524,7 +552,7 @@ public class Client : MonoBehaviour
 
         public void SendData(Packet packet) => TrySendData(packet);
 
-        private bool TrySendData(Packet packet)
+        internal bool TrySendData(Packet packet)
         {
             if (closed || socketUnavailable || socket == null) return false;
             try
@@ -623,7 +651,12 @@ public class Client : MonoBehaviour
         {
             try
             {
+#if TINYBOMBER_PROTOCOL_V4
+                using Packet packet = connection.UsesMovementOrdering
+                    ? ProtocolV4.OpenServerDatagram(data) : ProtocolV3.OpenServerDatagram(data);
+#else
                 using Packet packet = ProtocolV3.OpenServerDatagram(data);
+#endif
                 if (packet.UnreadLength() < sizeof(int)) return;
                 byte[] token = connection.SessionToken;
                 switch ((ServerPackets)packet.ReadInt(false))
@@ -636,6 +669,9 @@ public class Client : MonoBehaviour
                         connection.UdpConfirmSent = true;
                         break;
                     case ServerPackets.udpPlayerPosition:
+#if TINYBOMBER_PROTOCOL_V4
+                        if (connection.UsesMovementOrdering) return;
+#endif
                         var position = ProtocolV2.ReadUdpPlayerPosition(packet);
                         if (instance.IsConnecting || !position.Token.AsSpan().SequenceEqual(token) ||
                             float.IsNaN(position.X) || float.IsInfinity(position.X) ||
@@ -643,6 +679,14 @@ public class Client : MonoBehaviour
                         ClientHandle.ApplyPlayerPosition(position.RoomId, position.RoundId, position.PlayerId,
                             position.X, position.Y);
                         break;
+#if TINYBOMBER_PROTOCOL_V4
+                    case ServerPackets.udpPlayerPositionV4 when connection.UsesMovementOrdering:
+                        var ordered = ProtocolV4.ReadUdpPlayerPosition(packet);
+                        if (instance.IsConnecting || !ordered.Token.AsSpan().SequenceEqual(token)) return;
+                        GameManager.instance.ApplyOrderedPeerPosition(ordered.RoomId, ordered.RoundId,
+                            ordered.PlayerId, ordered.AcceptedMoveSeq, new Vector2(ordered.X, ordered.Y));
+                        break;
+#endif
                     case ServerPackets.udpHealthEcho:
                         var echo = ProtocolV3.ReadUdpHealthEcho(packet);
                         if (!instance.IsConnecting && echo.Token.AsSpan().SequenceEqual(token) &&

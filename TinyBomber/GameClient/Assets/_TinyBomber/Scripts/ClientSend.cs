@@ -68,6 +68,20 @@ public class ClientSend : MonoBehaviour
         Client client = Client.instance;
         if (client == null || client.IsConnecting || client.tcp?.SessionToken == null || client.udp == null) return;
 
+#if TINYBOMBER_PROTOCOL_V4
+        // Compile with a v4 GameShared reference for validation. Hello still selects v3 in C3-C1.
+        if (client.tcp.UsesMovementOrdering)
+        {
+            GameManager game = GameManager.instance;
+            game.TrySendOrderedMovement(sequence =>
+            {
+                using var ordered = ProtocolV4.CreateUdpPlayerMovement(client.myId, client.tcp.SessionToken,
+                    game.RoomId, game.ActiveRoundId, sequence, _position.x, _position.y);
+                return client.udp.TrySendData(ordered);
+            });
+            return;
+        }
+#endif
         using var packet = ProtocolV2.CreateUdpPlayerMovement(client.myId, client.tcp.SessionToken,
             GameManager.instance.RoomId, GameManager.instance.ActiveRoundId, _position.x, _position.y);
         client.udp.SendData(packet);

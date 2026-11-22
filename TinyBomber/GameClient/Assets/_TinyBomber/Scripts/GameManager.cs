@@ -20,6 +20,7 @@ public class GameManager : MonoBehaviour
 
     private readonly List<GameObject> blasts = new List<GameObject>();
     private readonly HashSet<int> pendingSpawns = new HashSet<int>();
+    private readonly MovementOrdering movementOrdering = new MovementOrdering();
     private Sprite blastSprite;
     private int[,] terrain;
     private MovementResolver movementResolver;
@@ -146,11 +147,21 @@ public class GameManager : MonoBehaviour
     {
         if (roundId < displayedRoundId || roundId < ActiveRoundId) return;
 
+        bool wasPlaying = IsPlaying;
         displayedRoundId = roundId;
         phase = matchPhase;
         readyCount = count;
         winnerId = winner;
-        if (phase == MatchPhase.Finished) ClearBombs();
+        if (phase == MatchPhase.Finished)
+        {
+            movementOrdering.Reset();
+            ClearBombs();
+        }
+        else if (!wasPlaying && IsPlaying)
+        {
+            foreach (var player in players)
+                ApplyStoredPeerPosition(player.Key, player.Value);
+        }
         RefreshMatchUi();
     }
 
@@ -285,10 +296,17 @@ public class GameManager : MonoBehaviour
         }
 
         players.Add(_id, _player);
+        if (IsPlaying && _id != Client.instance.myId) ApplyStoredPeerPosition(_id, _player);
     }
 
     public static void RemovePlayer(int id)
     {
+        if (instance)
+        {
+            instance.pendingSpawns.Remove(id);
+            instance.movementOrdering.RemovePeer(id);
+            if (Client.instance && id == Client.instance.myId) instance.movementOrdering.ResetLocal();
+        }
         if (!players.TryGetValue(id, out var player)) return;
         players.Remove(id);
         if (player != null)
@@ -311,6 +329,7 @@ public class GameManager : MonoBehaviour
 
     private void ClearRound()
     {
+        movementOrdering.Reset();
         movementResolver?.Reset();
         ActiveRoundId = 0;
         pendingSpawns.Clear();
@@ -330,6 +349,42 @@ public class GameManager : MonoBehaviour
             if (block) Destroy(block);
         softBlocks.Clear();
     }
+
+    internal bool TrySendOrderedMovement(System.Func<long, bool> send) =>
+        CanControl && movementOrdering.TrySend(send);
+
+    internal void ApplyOrderedPeerPosition(int roomId, int roundId, int id, long sequence, Vector2 target)
+    {
+        if (roomId <= 0 || roomId != RoomId || roundId <= 0 || roundId != ActiveRoundId ||
+            displayedRoundId > roundId || (displayedRoundId == roundId && phase == MatchPhase.Finished) ||
+            id == Client.instance.myId || !IsFinite(target)) return;
+
+        // Keep the newest snapshot only for a known member of this round. UDP can overtake spawn.
+        if (!players.TryGetValue(id, out var player) && !pendingSpawns.Contains(id)) return;
+        if (!movementOrdering.TryRecordPeer(id, sequence, target)) return;
+
+        if (IsPlaying && player) ApplyStoredPeerPosition(id, player);
+    }
+
+    private void ApplyStoredPeerPosition(int id, GameObject player)
+    {
+        if (movementOrdering.TryGetPeerTarget(id, out var target) &&
+            player.TryGetComponent(out RemotePlayerController remote))
+            remote.UpdatePosition(target);
+    }
+
+    internal void ApplyOrderedCorrection(int roomId, int roundId, int id, long processed, long accepted,
+        Vector2 position)
+    {
+        if (!IsPlaying || roomId <= 0 || roomId != RoomId || roundId != ActiveRoundId ||
+            id != Client.instance.myId || !IsFinite(position) || !players.TryGetValue(id, out var player))
+            return;
+
+        if (movementOrdering.TryAcceptCorrection(processed, accepted)) player.transform.position = position;
+    }
+
+    private static bool IsFinite(Vector2 position) => !float.IsNaN(position.x) && !float.IsInfinity(position.x) &&
+        !float.IsNaN(position.y) && !float.IsInfinity(position.y);
 
     private void ClearBombs()
     {
