@@ -150,10 +150,16 @@ namespace GameServer
                                 ServerSend.UdpProbe(slot);
                         });
                         break;
-                    case ClientPackets.udpPlayerMovement:
+                    case ClientPackets.udpPlayerMovement when !connection.UsesMovementOrdering:
                         var move = ProtocolV2.ReadUdpPlayerMovement(packet);
                         ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
                             endpoint, move.Token, move.RoomId, move.RoundId, move.X, move.Y));
+                        break;
+                    case ClientPackets.udpPlayerMovementV4 when connection.UsesMovementOrdering:
+                        var orderedMove = ProtocolV4.ReadUdpPlayerMovement(packet);
+                        ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
+                            endpoint, orderedMove.Token, orderedMove.RoomId, orderedMove.RoundId,
+                            orderedMove.X, orderedMove.Y, moveSeq: orderedMove.MoveSeq));
                         break;
                     case ClientPackets.udpHealthProbe:
                         var probe = ProtocolV3.ReadUdpHealthProbe(packet);

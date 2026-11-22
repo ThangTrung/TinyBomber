@@ -24,6 +24,7 @@ namespace GameServer
 
             if (connection.SessionToken != null) return;
             byte[] sessionToken = ProtocolV2.NewSessionToken();
+            connection.AcceptedProtocolVersion = version;
             connection.SessionToken = sessionToken;
             slot.Username = username;
             ServerSend.SessionGranted(connection, sessionToken);
@@ -60,12 +61,12 @@ namespace GameServer
         }
 
         internal static void UdpMovement(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
-            byte[] token, int roomId, int roundId, float x, float y, long? now = null)
+            byte[] token, int roomId, int roundId, float x, float y, long? now = null, long? moveSeq = null)
         {
             if (slot.tcp != connection || slot.udp != udp || !slot.IsReady ||
                 !endpoint.Equals(udp.endPoint) || !HasToken(connection, token)) return;
 
-            PlayerMovement(slot, roomId, roundId, x, y, now);
+            PlayerMovement(slot, roomId, roundId, x, y, now, moveSeq);
         }
 
         internal static void UdpHealthProbe(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
@@ -138,16 +139,21 @@ namespace GameServer
             ServerSend.MatchState(room);
         }
 
-        public static void PlayerMovement(Client slot, int roomId, int roundId, float _x, float _y, long? now = null)
+        public static void PlayerMovement(Client slot, int roomId, int roundId, float x, float y,
+            long? now = null, long? moveSeq = null)
         {
+            if (slot.tcp.UsesMovementOrdering != moveSeq.HasValue) return;
             if (slot.Room is not GameLogic room || !room.AcceptsInput(slot, roomId, roundId)) return;
 
             Player player = slot.player!;
+            if (moveSeq is long sequence &&
+                (!slot.IsReady || slot.tcp.SessionToken == null || !player.TryMarkMovementProcessed(sequence)))
+                return;
+
             long appliedAt = now ?? Stopwatch.GetTimestamp();
-            if (room.CanMove(player, _x, _y) && player.TrySpendMovementCredit(_x, _y, appliedAt))
+            if (room.CanMove(player, x, y) && player.TrySpendMovementCredit(x, y, appliedAt))
             {
-                player.x = _x;
-                player.y = _y;
+                player.AcceptMovement(x, y, moveSeq);
                 ServerSend.BroadcastPlayerPosition(room, player);
             }
             else

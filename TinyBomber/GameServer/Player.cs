@@ -20,6 +20,9 @@ namespace GameServer
         public int maxActiveBombs = 1;
         public int blastRange = 1;
 
+        internal long LastProcessedMoveSeq { get; private set; }
+        internal long LastAcceptedMoveSeq { get; private set; }
+
         private static readonly (float x, float y)[] SpawnPoints = new[]
         {
             (-7.5f, 5.5f),
@@ -39,6 +42,20 @@ namespace GameServer
             x = SpawnPoints[spawnIndex].x;
             y = SpawnPoints[spawnIndex].y;
             lastMovementRefillAt = spawnedAt;
+        }
+
+        internal bool TryMarkMovementProcessed(long moveSeq)
+        {
+            if (moveSeq <= LastProcessedMoveSeq) return false;
+            LastProcessedMoveSeq = moveSeq;
+            return true;
+        }
+
+        internal void AcceptMovement(float targetX, float targetY, long? moveSeq)
+        {
+            x = targetX;
+            y = targetY;
+            if (moveSeq.HasValue) LastAcceptedMoveSeq = moveSeq.Value;
         }
 
         internal bool TrySpendMovementCredit(float targetX, float targetY, long now)
