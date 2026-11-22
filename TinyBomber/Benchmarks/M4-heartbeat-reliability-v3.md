@@ -149,3 +149,32 @@ D:\Workspace\Project\Game\TinyBomber-baselines\M4-v3-d177a0f-20261122
 - `environment.json` ghi HEAD, cấu hình máy, thứ tự, tham số và hash. `regression/release.trx` giữ kết quả từng test. `runner-results.json` ghi kết quả sơ bộ. `verified-results.json` chứa metric mỗi lượt, kết quả đối chiếu, UTC, tổng byte, snapshot đầu có lỗi và snapshot cuối.
 - Mỗi thư mục từ `1-1-A` đến `3-3-B` có `client.command.json`, `client.json`, `client.console.log`, `server.console.log`, `server_metrics.csv`, `room_metrics.csv` và bản sao binary server. Các CSV gốc ở thư mục con `server/metrics` có PID và định danh exporter trong tên file.
 - Để kiểm lại số liệu đã có trên máy đo, chạy `python -B validate_v3.py` và `python -B tick_windows.py` từ thư mục bằng chứng. Validator dùng Python, Node và kiểm SHA-256 với bộ Release đã đo. Để tái lập phép đo, dùng bản source ở HEAD ghi trên, đặt `measure.py` và `run_baseline.py` vào thư mục raw mới, rồi chạy `python -B measure.py` khi hai cổng 26950/TCP và 26951/UDP đang trống. Raw M3 nằm ở thư mục ngang cấp `M3-v2-5ccc0c0-20261122`. [Baseline M3](M3-protocol-session-v2.md) · [Baseline M2.5](M2.5-capacity-baseline.md)
+
+## Đối chứng M3/M4 và quyết định đóng M4
+
+**Đóng M4 — Heartbeat & Connection Reliability.** M4 đạt các tiêu chí networking và regression đã kiểm thử. Bằng chứng gồm 252/252 test Release đạt, 9/9 lượt baseline hợp lệ và bốn lượt M4 trong phép đối chứng dưới đây. Tick chậm tái diễn trên cả M3 và M4. Chưa có bằng chứng về regression tick đặc thù M4 đủ để chặn nghiệm thu. **Mục tiêu 30 tick/s chưa đạt và được chuyển sang M8.**
+
+Hai bản Release được build riêng từ `protocol_session@5ce02b9` và `heartbeat_reliability@8ca6cc9`, chạy trên cùng máy với .NET 8.0.25 qua loopback. Mỗi lượt có server process mới, 8 client, warm-up 10 giây và đo 60 giây. A là Lobby Idle. C là Gameplay Active với hai phòng bốn người, mục tiêu 20 movement/s/client. Mỗi workload chạy hai cặp, đảo thứ tự phiên bản ở cặp sau.
+
+| Lượt thực chạy | Bản / tải | Interval TB (ms) | Tick/s ước tính | Sleep thực (ms) | Non-sleep (ms) | Gameplay work (ms) | Kỳ chậm / tổng kỳ CSV | Movement gửi / peer khớp |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | M3 / A | 36,983 | 27,040 | 36,962 | 0,021 | 0,011 | 0/57 | 0 / 0 |
+| 2 | M4 / A | 36,772 | 27,194 | 36,740 | 0,032 | 0,014 | 0/58 | 0 / 0 |
+| 3 | M4 / C | 38,965 | 25,664 | 38,024 | 0,941 | 0,922 | 7/58 | 9.600 / 9.600 |
+| 4 | M3 / C | 41,852 | 23,894 | 40,557 | 1,295 | 1,285 | 26/58 | 9.600 / 9.600 |
+| 5 | M4 / A | 41,917 | 23,857 | 41,883 | 0,034 | 0,015 | 15/57 | 0 / 0 |
+| 6 | M3 / A | 44,783 | 22,330 | 44,759 | 0,024 | 0,012 | 45/57 | 0 / 0 |
+| 7 | M3 / C | 36,498 | 27,398 | 35,817 | 0,681 | 0,672 | 0/58 | 9.520 / 9.520 |
+| 8 | M4 / C | 36,952 | 27,062 | 36,050 | 0,902 | 0,882 | 0/58 | 9.600 / 9.600 |
+
+**Measured.** CSV ghi thời gian thực quanh `Thread.Sleep`. Ở lượt 6, M3 dành 44,759 ms trong interval 44,783 ms cho sleep dù Lobby không có traffic trong các kỳ đo. Cả M3 và M4 đều có kỳ Lobby đạt 47,58 ms/tick. Bốn lượt M4 ghi tổng cộng 432 Probe gửi và 432 Echo được chấp nhận, không có Probe hết hạn hoặc phiên degraded. Lượt 7 của M3 chỉ gửi **9.520/9.600 movement mục tiêu**, đạt 19,83 Hz/client. Peer khớp cả 9.520 movement thực gửi. Sai lệch 80 thuộc số input phát ra, nên tải thực của cặp 7–8 khác nhau.
+
+**Calculated.** Interval TB dùng trọng số số mẫu tick, tick/s bằng 1.000 chia interval TB tính theo ms. Non-sleep là interval trừ sleep thực. Một kỳ CSV được đếm là chậm khi interval trung bình trong kỳ đạt ít nhất 44 ms. Trong cặp Active 3–4 đạt đủ tải, interval M4 thấp hơn M3 2,887 ms. Khi đảo thứ tự ở cặp 7–8, interval M4 cao hơn 0,454 ms.
+
+**Inference.** Chênh lệch Active đổi chiều giữa hai cặp. Các kỳ chậm xuất hiện ngay trên M3 v2, cả ở Lobby và trong round. Kết quả ủng hộ việc nghiên cứu cách scheduler chung chờ và thức dậy. Trong các kỳ có mẫu timer hệ thống, 2/68 kỳ chậm khi đọc được 1 ms và 48/164 kỳ chậm khi đọc được 15,625 ms. Đây là tương quan quan sát được.
+
+**Unverified và giới hạn tái lập.** Chỉ có hai lượt mỗi tổ hợp phiên bản/workload trên một máy. Cả tám lượt dùng power plan Balanced và server có priority Normal tại các mẫu quan sát, nhưng CPU toàn máy trung bình từng lượt dao động từ 17,98% đến 25,91%. Mẫu timer lấy mỗi hai giây chỉ phản ánh giá trị hệ thống tại lúc đọc. Dữ liệu chưa xác định timer hiệu dụng của server, giá trị sleep yêu cầu từng tick hay độ trễ từ lúc thread có thể chạy đến lúc thực sự chạy. **Nguyên nhân gốc của tick chậm chưa được xác minh.**
+
+**Phạm vi M8.** Trong cả hai bản, `ThreadManager.UpdateMain()` tính ngân sách nguyên 33 ms, trừ thời gian đã trôi qua khi xử lý queue và gọi sleep nếu phần còn lại dương. M8 cần đối chiếu *requested sleep* với *actual sleep* theo từng tick, đo scheduling jitter, đánh giá monotonic deadline tính từ đầu toàn bộ tick và kiểm tra chính sách bỏ nhịp sau stall để tránh phát tick dồn. [ThreadManager.UpdateMain](../GameServer/ThreadManager.cs) · [Server.UpdateLoop](../GameServer/Server.cs) · [ServerMetrics.BeginTick](../GameServer/ServerMetrics.cs)
+
+Raw đối chứng trên máy đo nằm tại `D:\Workspace\Project\Game\TinyBomber-baselines\control-8ca6cc9-1795336330339`. Từng lượt có JSON, CSV và log. Dùng `results.txt` để đối chiếu tick, CPU, queue, traffic và movement, `timer-results.txt` để kiểm các kỳ có mẫu timer, `hashes.json` để nhận diện binary. Việc tái lập cần hai mốc source, bộ runner ngoài repository mà `control.py` tham chiếu và cùng cấu hình workload.
