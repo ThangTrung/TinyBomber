@@ -60,6 +60,7 @@
     <Analyzer Include="D:\App\Unity\Hub\Editor\2022.3.62f3\Editor\Data\Tools\Unity.SourceGenerators\Unity.Properties.SourceGenerator.dll" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Assets\_TinyBomber\Tests\EditMode\MovementOrderingTests.cs" />
     <Compile Include="Assets\_TinyBomber\Tests\EditMode\MovementResolverTests.cs" />
   </ItemGroup>
   <ItemGroup>

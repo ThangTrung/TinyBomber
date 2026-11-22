@@ -200,6 +200,13 @@ namespace GameServer
             SendTCPData(recipient.tcp, packet);
         }
 
+        internal static void AcknowledgeMovement(GameLogic room, Client owner, Player player)
+        {
+            using var packet = ProtocolV4.CreateTcpPlayerPosition(room.Id, room.RoundId, player.id,
+                player.LastAcceptedMoveSeq, player.x, player.y);
+            owner.tcp.SendData(packet);
+        }
+
         internal static void SnapPlayerPosition(GameLogic room, Client recipient, Player player)
         {
             using var packet = recipient.tcp.UsesMovementOrdering

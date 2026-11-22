@@ -8,11 +8,12 @@ public sealed class MovementOrdering
     private readonly Dictionary<int, (long Sequence, Vector2 Target)> peers =
         new Dictionary<int, (long, Vector2)>();
     private long lastSent;
-    private long lastCorrection;
+    private long lastOwnerProcessed;
+    private (long Processed, bool Correction, Vector2 Position)? pendingOwnerState;
+    private bool recoveringFromCorrection;
 
     public bool TrySend(Func<long, bool> send)
     {
-        // Match ProtocolV4's sequence range while the Unity plugin still exposes only v3.
         if (lastSent == long.MaxValue) return false;
         long sequence = lastSent + 1;
         if (!send(sequence)) return false;
@@ -36,10 +37,32 @@ public sealed class MovementOrdering
         return found;
     }
 
-    public bool TryAcceptCorrection(long processed, long accepted)
+    public bool QueueOwnerState(long processed, long accepted, Vector2 position)
     {
-        if (processed <= lastCorrection || accepted < 0 || accepted >= processed) return false;
-        lastCorrection = processed;
+        if (processed <= lastOwnerProcessed || processed > lastSent || accepted < 0 || accepted > processed)
+            return false;
+
+        lastOwnerProcessed = processed;
+        pendingOwnerState = (processed, processed != accepted, position);
+        return true;
+    }
+
+    public bool TryTakeOwnerPosition(out Vector2 position)
+    {
+        position = default;
+        if (!pendingOwnerState.HasValue) return false;
+        var state = pendingOwnerState.Value;
+        pendingOwnerState = null;
+
+        if (state.Correction)
+            recoveringFromCorrection = true;
+        else
+        {
+            // Keep newer local prediction. Once caught up, repair a snap with the final accept.
+            if (!recoveringFromCorrection || state.Processed != lastSent) return false;
+            recoveringFromCorrection = false;
+        }
+        position = state.Position;
         return true;
     }
 
@@ -48,7 +71,9 @@ public sealed class MovementOrdering
     public void ResetLocal()
     {
         lastSent = 0;
-        lastCorrection = 0;
+        lastOwnerProcessed = 0;
+        pendingOwnerState = null;
+        recoveringFromCorrection = false;
     }
 
     public void Reset()

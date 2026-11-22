@@ -429,6 +429,8 @@ public sealed class HandshakeDeadlineTests
         Assert.Equal((room, round, mover.SlotId, mover.LastSentMoveSeq, x, y),
             (position.RoomId, position.RoundId, position.PlayerId, position.AcceptedMoveSeq, position.X, position.Y));
         Assert.Equal(0, packet.UnreadLength());
+        using Packet ack = await mover.ReadAsync(ServerPackets.playerPositionV4, token, leaveId: true);
+        Assert.Equal((room, round, mover.SlotId, position.AcceptedMoveSeq, x, y), ProtocolV4.ReadTcpPlayerPosition(ack));
         mover.LastAcceptedMoveSeq = position.AcceptedMoveSeq;
     }
 

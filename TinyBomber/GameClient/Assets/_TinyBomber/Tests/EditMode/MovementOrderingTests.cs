@@ -49,18 +49,80 @@ public sealed class MovementOrderingTests
     }
 
     [Test]
-    public void CorrectionOrdersAgainstEarlierCorrectionsEvenAfterNewerPredictionWasSent()
+    public void NewCorrectionStillAppliesAfterNewerPredictionWasSent()
+    {
+        var ordering = SentThrough(14);
+        Assert.That(ordering.QueueOwnerState(12, 11, At(0.08f)), Is.True);
+        Assert.That(ordering.QueueOwnerState(12, 11, At(0.08f)), Is.False);
+        Assert.That(ordering.QueueOwnerState(11, 10, At(0.04f)), Is.False);
+        Assert.That(ordering.QueueOwnerState(13, 14, At(0.24f)), Is.False);
+        Assert.That(ordering.TryTakeOwnerPosition(out var target) && target == At(0.08f), Is.True);
+        Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void AckSupersedesCorrectionBeforeTheFrameAppliesAnyMovement(bool ackFirst)
+    {
+        var ordering = SentThrough(13);
+        Assert.That(ordering.QueueOwnerState(11, 11, At(0.08f)), Is.True);
+        Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+        if (ackFirst)
+        {
+            Assert.That(ordering.QueueOwnerState(13, 13, At(0.24f)), Is.True);
+            Assert.That(ordering.QueueOwnerState(12, 11, At(0.08f)), Is.False);
+        }
+        else
+        {
+            Assert.That(ordering.QueueOwnerState(12, 11, At(0.08f)), Is.True);
+            Assert.That(ordering.QueueOwnerState(13, 13, At(0.24f)), Is.True);
+        }
+        Assert.That(ordering.QueueOwnerState(13, 13, At(0.24f)), Is.False);
+        Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void OnlyFinalAckCanRestorePositionAfterCorrectionWasApplied(bool hasNewerPrediction)
+    {
+        var ordering = SentThrough(hasNewerPrediction ? 14 : 13);
+        Assert.That(ordering.QueueOwnerState(12, 11, At(0.08f)), Is.True);
+        Assert.That(ordering.TryTakeOwnerPosition(out var snap) && snap == At(0.08f), Is.True);
+        Assert.That(ordering.QueueOwnerState(13, 13, At(0.24f)), Is.True);
+        if (hasNewerPrediction)
+        {
+            // The last move (14) has not been seen by the server. ACK 13 cannot acknowledge it.
+            Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+            Assert.That(ordering.QueueOwnerState(15, 15, At(0.40f)), Is.False);
+            Assert.That(ordering.QueueOwnerState(14, 14, At(0.32f)), Is.True);
+        }
+        Assert.That(ordering.TryTakeOwnerPosition(out var restored), Is.True);
+        Assert.That(restored, Is.EqualTo(At(hasNewerPrediction ? 0.32f : 0.24f)));
+        Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+    }
+
+    [Test]
+    public void RoundResetClearsOwnerWatermarkPendingAndRecovery()
+    {
+        var ordering = SentThrough(13);
+        ordering.QueueOwnerState(12, 11, At(0.08f));
+        Assert.That(ordering.TryTakeOwnerPosition(out _), Is.True);
+        ordering.QueueOwnerState(13, 13, At(0.24f));
+        ordering.Reset();
+        Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+        Assert.That(ordering.TrySend(sequence => sequence == 1), Is.True);
+        Assert.That(ordering.QueueOwnerState(1, 1, Vector2.right), Is.True);
+        Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+    }
+
+    private static Vector2 At(float x) => new Vector2(x, 0);
+
+    private static MovementOrdering SentThrough(int last)
     {
         var ordering = new MovementOrdering();
-        for (long sequence = 1; sequence <= 14; sequence++)
+        for (long sequence = 1; sequence <= last; sequence++)
             Assert.That(ordering.TrySend(next => next == sequence), Is.True);
-        Assert.That(ordering.TryAcceptCorrection(12, 11), Is.True);
-        Assert.That(ordering.TryAcceptCorrection(12, 11), Is.False);
-        Assert.That(ordering.TryAcceptCorrection(11, 10), Is.False);
-        Assert.That(ordering.TryAcceptCorrection(13, 13), Is.False);
-        Assert.That(ordering.TryAcceptCorrection(13, 12), Is.True);
-        ordering.Reset();
-        Assert.That(ordering.TryAcceptCorrection(1, 0), Is.True);
+        return ordering;
     }
 }
 
@@ -170,21 +232,85 @@ public sealed class MovementOrderingUnityTests
         Assert.That(ordering.TrySend(seq => seq == 1), Is.True);
     }
 
-    [Test]
-    public void CorrectionSnapsEvenAfterNewerPredictionAndDuplicateDoesNotSnapAgain()
+    [TestCase(false)]
+    [TestCase(true)]
+    public void TcpOwnerMessagesApplyOnlyOnceAtFrameEnd(bool separateFrames)
     {
         var local = NewObject();
         players.Add(1, local);
         Invoke("ApplyMatchState", 1, MatchPhase.Playing, 2, 0);
         var ordering = (MovementOrdering)gameType.GetField("movementOrdering", Instance).GetValue(game);
-        for (int i = 0; i < 14; i++) ordering.TrySend(_ => true);
-        local.transform.position = Vector3.right;
-        Invoke("ApplyOrderedCorrection", 7, 1, 1, 12L, 11L, Vector2.zero);
-        Assert.That(local.transform.position, Is.EqualTo(Vector3.zero));
+        for (int i = 0; i < 13; i++) ordering.TrySend(_ => true);
+        var predicted = new Vector3(0.24f, 0, 0);
+        var corrected = new Vector3(0.08f, 0, 0);
+        local.transform.position = predicted;
+        var connection = InstallConnection();
+        using var ackBefore = ProtocolV4.CreateTcpPlayerPosition(7, 1, 1, 11, 0.08f, 0);
+        using var correction = ProtocolV4.CreateTcpPlayerCorrection(7, 1, 1, 12, 11, 0.08f, 0);
+        using var ackAfter = ProtocolV4.CreateTcpPlayerPosition(7, 1, 1, 13, 0.24f, 0);
+        Receive(connection, ackBefore);
+        Receive(connection, correction);
+        DrainNetwork();
+        Assert.That(local.transform.position, Is.EqualTo(predicted));
+        if (separateFrames)
+        {
+            Invoke("LateUpdate");
+            Assert.That(local.transform.position, Is.EqualTo(corrected));
+        }
+        Receive(connection, ackAfter);
+        DrainNetwork();
+        Invoke("LateUpdate");
+        Assert.That(local.transform.position, Is.EqualTo(predicted));
         local.transform.position = Vector3.up;
-        Invoke("ApplyOrderedCorrection", 7, 1, 1, 12L, 11L, Vector2.zero);
+        Receive(connection, correction);
+        Receive(connection, ackAfter);
+        DrainNetwork();
+        Invoke("LateUpdate");
         Assert.That(local.transform.position, Is.EqualTo(Vector3.up));
     }
+
+    [Test]
+    public void RetiredTcpCallbackAndWrongOwnerScopeCannotQueueASnap()
+    {
+        var local = NewObject();
+        players.Add(1, local);
+        local.transform.position = Vector3.right;
+        Invoke("ApplyMatchState", 1, MatchPhase.Playing, 2, 0);
+        var ordering = (MovementOrdering)gameType.GetField("movementOrdering", Instance).GetValue(game);
+        ordering.TrySend(_ => true);
+        var oldConnection = InstallConnection();
+        using var correction = ProtocolV4.CreateTcpPlayerCorrection(7, 1, 1, 1, 0, 0, 0);
+        Receive(oldConnection, correction);
+        var connection = InstallConnection();
+        using var wrongRoom = ProtocolV4.CreateTcpPlayerCorrection(8, 1, 1, 1, 0, 0, 0);
+        using var wrongRound = ProtocolV4.CreateTcpPlayerCorrection(7, 2, 1, 1, 0, 0, 0);
+        using var wrongPlayer = ProtocolV4.CreateTcpPlayerCorrection(7, 1, 2, 1, 0, 0, 0);
+        Receive(connection, wrongRoom);
+        Receive(connection, wrongRound);
+        Receive(connection, wrongPlayer);
+        DrainNetwork();
+        Invoke("LateUpdate");
+        Assert.That(local.transform.position, Is.EqualTo(Vector3.right));
+
+        Receive(connection, correction);
+        DrainNetwork();
+        Invoke("LateUpdate");
+        Assert.That(local.transform.position, Is.EqualTo(Vector3.zero));
+    }
+
+    private object InstallConnection()
+    {
+        var type = clientType.GetNestedType("TCP");
+        var connection = Activator.CreateInstance(type);
+        type.GetProperty("AcceptedProtocolVersion", Instance).SetValue(connection, ProtocolV4.Version);
+        clientType.GetField("tcp").SetValue(clientInstance.GetValue(null), connection);
+        return connection;
+    }
+
+    private static void Receive(object connection, Packet packet) =>
+        connection.GetType().GetMethod("HandleFrame", Instance).Invoke(connection, new object[] { packet.ToArray() });
+
+    private static void DrainNetwork() => FindType("ThreadManager").GetMethod("UpdateMain").Invoke(null, null);
 
     private void Peer(int room, int round, long seq, Vector2 position) =>
         Invoke("ApplyOrderedPeerPosition", room, round, 2, seq, position);

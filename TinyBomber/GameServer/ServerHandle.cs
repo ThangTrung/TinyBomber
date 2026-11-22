@@ -154,6 +154,7 @@ namespace GameServer
             if (room.CanMove(player, x, y) && player.TrySpendMovementCredit(x, y, appliedAt))
             {
                 player.AcceptMovement(x, y, moveSeq);
+                if (moveSeq.HasValue) ServerSend.AcknowledgeMovement(room, slot, player);
                 ServerSend.BroadcastPlayerPosition(room, player);
             }
             else

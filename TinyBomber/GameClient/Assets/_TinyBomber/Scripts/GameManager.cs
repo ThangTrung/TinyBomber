@@ -373,14 +373,24 @@ public class GameManager : MonoBehaviour
             remote.UpdatePosition(target);
     }
 
-    internal void ApplyOrderedCorrection(int roomId, int roundId, int id, long processed, long accepted,
+    internal void QueueOwnerMovementState(int roomId, int roundId, int id, long processed, long accepted,
         Vector2 position)
     {
         if (!IsPlaying || roomId <= 0 || roomId != RoomId || roundId != ActiveRoundId ||
-            id != Client.instance.myId || !IsFinite(position) || !players.TryGetValue(id, out var player))
+            id != Client.instance.myId || !IsFinite(position) ||
+            !players.TryGetValue(id, out var player) || !player)
             return;
 
-        if (movementOrdering.TryAcceptCorrection(processed, accepted)) player.transform.position = position;
+        movementOrdering.QueueOwnerState(processed, accepted, position);
+    }
+
+    // ThreadManager drains TCP callbacks in Update. Apply only the latest owner result at frame end.
+    private void LateUpdate()
+    {
+        if (!IsPlaying || !Client.instance || !players.TryGetValue(Client.instance.myId, out var player) ||
+            !player || !movementOrdering.TryTakeOwnerPosition(out var position)) return;
+
+        if (!((Vector2)player.transform.position).Equals(position)) player.transform.position = position;
     }
 
     private static bool IsFinite(Vector2 position) => !float.IsNaN(position.x) && !float.IsInfinity(position.x) &&

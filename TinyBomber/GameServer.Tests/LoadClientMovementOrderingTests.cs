@@ -67,11 +67,38 @@ public sealed class LoadClientMovementOrderingTests
         using var correction = ProtocolV4.CreateTcpPlayerCorrection(7, 1, 1, 12, 11, 0.50f, 0f);
         Call(client, "HandleTcpPacket", correction.ToArray());
         Assert.True(Read<bool>(client, "corrected"));
-        Assert.Equal(12L, Read<long>(client, "lastCorrectionMoveSeq"));
+        Assert.Equal(12L, Read<long>(client, "lastOwnerProcessedMoveSeq"));
         Set(client, "corrected", false);
         Call(client, "HandleTcpPacket", correction.ToArray());
         Assert.False(Read<bool>(client, "corrected"));
         Assert.Equal(14L, Read<long>(client, "lastSentMoveSeq"));
+    }
+
+    [Fact]
+    public async Task OwnerAckSharesCorrectionWatermarkAndIsNeverCountedAsPeerObservation()
+    {
+        await using var client = ReadyClient();
+        object trace = ClientType.GetProperty("Trace", Members)!.GetValue(client)!;
+        Call(client, "Watch", 2, trace);
+        PrepareObservation(trace, 0.24f);
+        using var otherRound = ProtocolV4.CreateTcpPlayerPosition(7, 2, 1, 99, 0.24f, 0f);
+        Call(client, "HandleTcpPacket", otherRound.ToArray());
+        Assert.Equal(0L, Read<long>(client, "lastOwnerProcessedMoveSeq"));
+
+        using var ack = ProtocolV4.CreateTcpPlayerPosition(7, 1, 1, 13, 0.24f, 0f);
+        Call(client, "HandleTcpPacket", ack.ToArray());
+        Call(client, "HandleTcpPacket", ack.ToArray());
+        using var oldCorrection = ProtocolV4.CreateTcpPlayerCorrection(7, 1, 1, 12, 11, 0.08f, 0f);
+        Call(client, "HandleTcpPacket", oldCorrection.ToArray());
+        Assert.Equal(13L, Read<long>(client, "lastOwnerProcessedMoveSeq"));
+        Assert.False(Read<bool>(client, "corrected"));
+        object counts = Call(trace, "Read")!;
+        Assert.Equal(0, counts.GetType().GetProperty("Observed")!.GetValue(counts));
+
+        using var peerPosition = ProtocolV4.CreateTcpPlayerPosition(7, 1, 2, 1, 0.24f, 0f);
+        Call(client, "HandleTcpPacket", peerPosition.ToArray());
+        counts = Call(trace, "Read")!;
+        Assert.Equal(1, counts.GetType().GetProperty("Observed")!.GetValue(counts));
     }
 
     [Fact]
@@ -82,7 +109,7 @@ public sealed class LoadClientMovementOrderingTests
         using var initial = ProtocolV4.CreateUdpPlayerPosition(token, 7, 1, 2, 12, 0.08f, 0f);
         Call(client, "HandleUdpPacket", initial.ToArray());
         Set(client, "lastSentMoveSeq", 15L);
-        Set(client, "lastCorrectionMoveSeq", 12L);
+        Set(client, "lastOwnerProcessedMoveSeq", 12L);
         Assert.Equal(12L, watermarks[2]);
 
         ReceiveTcp(client, ServerPackets.roundBegin, 7, 2, 2, 1, 2);
@@ -101,7 +128,7 @@ public sealed class LoadClientMovementOrderingTests
         Call(client, "HandleUdpPacket", freshRound.ToArray());
         Assert.Equal(1L, watermarks[2]);
         Assert.Equal(0L, Read<long>(client, "lastSentMoveSeq"));
-        Assert.Equal(0L, Read<long>(client, "lastCorrectionMoveSeq"));
+        Assert.Equal(0L, Read<long>(client, "lastOwnerProcessedMoveSeq"));
         ReceiveTcp(client, ServerPackets.playerEliminated, 7, 2, 2);
         Call(client, "HandleUdpPacket", freshRound.ToArray());
         Assert.Empty(watermarks);

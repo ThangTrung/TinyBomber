@@ -52,7 +52,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private bool corrected;
     private volatile int acceptedProtocolVersion;
     private long lastSentMoveSeq;
-    private long lastCorrectionMoveSeq;
+    private long lastOwnerProcessedMoveSeq;
     private int id;
     private int roomId;
     private int roundId;
@@ -483,22 +483,19 @@ internal sealed class SimulatedClient : IAsyncDisposable
             if (UsesMovementOrdering && type == ServerPackets.playerPositionV4)
             {
                 var update = ProtocolV4.ReadTcpPlayerPosition(packet);
-                ApplyOrderedPeerPosition(update.RoomId, update.RoundId, update.PlayerId, update.AcceptedMoveSeq,
-                    new Position(update.X, update.Y));
+                var position = new Position(update.X, update.Y);
+                if (update.PlayerId == id)
+                    ApplyOwnerMovementState(update.RoomId, update.RoundId, id, update.AcceptedMoveSeq,
+                        position, isCorrection: false);
+                else
+                    ApplyOrderedPeerPosition(update.RoomId, update.RoundId, update.PlayerId, update.AcceptedMoveSeq, position);
                 return null;
             }
             if (UsesMovementOrdering && type == ServerPackets.playerCorrectionV4)
             {
                 var correction = ProtocolV4.ReadTcpPlayerCorrection(packet);
-                if (IsPlayingRound(correction.RoomId, correction.RoundId) && correction.PlayerId == id && alive &&
-                    spawns.ContainsKey(id) && correction.ProcessedMoveSeq > lastCorrectionMoveSeq)
-                {
-                    var position = new Position(correction.X, correction.Y);
-                    if (!position.IsFinite) throw new InvalidDataException("Tọa độ server không hữu hạn.");
-                    lastCorrectionMoveSeq = correction.ProcessedMoveSeq;
-                    // A correction still invalidates the workload, just as a v3 TCP snap does.
-                    corrected = true;
-                }
+                ApplyOwnerMovementState(correction.RoomId, correction.RoundId, correction.PlayerId,
+                    correction.ProcessedMoveSeq, new Position(correction.X, correction.Y), isCorrection: true);
                 return null;
             }
 
@@ -644,7 +641,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private void ResetLocalMovementOrdering()
     {
         lastSentMoveSeq = 0;
-        lastCorrectionMoveSeq = 0;
+        lastOwnerProcessedMoveSeq = 0;
     }
 
     private void ResetMovementOrdering()
@@ -700,6 +697,19 @@ internal sealed class SimulatedClient : IAsyncDisposable
         for (int row = 0; row < Constants.MAP_HEIGHT; row++)
             terrain[col, row] = packet.ReadInt();
         map = terrain;
+    }
+
+    private void ApplyOwnerMovementState(int room, int round, int player, long sequence, Position position,
+        bool isCorrection)
+    {
+        // A TCP reply may arrive before the async send has recorded lastSentMoveSeq.
+        if (!IsPlayingRound(room, round) || player != id || !alive || !spawns.ContainsKey(id) ||
+            sequence <= lastOwnerProcessedMoveSeq) return;
+        if (!position.IsFinite) throw new InvalidDataException("Tọa độ server không hữu hạn.");
+
+        lastOwnerProcessedMoveSeq = sequence;
+        // Preserve the benchmark's existing correction failure criterion.
+        if (isCorrection) corrected = true;
     }
 
     private void ApplyOrderedPeerPosition(int room, int round, int player, long sequence, Position position)

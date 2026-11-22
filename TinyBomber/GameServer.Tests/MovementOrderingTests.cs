@@ -374,6 +374,8 @@ public sealed class MovementOrderingTests
                 Assert.Equal((room.Id, room.RoundId, mover.id, 11L, 0.06f, 0f),
                     (position.RoomId, position.RoundId, position.PlayerId, position.AcceptedMoveSeq, position.X, position.Y));
             }
+            using (Packet ack = await ReadFrameAsync(ownerStream, cancellation))
+                Assert.Equal((room.Id, room.RoundId, mover.id, 11L, 0.06f, 0f), ProtocolV4.ReadTcpPlayerPosition(ack));
 
             peer.udp.endPoint = null; // Exercise the TCP fallback for delivery to the peer.
             SendTcp(12, 0.12f);
@@ -386,6 +388,8 @@ public sealed class MovementOrderingTests
             ServerSend.MatchState(room); // FIFO marker detects any extra legacy or v4 movement frames.
             using (Packet broadcast = await ReadFrameAsync(peerStream, cancellation))
                 Assert.Equal((room.Id, room.RoundId, mover.id, 12L, 0.12f, 0f), ProtocolV4.ReadTcpPlayerPosition(broadcast));
+            using (Packet ack = await ReadFrameAsync(ownerStream, cancellation))
+                Assert.Equal((room.Id, room.RoundId, mover.id, 12L, 0.12f, 0f), ProtocolV4.ReadTcpPlayerPosition(ack));
             await ReadMatchStateAsync(ownerStream);
             await ReadMatchStateAsync(peerStream);
 
@@ -454,6 +458,56 @@ public sealed class MovementOrderingTests
         {
             using Packet marker = await ReadFrameAsync(stream, cancellation);
             Assert.Equal((int)ServerPackets.matchState, marker.ReadInt());
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "SocketIntegration")]
+    public async Task OwnerReceivesAcceptRejectAcceptInProcessingOrderWithHeartbeatOnTheSameQueue()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        CancellationToken cancellation = timeout.Token;
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var owner = new TcpClient();
+        await owner.ConnectAsync((IPEndPoint)listener.LocalEndpoint, cancellation);
+        using TcpClient connection = await listener.AcceptTcpClientAsync(cancellation);
+        mover.tcp.Attach(connection);
+        mover.tcp.StartReceiving();
+        try
+        {
+            var stream = owner.GetStream();
+            using (Packet hello = await ReadFrameAsync(stream, cancellation))
+                Assert.Equal((ProtocolV4.Version, mover.id), ProtocolV2.ReadServerHello(hello));
+
+            Move(11, 0.08f, ms: 0, viaUdp: true);
+            Move(12, 0.16f, ms: 1);
+            Assert.Equal((12L, 11L), Watermarks);
+            Move(13, 0.24f, ms: 40, viaUdp: true);
+            Move(12, 0.16f, ms: 40);
+            Move(13, 0.24f, ms: 40);
+            // Sequence 14 was lost before the server. No frame for it may appear before the FIFO markers.
+            Assert.Equal((13L, 13L), Watermarks);
+            Assert.Equal((0.24f, 0f), Position);
+            mover.tcp.StartHeartbeat(0);
+            mover.tcp.SendHeartbeatIfDue(Stopwatch.Frequency * 5);
+            ServerSend.MatchState(room);
+
+            using (Packet ack = await ReadFrameAsync(stream, cancellation))
+                Assert.Equal((room.Id, room.RoundId, mover.id, 11L, 0.08f, 0f), ProtocolV4.ReadTcpPlayerPosition(ack));
+            using (Packet correction = await ReadFrameAsync(stream, cancellation))
+                Assert.Equal((room.Id, room.RoundId, mover.id, 12L, 11L, 0.08f, 0f),
+                    ProtocolV4.ReadTcpPlayerCorrection(correction));
+            using (Packet ack = await ReadFrameAsync(stream, cancellation))
+                Assert.Equal((room.Id, room.RoundId, mover.id, 13L, 0.24f, 0f), ProtocolV4.ReadTcpPlayerPosition(ack));
+            using (Packet ping = await ReadFrameAsync(stream, cancellation))
+                Assert.Equal(1L, ProtocolV3.ReadHeartbeatPing(ping));
+            using Packet marker = await ReadFrameAsync(stream, cancellation);
+            Assert.Equal((int)ServerPackets.matchState, marker.ReadInt());
+        }
+        finally
+        {
+            mover.tcp.Close();
         }
     }
 

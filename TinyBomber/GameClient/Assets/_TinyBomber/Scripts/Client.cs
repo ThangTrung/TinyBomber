@@ -375,14 +375,19 @@ public class Client : MonoBehaviour
                     if (_packetId == (int)ServerPackets.playerPositionV4)
                     {
                         var position = ProtocolV4.ReadTcpPlayerPosition(_packet);
-                        GameManager.instance.ApplyOrderedPeerPosition(position.RoomId, position.RoundId,
-                            position.PlayerId, position.AcceptedMoveSeq, new Vector2(position.X, position.Y));
+                        var target = new Vector2(position.X, position.Y);
+                        if (position.PlayerId == instance.myId)
+                            GameManager.instance.QueueOwnerMovementState(position.RoomId, position.RoundId,
+                                position.PlayerId, position.AcceptedMoveSeq, position.AcceptedMoveSeq, target);
+                        else
+                            GameManager.instance.ApplyOrderedPeerPosition(position.RoomId, position.RoundId,
+                                position.PlayerId, position.AcceptedMoveSeq, target);
                         return;
                     }
                     if (_packetId == (int)ServerPackets.playerCorrectionV4)
                     {
                         var correction = ProtocolV4.ReadTcpPlayerCorrection(_packet);
-                        GameManager.instance.ApplyOrderedCorrection(correction.RoomId, correction.RoundId,
+                        GameManager.instance.QueueOwnerMovementState(correction.RoomId, correction.RoundId,
                             correction.PlayerId, correction.ProcessedMoveSeq, correction.LastAcceptedMoveSeq,
                             new Vector2(correction.X, correction.Y));
                         return;
