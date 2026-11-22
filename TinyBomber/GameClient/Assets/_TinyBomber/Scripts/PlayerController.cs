@@ -3,7 +3,7 @@ using System;
 
 public class PlayerController : MonoBehaviour
 {
-    private static readonly Action<Vector2> SendMovement = ClientSend.SendPlayerMovement;
+    private static readonly Func<Vector2, bool> SendMovement = ClientSend.SendPlayerMovement;
 
     public float speed = 4f;
     private Animator anim;
@@ -54,13 +54,13 @@ public class PlayerController : MonoBehaviour
     }
 
     private static bool TryApplyMovement(Vector2 start, Vector2 target,
-        Action<Vector2, Vector2> apply, Action<Vector2> send)
+        Action<Vector2, Vector2> apply, Func<Vector2, bool> send)
     {
         // Match the resolver's exact comparison so even the last step at a tile edge is applied.
         if (target.Equals(start)) return false;
+        if (!send(target)) return false;
 
         apply(start, target);
-        send(target);
         return true;
     }
 }

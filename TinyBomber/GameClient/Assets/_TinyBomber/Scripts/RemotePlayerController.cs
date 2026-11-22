@@ -6,6 +6,7 @@ public class RemotePlayerController : MonoBehaviour
 
     private Vector2? targetPosition;
     private double lastTargetChangeTime = double.NegativeInfinity;
+    private bool finishAtTarget;
     private Animator anim;
     private SpriteRenderer sr;
 
@@ -16,12 +17,17 @@ public class RemotePlayerController : MonoBehaviour
         targetPosition ??= (Vector2)transform.position;
     }
 
-    public void UpdatePosition(Vector2 newPos)
+    public void UpdatePosition(Vector2 newPos, bool reliable = false)
     {
         targetPosition ??= (Vector2)transform.position;
-        if (newPos.Equals(targetPosition.Value)) return;
+        if (newPos.Equals(targetPosition.Value))
+        {
+            finishAtTarget |= reliable;
+            return;
+        }
 
         targetPosition = newPos;
+        finishAtTarget = reliable;
         lastTargetChangeTime = Time.unscaledTimeAsDouble;
     }
 
@@ -38,6 +44,11 @@ public class RemotePlayerController : MonoBehaviour
                 sr.flipX = dirX < 0;
             }
 
+            transform.position = Vector2.MoveTowards(transform.position, target, 15f * Time.deltaTime);
+        }
+        else if (finishAtTarget && !target.Equals((Vector2)transform.position))
+        {
+            // Close the deadband on reliable delivery without setting IsMoving.
             transform.position = Vector2.MoveTowards(transform.position, target, 15f * Time.deltaTime);
         }
 

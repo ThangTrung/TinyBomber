@@ -102,6 +102,26 @@ public sealed class LoadClientMovementOrderingTests
     }
 
     [Fact]
+    public async Task FinalTcpRefreshCountsOnlyWhenThePeerHadNotAlreadyObservedThePosition()
+    {
+        await using var client = ReadyClient();
+        object trace = ClientType.GetProperty("Trace", Members)!.GetValue(client)!;
+        Call(client, "Watch", 2, trace);
+        PrepareObservation(trace, 0.08f);
+        PrepareObservation(trace, 0.16f);
+        using var udp = ProtocolV4.CreateUdpPlayerPosition(token, 7, 1, 2, 1, 0.08f, 0f);
+        using var duplicate = ProtocolV4.CreateTcpPlayerPosition(7, 1, 2, 1, 0.08f, 0f);
+        using var missing = ProtocolV4.CreateTcpPlayerPosition(7, 1, 2, 2, 0.16f, 0f);
+        Call(client, "HandleUdpPacket", udp.ToArray());
+        Call(client, "HandleTcpPacket", duplicate.ToArray());
+        object counts = Call(trace, "Read")!;
+        Assert.Equal(1, counts.GetType().GetProperty("Observed")!.GetValue(counts));
+        Call(client, "HandleTcpPacket", missing.ToArray());
+        counts = Call(trace, "Read")!;
+        Assert.Equal(2, counts.GetType().GetProperty("Observed")!.GetValue(counts));
+    }
+
+    [Fact]
     public async Task NewRoundAndRoomResetWatermarksAndDropOldScope()
     {
         await using var client = ReadyClient();

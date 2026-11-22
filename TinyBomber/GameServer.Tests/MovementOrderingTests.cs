@@ -511,6 +511,139 @@ public sealed class MovementOrderingTests
         }
     }
 
+    [Theory]
+    [InlineData(0)] // Original UDP datagram lost
+    [InlineData(1)] // Original UDP arrives before TCP
+    [InlineData(2)] // TCP arrives before original UDP
+    [Trait("Category", "SocketIntegration")]
+    public async Task TailRetryAcceptsOnceAndFinalRefreshReachesPeerThatMissedUdp(int arrivalOrder)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        CancellationToken token = timeout.Token;
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var owner = new TcpClient();
+        using var recipient = new TcpClient();
+        await owner.ConnectAsync((IPEndPoint)listener.LocalEndpoint, token);
+        await recipient.ConnectAsync((IPEndPoint)listener.LocalEndpoint, token);
+        using TcpClient ownerConnection = await listener.AcceptTcpClientAsync(token);
+        using TcpClient recipientConnection = await listener.AcceptTcpClientAsync(token);
+        using var udpSender = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        using var udpRecipient = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+        var udpField = typeof(Server).GetField("udpSocket", BindingFlags.Static | BindingFlags.NonPublic)!;
+        object? previousUdp = udpField.GetValue(null);
+        udpField.SetValue(null, udpSender);
+        try
+        {
+            mover.tcp.Attach(ownerConnection);
+            peer.tcp.Attach(recipientConnection);
+            mover.tcp.StartReceiving();
+            peer.tcp.StartReceiving();
+            var ownerStream = owner.GetStream();
+            var peerStream = recipient.GetStream();
+            using (Packet hello = await ReadFrameAsync(ownerStream, token))
+                Assert.Equal((ProtocolV4.Version, mover.id), ProtocolV2.ReadServerHello(hello));
+            using (Packet hello = await ReadFrameAsync(peerStream, token))
+                Assert.Equal((ProtocolV4.Version, peer.id), ProtocolV2.ReadServerHello(hello));
+            peer.udp.endPoint = (IPEndPoint)udpRecipient.Client.LocalEndPoint!;
+
+            if (arrivalOrder == 1) Move(11, 0.08f, viaUdp: true);
+            Move(11, 0.08f);
+            if (arrivalOrder == 2) Move(11, 0.08f, viaUdp: true);
+            // If a stale datagram were incorrectly applied, the subsequent affordable step would fail.
+            Move(11, 0.04f, viaUdp: true);
+
+            Assert.Equal((11L, 11L), Watermarks);
+            Assert.Equal((0.08f, 0f), Position);
+            using (Packet ack = await ReadFrameAsync(ownerStream, token))
+                Assert.Equal((room.Id, room.RoundId, mover.id, 11L, 0.08f, 0f), ProtocolV4.ReadTcpPlayerPosition(ack));
+            // Simulate loss at the receiving peer by discarding the only UDP snapshot.
+            await udpRecipient.ReceiveAsync(token);
+            using (var quiet = CancellationTokenSource.CreateLinkedTokenSource(token))
+            {
+                quiet.CancelAfter(TimeSpan.FromMilliseconds(70));
+                await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+                    await udpRecipient.ReceiveAsync(quiet.Token));
+            }
+            token.ThrowIfCancellationRequested();
+
+            room.UpdateRound(Stopwatch.Frequency * 199 / 1000);
+            ServerSend.MatchState(room);
+            await AssertMatchStateAsync(ownerStream);
+            await AssertMatchStateAsync(peerStream);
+
+            room.UpdateRound(Stopwatch.Frequency / 5);
+            using (Packet refresh = await ReadFrameAsync(peerStream, token))
+                Assert.Equal((room.Id, room.RoundId, mover.id, 11L, 0.08f, 0f), ProtocolV4.ReadTcpPlayerPosition(refresh));
+
+            room.UpdateRound(Stopwatch.Frequency * 10);
+            ServerSend.MatchState(room);
+            await AssertMatchStateAsync(ownerStream);
+            await AssertMatchStateAsync(peerStream);
+            Move(12, 0.16f, ms: 20);
+            Assert.Equal((12L, 12L), Watermarks);
+            Assert.Equal((0.16f, 0f), Position);
+        }
+        finally
+        {
+            mover.tcp.Close();
+            peer.tcp.Close();
+            udpField.SetValue(null, previousUdp);
+        }
+
+        async Task AssertMatchStateAsync(NetworkStream stream)
+        {
+            using Packet frame = await ReadFrameAsync(stream, token);
+            Assert.Equal((int)ServerPackets.matchState, frame.ReadInt());
+        }
+    }
+
+    [Theory]
+    [InlineData("terrain")]
+    [InlineData("bomb")]
+    [InlineData("speed")]
+    public void TcpTailRetryUsesTheSameValidationAndPreservesCreditOnReject(string rejection)
+    {
+        if (rejection == "terrain") room.mapData[9, 8] = 1;
+        if (rejection == "bomb")
+        {
+            (peer.player!.x, peer.player.y) = (0.5f, 0.5f);
+            room.PlaceBomb(peer, room.Id, room.RoundId);
+        }
+        bool speed = rejection == "speed";
+        (Player.x, Player.y) = (-0.32f, 0.5f);
+        float target = speed ? -0.66f : -0.24f;
+        Assert.Equal(speed, room.CanMove(Player, target, 0.5f));
+        Move(11, target, 0.5f, ms: 250);
+        Assert.Equal((11L, 0L), Watermarks);
+        Assert.Equal((-0.32f, 0.5f), Position);
+
+        Move(11, -0.40f, 0.5f, ms: 250, viaUdp: true);
+        Assert.Equal((11L, 0L), Watermarks);
+        Move(12, -0.64f, 0.5f, ms: 250);
+        Assert.Equal((12L, 12L), Watermarks);
+        Assert.Equal((-0.64f, 0.5f), Position);
+    }
+
+    [Fact]
+    public void NewAcceptMovesRefreshDeadlineAndNewRoundDropsThePreviousPlayerSchedule()
+    {
+        var delay = TimeSpan.FromMilliseconds(200);
+        Move(11, 0.08f);
+        Move(12, 0.16f, ms: 150);
+        Assert.False(Player.TryTakeFinalPositionRefresh(Stopwatch.Frequency / 5, delay));
+        Assert.True(Player.TryTakeFinalPositionRefresh(Stopwatch.Frequency, delay));
+        Assert.False(Player.TryTakeFinalPositionRefresh(2 * Stopwatch.Frequency, delay));
+
+        Move(13, 0.24f, ms: 1000);
+        peer.player!.isAlive = false;
+        room.UpdateRound(Stopwatch.Frequency);
+        Assert.Equal(MatchPhase.Finished, room.Phase);
+        room.StartRound(mover, room.Id, room.RoundId, 2 * Stopwatch.Frequency);
+        Assert.False(Player.TryTakeFinalPositionRefresh(10 * Stopwatch.Frequency, delay));
+        Assert.Equal((0L, 0L), Watermarks);
+    }
+
     private static void Seal(Packet packet)
     {
         packet.WriteLength();

@@ -58,17 +58,20 @@ public sealed class MovementResolverTests
         Vector2 step = new Vector2(4f * 0.02f, 0f);
         var tryApply = GetPlayerMovementApplication();
         int applied = 0, sent = 0;
+        Vector2 sentTarget = default;
         Action<Vector2, Vector2> apply = (start, target) =>
         {
             Assert.That(start, Is.EqualTo(position));
+            Assert.That(target, Is.EqualTo(sentTarget));
             position = target;
             applied++;
         };
-        Action<Vector2> send = target =>
+        Func<Vector2, bool> send = target =>
         {
-            Assert.That(position, Is.EqualTo(target));
+            sentTarget = target;
             sent++;
-            Assert.That(sent, Is.EqualTo(applied));
+            Assert.That(sent, Is.EqualTo(applied + 1));
+            return true;
         };
 
         for (int i = 0; i < 3; i++)
@@ -98,7 +101,20 @@ public sealed class MovementResolverTests
 
         Vector2 target = resolver.Resolve(terrain, start, Vector2.zero);
         Assert.That(tryApply(start, target, (_, __) => Assert.Fail("Unexpected position update"),
-            _ => Assert.Fail("Unexpected movement send")), Is.False);
+            _ => throw new AssertionException("Unexpected movement send")), Is.False);
+    }
+
+    [Test]
+    public void MovementRejectedByBothTransportsDoesNotMoveTheLocalTransform()
+    {
+        Vector2 start = new Vector2(-0.32f, 0.3f);
+        Vector2 position = start;
+        int attempts = 0;
+        var tryApply = GetPlayerMovementApplication();
+        Assert.That(tryApply(start, start + new Vector2(0.08f, 0), (_, target) => position = target,
+            _ => { attempts++; return false; }), Is.False);
+        Assert.That(position, Is.EqualTo(start));
+        Assert.That(attempts, Is.EqualTo(1));
     }
 
     [Test]
@@ -276,7 +292,7 @@ public sealed class MovementResolverTests
         vertical ? new Vector2(lateral, forward) : new Vector2(forward, lateral);
 
     private delegate bool TryApplyMovement(Vector2 start, Vector2 target,
-        Action<Vector2, Vector2> apply, Action<Vector2> send);
+        Action<Vector2, Vector2> apply, Func<Vector2, bool> send);
 
     private static TryApplyMovement GetPlayerMovementApplication()
     {

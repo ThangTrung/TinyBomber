@@ -153,7 +153,7 @@ namespace GameServer
             long appliedAt = now ?? Stopwatch.GetTimestamp();
             if (room.CanMove(player, x, y) && player.TrySpendMovementCredit(x, y, appliedAt))
             {
-                player.AcceptMovement(x, y, moveSeq);
+                player.AcceptMovement(x, y, moveSeq, appliedAt);
                 if (moveSeq.HasValue) ServerSend.AcknowledgeMovement(room, slot, player);
                 ServerSend.BroadcastPlayerPosition(room, player);
             }

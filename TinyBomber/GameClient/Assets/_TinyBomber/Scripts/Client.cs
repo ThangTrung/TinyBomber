@@ -243,26 +243,29 @@ public class Client : MonoBehaviour
             }
         }
 
-        public void SendData(Packet _packet)
+        public void SendData(Packet packet) => TrySendData(packet);
+
+        internal bool TrySendData(Packet packet)
         {
             try
             {
                 lock (pendingWrites)
                 {
-                    if (closed || sendFailed || socket == null) return;
+                    if (closed || sendFailed || socket == null) return false;
 
-                    pendingWrites.Enqueue(_packet.ToArray());
-                    if (writing) return;
+                    pendingWrites.Enqueue(packet.ToArray());
+                    if (writing) return true;
                     writing = true;
                 }
             }
             catch (Exception ex)
             {
                 FailWrites(ex);
-                return;
+                return false;
             }
 
             _ = WritePendingAsync();
+            return true;
         }
 
         private async Task WritePendingAsync()
@@ -381,7 +384,7 @@ public class Client : MonoBehaviour
                                 position.PlayerId, position.AcceptedMoveSeq, position.AcceptedMoveSeq, target);
                         else
                             GameManager.instance.ApplyOrderedPeerPosition(position.RoomId, position.RoundId,
-                                position.PlayerId, position.AcceptedMoveSeq, target);
+                                position.PlayerId, position.AcceptedMoveSeq, target, reliable: true);
                         return;
                     }
                     if (_packetId == (int)ServerPackets.playerCorrectionV4)
@@ -662,7 +665,7 @@ public class Client : MonoBehaviour
                         var ordered = ProtocolV4.ReadUdpPlayerPosition(packet);
                         if (instance.IsConnecting || !ordered.Token.AsSpan().SequenceEqual(token)) return;
                         GameManager.instance.ApplyOrderedPeerPosition(ordered.RoomId, ordered.RoundId,
-                            ordered.PlayerId, ordered.AcceptedMoveSeq, new Vector2(ordered.X, ordered.Y));
+                            ordered.PlayerId, ordered.AcceptedMoveSeq, new Vector2(ordered.X, ordered.Y), reliable: false);
                         break;
                     case ServerPackets.udpHealthEcho:
                         var echo = ProtocolV3.ReadUdpHealthEcho(packet);

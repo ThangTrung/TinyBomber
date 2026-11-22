@@ -6,6 +6,8 @@ namespace GameServer
 {
     internal sealed class GameLogic
     {
+        internal const int DefaultFinalPositionIdleMs = 200;
+        private readonly TimeSpan finalPositionIdleDelay;
         private readonly List<Client> members = new();
         internal IReadOnlyList<Client> Members => members;
         internal readonly int[,] mapData = new int[Constants.MAP_WIDTH, Constants.MAP_HEIGHT];
@@ -13,7 +15,11 @@ namespace GameServer
         private readonly List<Bomb> bombs = new();
         private static readonly (int dx, int dy)[] directions = { (1, 0), (-1, 0), (0, 1), (0, -1) };
 
-        internal GameLogic(int id) => Id = id;
+        internal GameLogic(int id, int finalPositionIdleMs = DefaultFinalPositionIdleMs)
+        {
+            Id = id;
+            finalPositionIdleDelay = TimeSpan.FromMilliseconds(finalPositionIdleMs);
+        }
 
         internal int Id { get; }
         internal MatchPhase Phase { get; private set; }
@@ -138,7 +144,13 @@ namespace GameServer
             }
 
             alive.RemoveAll(hit.Contains);
-            if (alive.Count > 1) return;
+            if (alive.Count > 1)
+            {
+                foreach (var player in alive)
+                    if (player.TryTakeFinalPositionRefresh(now, finalPositionIdleDelay))
+                        ServerSend.RefreshFinalPeerPosition(this, player);
+                return;
+            }
 
             WinnerId = alive.Count == 1 ? alive[0].id : 0;
             Phase = MatchPhase.Finished;

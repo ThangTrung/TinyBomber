@@ -207,6 +207,29 @@ namespace GameServer
             owner.tcp.SendData(packet);
         }
 
+        internal static void RefreshFinalPeerPosition(GameLogic room, Player player)
+        {
+            Packet? position = null;
+            try
+            {
+                foreach (var slot in room.Members)
+                {
+                    // TCP-only recipients already received this sequence on the reliable path.
+                    if (slot.id == player.id || slot.player == null || !slot.tcp.UsesMovementOrdering ||
+                        !slot.IsReady || slot.tcp.SessionToken == null || slot.udp.endPoint == null)
+                        continue;
+
+                    position ??= ProtocolV4.CreateTcpPlayerPosition(room.Id, room.RoundId, player.id,
+                        player.LastAcceptedMoveSeq, player.x, player.y);
+                    slot.tcp.SendData(position);
+                }
+            }
+            finally
+            {
+                position?.Dispose();
+            }
+        }
+
         internal static void SnapPlayerPosition(GameLogic room, Client recipient, Player player)
         {
             using var packet = recipient.tcp.UsesMovementOrdering

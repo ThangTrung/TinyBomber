@@ -9,14 +9,20 @@ using Object = UnityEngine.Object;
 
 public sealed class MovementOrderingTests
 {
+    private const double Delay = 0.25;
+    private static readonly (object, int, int) Scope = (new object(), 7, 1);
+
+    internal static bool Submit(MovementOrdering ordering, Func<long, bool> send) =>
+        ordering.TrySend(Scope, Vector2.zero, 0, Delay, (sequence, _) => send(sequence), (_, _) => false);
+
     [Test]
     public void OnlyASubmittedMovementConsumesTheNextSequence()
     {
         var ordering = new MovementOrdering();
-        Assert.That(ordering.TrySend(seq => seq == 1), Is.True);
-        Assert.That(ordering.TrySend(seq => { Assert.That(seq, Is.EqualTo(2)); return false; }), Is.False);
-        Assert.That(ordering.TrySend(seq => seq == 2), Is.True);
-        Assert.That(ordering.TrySend(seq => seq == 3), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 1), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => { Assert.That(seq, Is.EqualTo(2)); return false; }), Is.False);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 2), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 3), Is.True);
     }
 
     [Test]
@@ -25,10 +31,10 @@ public sealed class MovementOrderingTests
         var ordering = new MovementOrdering();
         typeof(MovementOrdering).GetField("lastSent", BindingFlags.Instance | BindingFlags.NonPublic)
             .SetValue(ordering, long.MaxValue - 1);
-        Assert.That(ordering.TrySend(seq => seq == long.MaxValue), Is.True);
-        Assert.That(ordering.TrySend(_ => throw new AssertionException("An exhausted stream cannot send")), Is.False);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == long.MaxValue), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, _ => throw new AssertionException("An exhausted stream cannot send")), Is.False);
         ordering.ResetLocal();
-        Assert.That(ordering.TrySend(seq => seq == 1), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 1), Is.True);
     }
 
     [TestCase(11, 12, true)]
@@ -39,13 +45,13 @@ public sealed class MovementOrderingTests
         var ordering = new MovementOrdering();
         Assert.That(ordering.TryRecordPeer(2, first, Vector2.left), Is.True);
         Assert.That(ordering.TryRecordPeer(2, second, Vector2.right), Is.EqualTo(acceptsSecond));
-        Assert.That(ordering.TryGetPeerTarget(2, out var target), Is.True);
+        Assert.That(ordering.TryGetPeerTarget(2, out var target, out _), Is.True);
         Assert.That(target, Is.EqualTo(acceptsSecond ? Vector2.right : Vector2.left));
         Assert.That(ordering.TryRecordPeer(3, 1, Vector2.up), Is.True);
         ordering.RemovePeer(2);
-        Assert.That(ordering.TryGetPeerTarget(2, out _), Is.False);
+        Assert.That(ordering.TryGetPeerTarget(2, out _, out _), Is.False);
         Assert.That(ordering.TryRecordPeer(2, 1, Vector2.down), Is.True);
-        Assert.That(ordering.TryGetPeerTarget(3, out target) && target == Vector2.up, Is.True);
+        Assert.That(ordering.TryGetPeerTarget(3, out target, out _) && target == Vector2.up, Is.True);
     }
 
     [Test]
@@ -110,9 +116,122 @@ public sealed class MovementOrderingTests
         ordering.QueueOwnerState(13, 13, At(0.24f));
         ordering.Reset();
         Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
-        Assert.That(ordering.TrySend(sequence => sequence == 1), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, sequence => sequence == 1), Is.True);
         Assert.That(ordering.QueueOwnerState(1, 1, Vector2.right), Is.True);
         Assert.That(ordering.TryTakeOwnerPosition(out _), Is.False);
+    }
+
+    [Test]
+    public void TailRetryKeepsSequenceAndPositionAndIsAttemptedOnce()
+    {
+        var ordering = new MovementOrdering();
+        int attempts = 0;
+        var target = At(0.08f);
+        Assert.That(ordering.TrySend(Scope, target, 1, Delay, (seq, position) =>
+            seq == 1 && position.Equals(target), (_, _) => false), Is.True);
+        Assert.That(ordering.TryRetry(Scope, 1.249, Delay, Retry), Is.False);
+        Assert.That(ordering.TryRetry(Scope, 1.25, Delay, Retry), Is.True);
+        Assert.That(ordering.TryRetry(Scope, 100, Delay, Retry), Is.False);
+        Assert.That(attempts, Is.EqualTo(1));
+        Assert.That(ordering.QueueOwnerState(1, 1, target), Is.True);
+        Assert.That(Submit(ordering, seq => seq == 2), Is.True);
+
+        bool Retry(long sequence, Vector2 position)
+        {
+            attempts++;
+            Assert.That(sequence, Is.EqualTo(1));
+            Assert.That(position, Is.EqualTo(target));
+            return true;
+        }
+    }
+
+    [TestCase(0L)]
+    [TestCase(1L)]
+    public void CorrectionOrAckBeforeTimeoutCancelsTailRetry(long accepted)
+    {
+        var ordering = SentThrough(1);
+        Assert.That(ordering.QueueOwnerState(1, accepted, Vector2.zero), Is.True);
+        Assert.That(ordering.TryRetry(Scope, 1, Delay, (_, _) => throw new AssertionException("Already processed")), Is.False);
+    }
+
+    [Test]
+    public void NewMovementReplacesOldTailAndRestartsTimeout()
+    {
+        var ordering = SentThrough(1);
+        Assert.That(ordering.TrySend(Scope, At(0.16f), 0.125, Delay, (seq, _) => seq == 2, (_, _) => false), Is.True);
+        Assert.That(ordering.QueueOwnerState(1, 1, Vector2.zero), Is.True);
+        Assert.That(ordering.TryRetry(Scope, 0.25, Delay, (_, _) => throw new AssertionException("Too early")), Is.False);
+        Assert.That(ordering.TryRetry(Scope, 0.375, Delay, (seq, pos) => seq == 2 && pos.Equals(At(0.16f))), Is.True);
+        Assert.That(ordering.QueueOwnerState(2, 1, At(0.08f)), Is.True);
+        Assert.That(ordering.TryTakeOwnerPosition(out var corrected) && corrected.Equals(At(0.08f)), Is.True);
+    }
+
+    [Test]
+    public void FailedUdpEnqueuesIdenticalCandidateViaTcpAndThrottlesFurtherFallback()
+    {
+        var ordering = new MovementOrdering();
+        var pos = At(0.08f);
+        int tcpCalls = 0;
+        bool Tcp(long sequence, Vector2 position)
+        {
+            tcpCalls++;
+            Assert.That(sequence, Is.EqualTo(1));
+            Assert.That(position, Is.EqualTo(pos));
+            return true;
+        }
+        Assert.That(ordering.TrySend(Scope, pos, 0, Delay, (_, _) => false, Tcp), Is.True);
+        Assert.That(ordering.TrySend(Scope, At(0.16f), 0.125, Delay, (_, _) => false, Tcp), Is.False);
+        Assert.That(ordering.TryRetry(Scope, 1, Delay, Tcp), Is.False);
+        Assert.That(tcpCalls, Is.EqualTo(1));
+        Assert.That(Submit(ordering, seq => seq == 2), Is.True);
+    }
+
+    [Test]
+    public void BothSendFailuresLeaveSequenceUnspentAndLimitTcpAttempts()
+    {
+        var ordering = new MovementOrdering();
+        int attempts = 0;
+        bool FailTcp(long sequence, Vector2 _)
+        {
+            Assert.That(sequence, Is.EqualTo(1));
+            attempts++;
+            return false;
+        }
+        for (int frame = 0; frame < 10; frame++)
+            Assert.That(ordering.TrySend(Scope, Vector2.right, frame * 0.02, Delay, (_, _) => false, FailTcp), Is.False);
+        Assert.That(attempts, Is.EqualTo(1));
+        Assert.That(Submit(ordering, seq => seq == 1), Is.True);
+    }
+
+    [Test]
+    public void RetryIsScopedToItsSessionRoomAndRoundAndClearedOnReset()
+    {
+        var ordering = SentThrough(1);
+        bool NoRetry(long _, Vector2 __) => throw new AssertionException("Previous scope cannot send");
+        Assert.That(ordering.TryRetry((new object(), Scope.Item2, Scope.Item3), 1, Delay, NoRetry), Is.False);
+        Assert.That(ordering.TryRetry((Scope.Item1, 8, Scope.Item3), 1, Delay, NoRetry), Is.False);
+        Assert.That(ordering.TryRetry((Scope.Item1, Scope.Item2, 2), 1, Delay, NoRetry), Is.False);
+        ordering.Reset();
+        Assert.That(ordering.TryRetry(Scope, 1, Delay, NoRetry), Is.False);
+        Assert.That(Submit(ordering, seq => seq == 1), Is.True);
+    }
+
+    [Test]
+    public void ReliableRefreshCanConfirmEqualTargetOnceAndCannotReplaceNewerUdpTarget()
+    {
+        var ordering = new MovementOrdering();
+        Assert.That(ordering.TryRecordPeer(2, 11, Vector2.left), Is.True);
+        Assert.That(ordering.TryRecordPeer(2, 12, Vector2.right), Is.True);
+        Assert.That(ordering.TryRecordPeer(2, 11, Vector2.left, reliable: true), Is.False);
+        Assert.That(ordering.TryRecordPeer(2, 12, Vector2.left, reliable: true), Is.False);
+        Assert.That(ordering.TryRecordPeer(2, 12, Vector2.right, reliable: true), Is.True);
+        Assert.That(ordering.TryRecordPeer(2, 12, Vector2.right, reliable: true), Is.False);
+        Assert.That(ordering.TryRecordPeer(2, 12, Vector2.right), Is.False);
+        Assert.That(ordering.TryGetPeerTarget(2, out var target, out var reliable) &&
+            reliable && target.Equals(Vector2.right), Is.True);
+        Assert.That(ordering.TryRecordPeer(2, 13, Vector2.up, reliable: true), Is.True);
+        Assert.That(ordering.TryGetPeerTarget(2, out target, out reliable) &&
+            reliable && target.Equals(Vector2.up), Is.True);
     }
 
     private static Vector2 At(float x) => new Vector2(x, 0);
@@ -121,7 +240,7 @@ public sealed class MovementOrderingTests
     {
         var ordering = new MovementOrdering();
         for (long sequence = 1; sequence <= last; sequence++)
-            Assert.That(ordering.TrySend(next => next == sequence), Is.True);
+            Assert.That(MovementOrderingTests.Submit(ordering, next => next == sequence), Is.True);
         return ordering;
     }
 }
@@ -203,33 +322,40 @@ public sealed class MovementOrderingUnityTests
         Peer(7, 1, 13, Vector2.left);
         Assert.That(target.GetValue(remote), Is.EqualTo(Vector2.left));
         Assert.That(hold.GetValue(remote), Is.Not.EqualTo(-123d));
+
+        hold.SetValue(remote, -125d);
+        Invoke("ApplyOrderedPeerPosition", 7, 1, 2, 12L, Vector2.right, true);
+        Invoke("ApplyOrderedPeerPosition", 7, 1, 2, 13L, Vector2.left, true);
+        Assert.That(target.GetValue(remote), Is.EqualTo(Vector2.left));
+        Assert.That(hold.GetValue(remote), Is.EqualTo(-125d));
+        Assert.That(remote.GetType().GetField("finishAtTarget", Instance).GetValue(remote), Is.True);
     }
 
     [Test]
     public void ReplayRoomChangeAndSessionResetAllowReusedPlayerIdButDropOldScope()
     {
         var ordering = (MovementOrdering)gameType.GetField("movementOrdering", Instance).GetValue(game);
-        Assert.That(ordering.TrySend(seq => seq == 1), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 1), Is.True);
         Peer(7, 1, 12, Vector2.right);
         Invoke("ApplyMatchState", 1, MatchPhase.Finished, 2, 0);
         Peer(7, 1, 13, Vector2.left);
-        Assert.That(ordering.TryGetPeerTarget(2, out _), Is.False);
+        Assert.That(ordering.TryGetPeerTarget(2, out _, out _), Is.False);
         Invoke("BeginRound", 2, new[] { 1, 2 });
         Peer(7, 1, 13, Vector2.left);
         Peer(7, 2, 1, Vector2.up);
-        Assert.That(ordering.TryGetPeerTarget(2, out var target) && target == Vector2.up, Is.True);
-        Assert.That(ordering.TrySend(seq => seq == 1), Is.True);
+        Assert.That(ordering.TryGetPeerTarget(2, out var target, out _) && target == Vector2.up, Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 1), Is.True);
 
         Invoke("ChangeRoom", 8);
         Invoke("BeginRound", 1, new[] { 1, 2 });
         Peer(7, 2, 14, Vector2.right);
-        Assert.That(ordering.TryGetPeerTarget(2, out _), Is.False);
-        Assert.That(ordering.TrySend(seq => seq == 1), Is.True);
+        Assert.That(ordering.TryGetPeerTarget(2, out _, out _), Is.False);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 1), Is.True);
         gameType.GetMethod("RemovePlayer").Invoke(null, new object[] { 2 });
         Peer(8, 1, 1, Vector2.up);
-        Assert.That(ordering.TryGetPeerTarget(2, out _), Is.False);
+        Assert.That(ordering.TryGetPeerTarget(2, out _, out _), Is.False);
         gameType.GetMethod("ClearSession").Invoke(null, new object[] { "Disconnected" });
-        Assert.That(ordering.TrySend(seq => seq == 1), Is.True);
+        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 1), Is.True);
     }
 
     [TestCase(false)]
@@ -240,7 +366,7 @@ public sealed class MovementOrderingUnityTests
         players.Add(1, local);
         Invoke("ApplyMatchState", 1, MatchPhase.Playing, 2, 0);
         var ordering = (MovementOrdering)gameType.GetField("movementOrdering", Instance).GetValue(game);
-        for (int i = 0; i < 13; i++) ordering.TrySend(_ => true);
+        for (int i = 0; i < 13; i++) MovementOrderingTests.Submit(ordering, _ => true);
         var predicted = new Vector3(0.24f, 0, 0);
         var corrected = new Vector3(0.08f, 0, 0);
         local.transform.position = predicted;
@@ -277,7 +403,7 @@ public sealed class MovementOrderingUnityTests
         local.transform.position = Vector3.right;
         Invoke("ApplyMatchState", 1, MatchPhase.Playing, 2, 0);
         var ordering = (MovementOrdering)gameType.GetField("movementOrdering", Instance).GetValue(game);
-        ordering.TrySend(_ => true);
+        MovementOrderingTests.Submit(ordering, _ => true);
         var oldConnection = InstallConnection();
         using var correction = ProtocolV4.CreateTcpPlayerCorrection(7, 1, 1, 1, 0, 0, 0);
         Receive(oldConnection, correction);
@@ -313,7 +439,7 @@ public sealed class MovementOrderingUnityTests
     private static void DrainNetwork() => FindType("ThreadManager").GetMethod("UpdateMain").Invoke(null, null);
 
     private void Peer(int room, int round, long seq, Vector2 position) =>
-        Invoke("ApplyOrderedPeerPosition", room, round, 2, seq, position);
+        Invoke("ApplyOrderedPeerPosition", room, round, 2, seq, position, false);
 
     private void Invoke(string method, params object[] args) => gameType.GetMethod(method, Instance).Invoke(game, args);
 

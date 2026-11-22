@@ -22,6 +22,7 @@ namespace GameServer
 
         internal long LastProcessedMoveSeq { get; private set; }
         internal long LastAcceptedMoveSeq { get; private set; }
+        private long? lastMoveAwaitingRefresh;
 
         private static readonly (float x, float y)[] SpawnPoints = new[]
         {
@@ -51,11 +52,24 @@ namespace GameServer
             return true;
         }
 
-        internal void AcceptMovement(float targetX, float targetY, long? moveSeq)
+        internal void AcceptMovement(float targetX, float targetY, long? moveSeq, long? acceptedAt = null)
         {
             x = targetX;
             y = targetY;
-            if (moveSeq.HasValue) LastAcceptedMoveSeq = moveSeq.Value;
+            if (moveSeq is long sequence)
+            {
+                LastAcceptedMoveSeq = sequence;
+                lastMoveAwaitingRefresh = acceptedAt;
+            }
+        }
+
+        internal bool TryTakeFinalPositionRefresh(long now, TimeSpan idleDelay)
+        {
+            if (lastMoveAwaitingRefresh is not long acceptedAt ||
+                Stopwatch.GetElapsedTime(acceptedAt, now) < idleDelay) return false;
+
+            lastMoveAwaitingRefresh = null;
+            return true;
         }
 
         internal bool TrySpendMovementCredit(float targetX, float targetY, long now)

@@ -17,11 +17,14 @@ namespace GameServer
 
         // Lobby membership and room lifecycles are owned by the update thread.
         private static readonly Dictionary<int, GameLogic> rooms = new();
+        private static readonly int finalPositionIdleMs =
+            int.TryParse(Environment.GetEnvironmentVariable("TINYBOMBER_FINAL_POSITION_IDLE_MS"), out int delay) &&
+            delay is >= 50 and <= 5000 ? delay : GameLogic.DefaultFinalPositionIdleMs;
         private static int lastRoomId;
 
         internal static GameLogic CreateRoom()
         {
-            var room = new GameLogic(checked(++lastRoomId));
+            var room = new GameLogic(checked(++lastRoomId), finalPositionIdleMs);
             rooms.Add(room.Id, room);
             return room;
         }

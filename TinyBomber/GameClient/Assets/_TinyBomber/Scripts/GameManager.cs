@@ -21,6 +21,8 @@ public class GameManager : MonoBehaviour
     private readonly List<GameObject> blasts = new List<GameObject>();
     private readonly HashSet<int> pendingSpawns = new HashSet<int>();
     private readonly MovementOrdering movementOrdering = new MovementOrdering();
+    [SerializeField, Min(0.05f)] private float movementRecoverySeconds = 0.25f;
+    private double MovementRecoveryDelay => Mathf.Max(0.05f, movementRecoverySeconds);
     private Sprite blastSprite;
     private int[,] terrain;
     private MovementResolver movementResolver;
@@ -350,10 +352,13 @@ public class GameManager : MonoBehaviour
         softBlocks.Clear();
     }
 
-    internal bool TrySendOrderedMovement(System.Func<long, bool> send) =>
-        CanControl && movementOrdering.TrySend(send);
+    internal bool TrySendOrderedMovement(Vector2 position) =>
+        Client.instance && Client.instance.tcp != null && CanControl &&
+        movementOrdering.TrySend((Client.instance.tcp, RoomId, ActiveRoundId), position,
+            Time.realtimeSinceStartupAsDouble, MovementRecoveryDelay,
+            ClientSend.TrySendUdpMovement, ClientSend.TrySendTcpMovement);
 
-    internal void ApplyOrderedPeerPosition(int roomId, int roundId, int id, long sequence, Vector2 target)
+    internal void ApplyOrderedPeerPosition(int roomId, int roundId, int id, long sequence, Vector2 target, bool reliable)
     {
         if (roomId <= 0 || roomId != RoomId || roundId <= 0 || roundId != ActiveRoundId ||
             displayedRoundId > roundId || (displayedRoundId == roundId && phase == MatchPhase.Finished) ||
@@ -361,16 +366,16 @@ public class GameManager : MonoBehaviour
 
         // Keep the newest snapshot only for a known member of this round. UDP can overtake spawn.
         if (!players.TryGetValue(id, out var player) && !pendingSpawns.Contains(id)) return;
-        if (!movementOrdering.TryRecordPeer(id, sequence, target)) return;
+        if (!movementOrdering.TryRecordPeer(id, sequence, target, reliable)) return;
 
         if (IsPlaying && player) ApplyStoredPeerPosition(id, player);
     }
 
     private void ApplyStoredPeerPosition(int id, GameObject player)
     {
-        if (movementOrdering.TryGetPeerTarget(id, out var target) &&
+        if (movementOrdering.TryGetPeerTarget(id, out var target, out var reliable) &&
             player.TryGetComponent(out RemotePlayerController remote))
-            remote.UpdatePosition(target);
+            remote.UpdatePosition(target, reliable);
     }
 
     internal void QueueOwnerMovementState(int roomId, int roundId, int id, long processed, long accepted,
@@ -387,10 +392,13 @@ public class GameManager : MonoBehaviour
     // ThreadManager drains TCP callbacks in Update. Apply only the latest owner result at frame end.
     private void LateUpdate()
     {
-        if (!IsPlaying || !Client.instance || !players.TryGetValue(Client.instance.myId, out var player) ||
-            !player || !movementOrdering.TryTakeOwnerPosition(out var position)) return;
+        if (!IsPlaying || !Client.instance || !players.TryGetValue(Client.instance.myId, out var player) || !player) return;
 
-        if (!((Vector2)player.transform.position).Equals(position)) player.transform.position = position;
+        if (movementOrdering.TryTakeOwnerPosition(out var position) &&
+            !((Vector2)player.transform.position).Equals(position)) player.transform.position = position;
+        if (Client.instance.tcp != null && CanControl)
+            movementOrdering.TryRetry((Client.instance.tcp, RoomId, ActiveRoundId), Time.realtimeSinceStartupAsDouble,
+                MovementRecoveryDelay, ClientSend.TrySendTcpMovement);
     }
 
     private static bool IsFinite(Vector2 position) => !float.IsNaN(position.x) && !float.IsInfinity(position.x) &&
