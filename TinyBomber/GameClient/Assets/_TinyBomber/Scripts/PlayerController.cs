@@ -1,17 +1,21 @@
 ﻿using UnityEngine;
-using GameShared;
+using System;
 
 public class PlayerController : MonoBehaviour
 {
-    public float speed = 5f;
+    private static readonly Action<Vector2> SendMovement = ClientSend.SendPlayerMovement;
+
+    public float speed = 4f;
     private Animator anim;
     private SpriteRenderer sr;
     private Vector2 moveDir;
+    private Action<Vector2, Vector2> applyPosition;
 
     private void Start()
     {
         anim = GetComponent<Animator>();
         sr = GetComponent<SpriteRenderer>();
+        applyPosition = ApplyPosition;
     }
 
     private void Update()
@@ -38,12 +42,25 @@ public class PlayerController : MonoBehaviour
 
         Vector2 start = transform.position;
         Vector2 target = GameManager.instance.ResolveMovement(start, moveDir * speed * Time.fixedDeltaTime);
-        bool moving = target != start;
-        anim.SetBool("IsMoving", moving);
-        if (!moving) return;
+        if (!TryApplyMovement(start, target, applyPosition, SendMovement))
+            anim.SetBool("IsMoving", false);
+    }
 
+    private void ApplyPosition(Vector2 start, Vector2 target)
+    {
+        anim.SetBool("IsMoving", true);
         if (target.x != start.x) sr.flipX = target.x < start.x;
         transform.position = target;
-        ClientSend.SendPlayerMovement(target);
+    }
+
+    private static bool TryApplyMovement(Vector2 start, Vector2 target,
+        Action<Vector2, Vector2> apply, Action<Vector2> send)
+    {
+        // Match the resolver's exact comparison so even the last step at a tile edge is applied.
+        if (target.Equals(start)) return false;
+
+        apply(start, target);
+        send(target);
+        return true;
     }
 }

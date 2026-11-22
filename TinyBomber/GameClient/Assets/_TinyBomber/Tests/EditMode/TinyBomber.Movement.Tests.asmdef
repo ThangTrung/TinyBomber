@@ -1,0 +1,7 @@
+{
+    "name": "TinyBomber.Movement.Tests",
+    "references": ["TinyBomber.Movement"],
+    "precompiledReferences": ["GameShared.dll"],
+    "includePlatforms": ["Editor"],
+    "optionalUnityReferences": ["TestAssemblies"]
+}

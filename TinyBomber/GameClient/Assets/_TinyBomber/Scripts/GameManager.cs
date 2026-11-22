@@ -22,6 +22,7 @@ public class GameManager : MonoBehaviour
     private readonly HashSet<int> pendingSpawns = new HashSet<int>();
     private Sprite blastSprite;
     private int[,] terrain;
+    private MovementResolver movementResolver;
     private MatchPhase phase;
     private int displayedRoundId;
     private int readyCount;
@@ -186,24 +187,7 @@ public class GameManager : MonoBehaviour
 
     public Vector2 ResolveMovement(Vector2 start, Vector2 step)
     {
-        if (terrain == null || step == Vector2.zero) return start;
-        Vector2 target = start + step;
-        if (CanStep(start, target)) return target;
-        if (step.x == 0f || step.y == 0f) return start;
-
-        Vector2 alongX = new Vector2(target.x, start.y);
-        Vector2 alongY = new Vector2(start.x, target.y);
-        bool preferX = Mathf.Abs(step.x) >= Mathf.Abs(step.y);
-        Vector2 first = preferX ? alongX : alongY;
-        Vector2 second = preferX ? alongY : alongX;
-        if (CanStep(start, first)) return first;
-        return CanStep(start, second) ? second : start;
-    }
-
-    private bool CanStep(Vector2 start, Vector2 target)
-    {
-        return TerrainCollision.CanSweep(terrain, start.x, start.y, target.x, target.y)
-            && !BombBlocksStep(start, target);
+        return movementResolver.Resolve(terrain, start, step);
     }
 
     public bool BombBlocksStep(Vector2 start, Vector2 target)
@@ -271,6 +255,7 @@ public class GameManager : MonoBehaviour
         }
 
         instance = this;
+        movementResolver = new MovementResolver(BombBlocksStep);
         if (matchButton) matchButton.onClick.AddListener(RequestStartOrReplay);
         RefreshMatchUi();
     }
@@ -326,6 +311,7 @@ public class GameManager : MonoBehaviour
 
     private void ClearRound()
     {
+        movementResolver?.Reset();
         ActiveRoundId = 0;
         pendingSpawns.Clear();
         terrain = null;
