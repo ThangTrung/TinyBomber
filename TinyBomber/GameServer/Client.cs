@@ -40,6 +40,9 @@ namespace GameServer
             private bool heartbeatWritePending;
             private bool writeFailed;
             private volatile bool closed;
+            // Published by the update thread after hello validation and read by receive callbacks.
+            internal volatile int AcceptedProtocolVersion;
+            internal bool UsesMovementOrdering => AcceptedProtocolVersion == ProtocolV4.Version;
             // Read and written by the server update thread.
             internal byte[]? SessionToken { get; set; }
             private long? lastHeartbeatProof;
@@ -214,7 +217,15 @@ namespace GameServer
                         return;
                     }
                     if (packetId is (int)ClientPackets.welcomeReceived or (int)ClientPackets.udpReady)
-                        throw new InvalidDataException("Legacy v1 handshake packet on a v3 connection.");
+                        throw new InvalidDataException($"Legacy v1 handshake packet on a v{ProtocolV4.Version} server.");
+                    if (packetId == (int)ClientPackets.playerMovementV4)
+                    {
+                        if (!UsesMovementOrdering) return;
+                        var move = ProtocolV4.ReadTcpPlayerMovement(_packet);
+                        EnqueueCurrent(slot => ServerHandle.PlayerMovement(slot, move.RoomId, move.RoundId,
+                            move.X, move.Y, moveSeq: move.MoveSeq));
+                        return;
+                    }
 
                     _packet.ReadInt();
                     if (packetId == (int)ClientPackets.placeBomb)
@@ -223,7 +234,7 @@ namespace GameServer
                         int roundId = _packet.ReadInt();
                         EnqueueCurrent(slot => slot.Room?.PlaceBomb(slot, roomId, roundId));
                     }
-                    else if (packetId == (int)ClientPackets.playerMovement)
+                    else if (packetId == (int)ClientPackets.playerMovement && !UsesMovementOrdering)
                     {
                         int roomId = _packet.ReadInt();
                         int roundId = _packet.ReadInt();

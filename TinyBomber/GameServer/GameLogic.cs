@@ -6,6 +6,8 @@ namespace GameServer
 {
     internal sealed class GameLogic
     {
+        internal const int DefaultFinalPositionIdleMs = 200;
+        private readonly TimeSpan finalPositionIdleDelay;
         private readonly List<Client> members = new();
         internal IReadOnlyList<Client> Members => members;
         internal readonly int[,] mapData = new int[Constants.MAP_WIDTH, Constants.MAP_HEIGHT];
@@ -13,7 +15,11 @@ namespace GameServer
         private readonly List<Bomb> bombs = new();
         private static readonly (int dx, int dy)[] directions = { (1, 0), (-1, 0), (0, 1), (0, -1) };
 
-        internal GameLogic(int id) => Id = id;
+        internal GameLogic(int id, int finalPositionIdleMs = DefaultFinalPositionIdleMs)
+        {
+            Id = id;
+            finalPositionIdleDelay = TimeSpan.FromMilliseconds(finalPositionIdleMs);
+        }
 
         internal int Id { get; }
         internal MatchPhase Phase { get; private set; }
@@ -44,7 +50,7 @@ namespace GameServer
             slot.Room == this && roomId == Id && Phase == MatchPhase.Playing && roundId == RoundId &&
             slot.player is { isAlive: true };
 
-        internal void StartRound(Client requester, int roomId, int expectedRoundId)
+        internal void StartRound(Client requester, int roomId, int expectedRoundId, long? now = null)
         {
             if (requester.Room != this || roomId != Id || Phase == MatchPhase.Playing ||
                 expectedRoundId != RoundId || !requester.IsReady)
@@ -56,11 +62,12 @@ namespace GameServer
             RoundId++;
             WinnerId = 0;
             InitializeMap();
+            long spawnedAt = now ?? Stopwatch.GetTimestamp();
             foreach (var slot in members) slot.player = null;
             for (int i = 0; i < participants.Length; i++)
             {
                 Client slot = participants[i];
-                slot.player = new Player(slot.id, slot.Username!, i);
+                slot.player = new Player(slot.id, slot.Username!, i, spawnedAt);
             }
             Phase = MatchPhase.Playing;
 
@@ -137,7 +144,13 @@ namespace GameServer
             }
 
             alive.RemoveAll(hit.Contains);
-            if (alive.Count > 1) return;
+            if (alive.Count > 1)
+            {
+                foreach (var player in alive)
+                    if (player.TryTakeFinalPositionRefresh(now, finalPositionIdleDelay))
+                        ServerSend.RefreshFinalPeerPosition(this, player);
+                return;
+            }
 
             WinnerId = alive.Count == 1 ? alive[0].id : 0;
             Phase = MatchPhase.Finished;
@@ -150,7 +163,7 @@ namespace GameServer
 
         internal bool CanMove(Player player, float x, float y)
         {
-            if (!CanMoveTo(x, y)) return false;
+            if (!TerrainCollision.CanSweep(mapData, player.x, player.y, x, y)) return false;
             foreach (var bomb in bombs)
                 if (BombCollision.BlocksStep(bomb.Col, bomb.Row, player.x, player.y, x, y)) return false;
             return true;
@@ -230,11 +243,6 @@ namespace GameServer
         public static (float x, float y) GridToWorld(int col, int row)
         {
             return (col - 8.5f, row - 7.5f);
-        }
-
-        private bool CanMoveTo(float targetX, float targetY)
-        {
-            return TerrainCollision.CanStandAt(mapData, targetX, targetY);
         }
     }
 }

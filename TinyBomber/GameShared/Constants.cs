@@ -73,7 +73,10 @@ namespace GameShared
         udpProbeV2 = 17,
         udpPlayerPosition = 18,
         heartbeatPing = 19,
-        udpHealthEcho = 20
+        udpHealthEcho = 20,
+        playerPositionV4 = 21,
+        udpPlayerPositionV4 = 22,
+        playerCorrectionV4 = 23
     }
 
     public enum ClientPackets
@@ -91,7 +94,9 @@ namespace GameShared
         udpConfirm = 11,
         udpPlayerMovement = 12,
         heartbeatPong = 13,
-        udpHealthProbe = 14
+        udpHealthProbe = 14,
+        playerMovementV4 = 15,
+        udpPlayerMovementV4 = 16
     }
 
     public enum RoomError

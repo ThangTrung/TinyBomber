@@ -132,7 +132,7 @@ public sealed class MatchLifecycleTests
         var fourth = new Client(4) { Username = "Fourth", UdpConfirmed = true };
         Assert.True(otherRoom.TryAddMember(third));
         Assert.True(otherRoom.TryAddMember(fourth));
-        otherRoom.StartRound(third, otherRoom.Id, 0);
+        otherRoom.StartRound(third, otherRoom.Id, 0, now: 0);
 
         Player otherPlayer = third.player!;
         Player otherBombOwner = fourth.player!;
@@ -157,8 +157,8 @@ public sealed class MatchLifecycleTests
         Assert.Same(otherBombOwner, fourth.player);
         Assert.Equal(otherMap.Cast<int>(), otherRoom.mapData.Cast<int>());
 
-        var (x, y) = GameLogic.GridToWorld(2, 13);
-        ServerHandle.PlayerMovement(third, otherRoom.Id, otherRoundId, x, y);
+        var (x, y) = (otherPlayer.x + 0.0625f, otherPlayer.y);
+        ServerHandle.PlayerMovement(third, otherRoom.Id, otherRoundId, x, y, now: 0);
         Assert.Equal((x, y), (otherPlayer.x, otherPlayer.y));
 
         otherRoom.UpdateRound(long.MaxValue);

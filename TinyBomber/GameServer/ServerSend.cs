@@ -18,7 +18,7 @@ namespace GameServer
 
         internal static void ServerHello(Client.TCP connection, int slotId)
         {
-            using var packet = ProtocolV3.CreateServerHello(slotId);
+            using var packet = ProtocolV4.CreateServerHello(slotId);
             connection.SendData(packet);
         }
 
@@ -116,27 +116,30 @@ namespace GameServer
 
         internal static void BroadcastPlayerPosition(GameLogic room, Player player)
         {
+            bool ordered = player.LastAcceptedMoveSeq > 0;
             Packet? tcpPosition = null;
             try
             {
                 foreach (var slot in room.Members)
                 {
                     if (slot.id == player.id || slot.player == null) continue;
+                    // Movement formats are activated together. Do not send across versions.
+                    if (slot.tcp.UsesMovementOrdering != ordered) continue;
 
                     if (slot.UdpConfirmed && slot.tcp.SessionToken is byte[] token && slot.udp.endPoint != null)
                     {
-                        using var position = ProtocolV2.CreateUdpPlayerPosition(token,
-                            room.Id, room.RoundId, player.id, player.x, player.y);
+                        using var position = ordered
+                            ? ProtocolV4.CreateUdpPlayerPosition(token, room.Id, room.RoundId, player.id,
+                                player.LastAcceptedMoveSeq, player.x, player.y)
+                            : ProtocolV2.CreateUdpPlayerPosition(token, room.Id, room.RoundId, player.id, player.x, player.y);
                         slot.udp.SendData(position);
                     }
                     else
                     {
-                        if (tcpPosition == null)
-                        {
-                            tcpPosition = new Packet((int)ServerPackets.playerPosition);
-                            WritePosition(tcpPosition, room, player);
-                            Prepare(tcpPosition);
-                        }
+                        tcpPosition ??= ordered
+                            ? ProtocolV4.CreateTcpPlayerPosition(room.Id, room.RoundId, player.id,
+                                player.LastAcceptedMoveSeq, player.x, player.y)
+                            : CreateLegacyPosition(room, player);
                         slot.tcp.SendData(tcpPosition);
                     }
                 }
@@ -197,17 +200,57 @@ namespace GameServer
             SendTCPData(recipient.tcp, packet);
         }
 
+        internal static void AcknowledgeMovement(GameLogic room, Client owner, Player player)
+        {
+            using var packet = ProtocolV4.CreateTcpPlayerPosition(room.Id, room.RoundId, player.id,
+                player.LastAcceptedMoveSeq, player.x, player.y);
+            owner.tcp.SendData(packet);
+        }
+
+        internal static void RefreshFinalPeerPosition(GameLogic room, Player player)
+        {
+            Packet? position = null;
+            try
+            {
+                foreach (var slot in room.Members)
+                {
+                    // TCP-only recipients already received this sequence on the reliable path.
+                    if (slot.id == player.id || slot.player == null || !slot.tcp.UsesMovementOrdering ||
+                        !slot.IsReady || slot.tcp.SessionToken == null || slot.udp.endPoint == null)
+                        continue;
+
+                    position ??= ProtocolV4.CreateTcpPlayerPosition(room.Id, room.RoundId, player.id,
+                        player.LastAcceptedMoveSeq, player.x, player.y);
+                    slot.tcp.SendData(position);
+                }
+            }
+            finally
+            {
+                position?.Dispose();
+            }
+        }
+
         internal static void SnapPlayerPosition(GameLogic room, Client recipient, Player player)
         {
-            using var packet = new Packet((int)ServerPackets.playerPosition);
-            WritePosition(packet, room, player);
-            SendTCPData(recipient.tcp, packet);
+            using var packet = recipient.tcp.UsesMovementOrdering
+                ? ProtocolV4.CreateTcpPlayerCorrection(room.Id, room.RoundId, player.id,
+                    player.LastProcessedMoveSeq, player.LastAcceptedMoveSeq, player.x, player.y)
+                : CreateLegacyPosition(room, player);
+            recipient.tcp.SendData(packet);
         }
 
         private static void WriteRound(Packet packet, GameLogic room)
         {
             packet.Write(room.Id);
             packet.Write(room.RoundId);
+        }
+
+        private static Packet CreateLegacyPosition(GameLogic room, Player player)
+        {
+            var packet = new Packet((int)ServerPackets.playerPosition);
+            WritePosition(packet, room, player);
+            Prepare(packet);
+            return packet;
         }
 
         private static void WritePosition(Packet packet, GameLogic room, Player player)

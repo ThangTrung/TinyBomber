@@ -20,8 +20,12 @@ public class GameManager : MonoBehaviour
 
     private readonly List<GameObject> blasts = new List<GameObject>();
     private readonly HashSet<int> pendingSpawns = new HashSet<int>();
+    private readonly MovementOrdering movementOrdering = new MovementOrdering();
+    [SerializeField, Min(0.05f)] private float movementRecoverySeconds = 0.25f;
+    private double MovementRecoveryDelay => Mathf.Max(0.05f, movementRecoverySeconds);
     private Sprite blastSprite;
     private int[,] terrain;
+    private MovementResolver movementResolver;
     private MatchPhase phase;
     private int displayedRoundId;
     private int readyCount;
@@ -145,11 +149,21 @@ public class GameManager : MonoBehaviour
     {
         if (roundId < displayedRoundId || roundId < ActiveRoundId) return;
 
+        bool wasPlaying = IsPlaying;
         displayedRoundId = roundId;
         phase = matchPhase;
         readyCount = count;
         winnerId = winner;
-        if (phase == MatchPhase.Finished) ClearBombs();
+        if (phase == MatchPhase.Finished)
+        {
+            movementOrdering.Reset();
+            ClearBombs();
+        }
+        else if (!wasPlaying && IsPlaying)
+        {
+            foreach (var player in players)
+                ApplyStoredPeerPosition(player.Key, player.Value);
+        }
         RefreshMatchUi();
     }
 
@@ -186,23 +200,7 @@ public class GameManager : MonoBehaviour
 
     public Vector2 ResolveMovement(Vector2 start, Vector2 step)
     {
-        if (terrain == null || step == Vector2.zero) return start;
-        Vector2 target = start + step;
-        if (CanStep(start, target)) return target;
-        if (step.x == 0f || step.y == 0f) return start;
-
-        Vector2 alongX = new Vector2(target.x, start.y);
-        Vector2 alongY = new Vector2(start.x, target.y);
-        bool preferX = Mathf.Abs(step.x) >= Mathf.Abs(step.y);
-        Vector2 first = preferX ? alongX : alongY;
-        Vector2 second = preferX ? alongY : alongX;
-        if (CanStep(start, first)) return first;
-        return CanStep(start, second) ? second : start;
-    }
-
-    private bool CanStep(Vector2 start, Vector2 target)
-    {
-        return TerrainCollision.CanStandAt(terrain, target.x, target.y) && !BombBlocksStep(start, target);
+        return movementResolver.Resolve(terrain, start, step);
     }
 
     public bool BombBlocksStep(Vector2 start, Vector2 target)
@@ -270,6 +268,7 @@ public class GameManager : MonoBehaviour
         }
 
         instance = this;
+        movementResolver = new MovementResolver(BombBlocksStep);
         if (matchButton) matchButton.onClick.AddListener(RequestStartOrReplay);
         RefreshMatchUi();
     }
@@ -299,10 +298,17 @@ public class GameManager : MonoBehaviour
         }
 
         players.Add(_id, _player);
+        if (IsPlaying && _id != Client.instance.myId) ApplyStoredPeerPosition(_id, _player);
     }
 
     public static void RemovePlayer(int id)
     {
+        if (instance)
+        {
+            instance.pendingSpawns.Remove(id);
+            instance.movementOrdering.RemovePeer(id);
+            if (Client.instance && id == Client.instance.myId) instance.movementOrdering.ResetLocal();
+        }
         if (!players.TryGetValue(id, out var player)) return;
         players.Remove(id);
         if (player != null)
@@ -325,6 +331,8 @@ public class GameManager : MonoBehaviour
 
     private void ClearRound()
     {
+        movementOrdering.Reset();
+        movementResolver?.Reset();
         ActiveRoundId = 0;
         pendingSpawns.Clear();
         terrain = null;
@@ -343,6 +351,58 @@ public class GameManager : MonoBehaviour
             if (block) Destroy(block);
         softBlocks.Clear();
     }
+
+    internal bool TrySendOrderedMovement(Vector2 position) =>
+        Client.instance && Client.instance.tcp != null && CanControl &&
+        movementOrdering.TrySend((Client.instance.tcp, RoomId, ActiveRoundId), position,
+            Time.realtimeSinceStartupAsDouble, MovementRecoveryDelay,
+            ClientSend.TrySendUdpMovement, ClientSend.TrySendTcpMovement);
+
+    internal void ApplyOrderedPeerPosition(int roomId, int roundId, int id, long sequence, Vector2 target, bool reliable)
+    {
+        if (roomId <= 0 || roomId != RoomId || roundId <= 0 || roundId != ActiveRoundId ||
+            displayedRoundId > roundId || (displayedRoundId == roundId && phase == MatchPhase.Finished) ||
+            id == Client.instance.myId || !IsFinite(target)) return;
+
+        // Keep the newest snapshot only for a known member of this round. UDP can overtake spawn.
+        if (!players.TryGetValue(id, out var player) && !pendingSpawns.Contains(id)) return;
+        if (!movementOrdering.TryRecordPeer(id, sequence, target, reliable)) return;
+
+        if (IsPlaying && player) ApplyStoredPeerPosition(id, player);
+    }
+
+    private void ApplyStoredPeerPosition(int id, GameObject player)
+    {
+        if (movementOrdering.TryGetPeerTarget(id, out var target, out var reliable) &&
+            player.TryGetComponent(out RemotePlayerController remote))
+            remote.UpdatePosition(target, reliable);
+    }
+
+    internal void QueueOwnerMovementState(int roomId, int roundId, int id, long processed, long accepted,
+        Vector2 position)
+    {
+        if (!IsPlaying || roomId <= 0 || roomId != RoomId || roundId != ActiveRoundId ||
+            id != Client.instance.myId || !IsFinite(position) ||
+            !players.TryGetValue(id, out var player) || !player)
+            return;
+
+        movementOrdering.QueueOwnerState(processed, accepted, position);
+    }
+
+    // ThreadManager drains TCP callbacks in Update. Apply only the latest owner result at frame end.
+    private void LateUpdate()
+    {
+        if (!IsPlaying || !Client.instance || !players.TryGetValue(Client.instance.myId, out var player) || !player) return;
+
+        if (movementOrdering.TryTakeOwnerPosition(out var position) &&
+            !((Vector2)player.transform.position).Equals(position)) player.transform.position = position;
+        if (Client.instance.tcp != null && CanControl)
+            movementOrdering.TryRetry((Client.instance.tcp, RoomId, ActiveRoundId), Time.realtimeSinceStartupAsDouble,
+                MovementRecoveryDelay, ClientSend.TrySendTcpMovement);
+    }
+
+    private static bool IsFinite(Vector2 position) => !float.IsNaN(position.x) && !float.IsInfinity(position.x) &&
+        !float.IsNaN(position.y) && !float.IsInfinity(position.y);
 
     private void ClearBombs()
     {

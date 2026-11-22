@@ -17,11 +17,14 @@ namespace GameServer
 
         // Lobby membership and room lifecycles are owned by the update thread.
         private static readonly Dictionary<int, GameLogic> rooms = new();
+        private static readonly int finalPositionIdleMs =
+            int.TryParse(Environment.GetEnvironmentVariable("TINYBOMBER_FINAL_POSITION_IDLE_MS"), out int delay) &&
+            delay is >= 50 and <= 5000 ? delay : GameLogic.DefaultFinalPositionIdleMs;
         private static int lastRoomId;
 
         internal static GameLogic CreateRoom()
         {
-            var room = new GameLogic(checked(++lastRoomId));
+            var room = new GameLogic(checked(++lastRoomId), finalPositionIdleMs);
             rooms.Add(room.Id, room);
             return room;
         }
@@ -150,10 +153,16 @@ namespace GameServer
                                 ServerSend.UdpProbe(slot);
                         });
                         break;
-                    case ClientPackets.udpPlayerMovement:
+                    case ClientPackets.udpPlayerMovement when !connection.UsesMovementOrdering:
                         var move = ProtocolV2.ReadUdpPlayerMovement(packet);
                         ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
                             endpoint, move.Token, move.RoomId, move.RoundId, move.X, move.Y));
+                        break;
+                    case ClientPackets.udpPlayerMovementV4 when connection.UsesMovementOrdering:
+                        var orderedMove = ProtocolV4.ReadUdpPlayerMovement(packet);
+                        ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
+                            endpoint, orderedMove.Token, orderedMove.RoomId, orderedMove.RoundId,
+                            orderedMove.X, orderedMove.Y, moveSeq: orderedMove.MoveSeq));
                         break;
                     case ClientPackets.udpHealthProbe:
                         var probe = ProtocolV3.ReadUdpHealthProbe(packet);

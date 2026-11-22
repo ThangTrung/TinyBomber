@@ -13,7 +13,8 @@ public sealed class ProtocolV2SessionTests
     [Theory]
     [InlineData(1, 42)]
     [InlineData(2, 42)]
-    [InlineData(3, 43)]
+    [InlineData(ProtocolV3.Version, 42)]
+    [InlineData(ProtocolV4.Version, 43)]
     public void ClientHelloWithWrongVersionOrSlotReleasesConnectionBeforeGrant(int version, int slotId)
     {
         var slot = new Client(42);
@@ -48,9 +49,9 @@ public sealed class ProtocolV2SessionTests
 
         Assert.False(ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp, endpoint, new byte[16], 100));
         Assert.Null(slot.udp.endPoint);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV3.Version, slot.id, "Player", 100);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", 100);
         byte[] token = Assert.IsType<byte[]>(slot.tcp.SessionToken);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV3.Version, slot.id, "Repeated", 101);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Repeated", 101);
         Assert.Same(token, slot.tcp.SessionToken);
         Assert.Equal("Player", slot.Username);
 
@@ -69,7 +70,7 @@ public sealed class ProtocolV2SessionTests
         var slot = new Client(1);
         var endpoint = new IPEndPoint(IPAddress.Loopback, 12345);
         slot.tcp.StartHandshake(100);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV3.Version, slot.id, "Player", 100);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", 100);
         byte[] token = slot.tcp.SessionToken!;
         ServerHandle.ConfirmUdp(slot, slot.tcp, token, new byte[16], 101);
         Assert.False(slot.IsReady);
@@ -109,7 +110,7 @@ public sealed class ProtocolV2SessionTests
             Server.Disconnect(slot.id, first);
             var next = slot.tcp;
             Assert.NotSame(first, next);
-            ServerHandle.ClientHello(slot, next, ProtocolV3.Version, slot.id, "Replacement", 100);
+            ServerHandle.ClientHello(slot, next, ProtocolV4.Version, slot.id, "Replacement", 100);
             byte[] token = next.SessionToken!;
             Assert.True(ServerHandle.RegisterUdp(slot, next, slot.udp,
                 new IPEndPoint(IPAddress.Loopback, 12345), token, 100));
@@ -134,7 +135,7 @@ public sealed class ProtocolV2SessionTests
     }
 
     [Fact]
-    public async Task BroadcastFallbackKeepsLegacyTcpPositionLayout()
+    public async Task BroadcastFallbackCarriesV4PeerPositionAndAcceptedSequence()
     {
         var mover = new Client(1) { Username = "Mover", UdpConfirmed = true };
         var recipient = new Client(2) { Username = "Recipient", UdpConfirmed = true };
@@ -159,14 +160,16 @@ public sealed class ProtocolV2SessionTests
             try
             {
                 using Packet hello = await ReadFrameAsync(peer.GetStream(), token);
-                Assert.Equal(recipient.id, ProtocolV2.ReadServerHello(hello).SlotId);
+                Assert.Equal((ProtocolV4.Version, recipient.id), ProtocolV2.ReadServerHello(hello));
 
+                recipient.tcp.AcceptedProtocolVersion = ProtocolV4.Version;
+                Assert.True(player.TryMarkMovementProcessed(11));
+                player.AcceptMovement(player.x, player.y, 11);
                 ServerSend.BroadcastPlayerPosition(room, player);
 
                 using Packet position = await ReadFrameAsync(peer.GetStream(), token);
-                Assert.Equal((int)ServerPackets.playerPosition, position.ReadInt());
-                Assert.Equal((room.Id, room.RoundId, mover.id, player.x, player.y),
-                    (position.ReadInt(), position.ReadInt(), position.ReadInt(), position.ReadFloat(), position.ReadFloat()));
+                Assert.Equal((room.Id, room.RoundId, mover.id, 11L, player.x, player.y),
+                    ProtocolV4.ReadTcpPlayerPosition(position));
                 Assert.Equal(0, position.UnreadLength());
             }
             finally
@@ -204,7 +207,7 @@ public sealed class ProtocolV2SessionTests
             byte[] firstToken = ProtocolV2.NewSessionToken();
             byte[] firstNonce = ProtocolV2.NewProbeNonce();
             using var staleProbe = ProtocolV2.CreateUdpProbe(firstToken, firstNonce);
-            using var stalePosition = ProtocolV2.CreateUdpPlayerPosition(firstToken, room, round, actor, oldX, y);
+            using var stalePosition = ProtocolV4.CreateUdpPlayerPosition(firstToken, room, round, actor, long.MaxValue, oldX, y);
 
             await using (IAsyncDisposable first = NewLoadClient(clientAssembly, token))
             {
@@ -256,6 +259,8 @@ public sealed class ProtocolV2SessionTests
 
             await SendServerPacketAsync(stream, ServerPackets.roomChanged, new[] { room }, token);
             await SendServerPacketAsync(stream, ServerPackets.roundBegin, new[] { room, round, 2, slot, actor }, token);
+            await SendSpawnAsync(stream, room, round, slot, 0.5f, y, token);
+            await SendSpawnAsync(stream, room, round, actor, 1f, y, token);
             await SendServerPacketAsync(stream, ServerPackets.matchState,
                 new[] { room, round, (int)MatchPhase.Playing, 2, 0 }, token);
             while ((MatchPhase)ReadProperty(Invoke(replacement, "ReadState")!, "Phase") != MatchPhase.Playing)
@@ -276,7 +281,7 @@ public sealed class ProtocolV2SessionTests
             Invoke(replacement, "HandleUdpPacket", stalePosition.ToArray());
             Assert.Equal(0, ReadObserved(trace));
             await udp.SendAsync(stalePosition.ToArray(), nextEndpoint, token);
-            using var currentPosition = ProtocolV2.CreateUdpPlayerPosition(nextToken, room, round, actor, newX, y);
+            using var currentPosition = ProtocolV4.CreateUdpPlayerPosition(nextToken, room, round, actor, 1, newX, y);
             await udp.SendAsync(currentPosition.ToArray(), nextEndpoint, token);
             while (ReadObserved(trace) == 0)
                 await Task.Delay(10, token);
@@ -292,10 +297,11 @@ public sealed class ProtocolV2SessionTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
+    [InlineData(ProtocolV2.Version, false)]
+    [InlineData(ProtocolV3.Version, false)]
+    [InlineData(ProtocolV4.Version, true)]
     [Trait("Category", "LoadClientIntegration")]
-    public async Task V3LoadClientClosesBeforeClientHelloOnV2OrMalformedServerHello(bool malformed)
+    public async Task V4LoadClientClosesBeforeClientHelloOnOldOrMalformedServerHello(int version, bool malformed)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
         CancellationToken token = timeout.Token;
@@ -307,10 +313,10 @@ public sealed class ProtocolV2SessionTests
         using TcpClient peer = await listener.AcceptTcpClientAsync(token);
         NetworkStream stream = peer.GetStream();
         if (malformed)
-            await SendServerPacketAsync(stream, ServerPackets.serverHello, [3], token);
+            await SendServerPacketAsync(stream, ServerPackets.serverHello, [version], token);
         else
         {
-            using var hello = ProtocolV2.CreateServerHello(1);
+            using var hello = ProtocolV2.CreateServerHello(1, version);
             await stream.WriteAsync(hello.ToArray(), token);
         }
 
@@ -320,7 +326,7 @@ public sealed class ProtocolV2SessionTests
         var errors = ReadField<object>(client, "errors");
         string detail = Assert.Single((string[])Invoke(errors, "Details")!);
         Assert.StartsWith(malformed ? "Receive:" : "Connection:", detail);
-        Assert.Contains(malformed ? "Invalid v2 packet payload length" : "protocol v2. Client yêu cầu v3", detail);
+        Assert.Contains(malformed ? "Invalid v2 packet payload length" : $"protocol v{version}. Client yêu cầu v4", detail);
     }
 
     [Fact]
@@ -481,6 +487,8 @@ public sealed class ProtocolV2SessionTests
                 peers.Add(endpoint, (client, tcp, slot, session));
                 await SendServerPacketAsync(stream, ServerPackets.roomChanged, [room], token);
                 await SendServerPacketAsync(stream, ServerPackets.roundBegin, [room, round, 3, 1, 2, 3], token);
+                for (int actorSlot = 1; actorSlot <= 3; actorSlot++)
+                    await SendSpawnAsync(stream, room, round, actorSlot, 1f, 1f, token);
                 await SendServerPacketAsync(stream, ServerPackets.matchState, [room, round, (int)MatchPhase.Playing, 3, 0], token);
             }
 
@@ -551,16 +559,18 @@ public sealed class ProtocolV2SessionTests
             Invoke(trace, "Prepare", origin, target, true);
             Invoke(trace, "MarkSent", target, 0d);
             Invoke(observer.Value.Client, "Watch", sender.Value.Slot, trace);
-            using var movement = ProtocolV2.CreateUdpPlayerMovement(sender.Value.Slot, sender.Value.Session, room, round, x, y);
+            using var movement = ProtocolV4.CreateUdpPlayerMovement(sender.Value.Slot, sender.Value.Session,
+                room, round, 1, x, y);
             await (Task)Invoke(sender.Value.Client, "SendUdpAsync", movement.ToArray(), token)!;
             var moved = await udp.ReceiveAsync(token);
             Assert.Equal(sender.Key, moved.RemoteEndPoint);
             using Packet frame = ProtocolV2.OpenClientDatagram(moved.Buffer, out int actor);
-            var move = ProtocolV2.ReadUdpPlayerMovement(frame);
+            var move = ProtocolV4.ReadUdpPlayerMovement(frame);
             Assert.Equal(sender.Value.Slot, actor);
             Assert.Equal(sender.Value.Session, move.Token);
-            Assert.Equal((room, round, x, y), (move.RoomId, move.RoundId, move.X, move.Y));
-            using var position = ProtocolV2.CreateUdpPlayerPosition(observer.Value.Session, room, round, actor, move.X, move.Y);
+            Assert.Equal((room, round, 1L, x, y), (move.RoomId, move.RoundId, move.MoveSeq, move.X, move.Y));
+            using var position = ProtocolV4.CreateUdpPlayerPosition(observer.Value.Session,
+                room, round, actor, move.MoveSeq, move.X, move.Y);
             await udp.SendAsync(position.ToArray(), observer.Key, token);
             while (ReadObserved(trace) == 0) await Task.Delay(5, token);
             Assert.Equal(1, ReadObserved(trace));
@@ -705,11 +715,11 @@ public sealed class ProtocolV2SessionTests
     private static async Task<IPEndPoint> GrantLoadClientAsync(NetworkStream stream, UdpClient udp,
         int slot, byte[] sessionToken, CancellationToken token)
     {
-        using var hello = ProtocolV3.CreateServerHello(slot);
+        using var hello = ProtocolV4.CreateServerHello(slot);
         await stream.WriteAsync(hello.ToArray(), token);
         using Packet clientHello = await ReadFrameAsync(stream, token);
         var advertised = ProtocolV2.ReadClientHello(clientHello);
-        Assert.Equal((ProtocolV3.Version, slot), (advertised.Version, advertised.SlotId));
+        Assert.Equal((ProtocolV4.Version, slot), (advertised.Version, advertised.SlotId));
         using var grant = ProtocolV2.CreateSessionGranted(sessionToken);
         await stream.WriteAsync(grant.ToArray(), token);
         return await ReadRegistrationAsync(udp, slot, sessionToken, token);
@@ -748,6 +758,10 @@ public sealed class ProtocolV2SessionTests
         packet.EncryptPayload();
         await stream.WriteAsync(packet.ToArray(), token);
     }
+
+    private static Task SendSpawnAsync(NetworkStream stream, int room, int round, int player, float x, float y,
+        CancellationToken token) => SendServerPacketAsync(stream, ServerPackets.spawnPlayer,
+            [room, round, player, BitConverter.SingleToInt32Bits(x), BitConverter.SingleToInt32Bits(y)], token);
 
     private static byte[] Different(byte[] bytes)
     {
