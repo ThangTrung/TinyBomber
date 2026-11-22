@@ -2,7 +2,10 @@
 
 public class RemotePlayerController : MonoBehaviour
 {
-    private Vector2 targetPosition;
+    private const double AnimationHoldSeconds = 0.10;
+
+    private Vector2? targetPosition;
+    private double lastTargetChangeTime = double.NegativeInfinity;
     private Animator anim;
     private SpriteRenderer sr;
 
@@ -10,32 +13,35 @@ public class RemotePlayerController : MonoBehaviour
     {
         anim = GetComponent<Animator>();
         sr = GetComponent<SpriteRenderer>();
-        targetPosition = transform.position;
+        targetPosition ??= (Vector2)transform.position;
     }
+
     public void UpdatePosition(Vector2 newPos)
     {
+        targetPosition ??= (Vector2)transform.position;
+        if (newPos.Equals(targetPosition.Value)) return;
+
         targetPosition = newPos;
+        lastTargetChangeTime = Time.unscaledTimeAsDouble;
     }
 
     private void Update()
     {
-        float distance = Vector2.Distance(transform.position, targetPosition);
+        Vector2 target = targetPosition.Value;
+        bool chasingTarget = Vector2.Distance(transform.position, target) > 0.05f;
 
-        if (distance > 0.05f)
+        if (chasingTarget)
         {
-            float dirX = targetPosition.x - transform.position.x;
+            float dirX = target.x - transform.position.x;
             if (Mathf.Abs(dirX) > 0.01f)
             {
                 sr.flipX = dirX < 0;
             }
 
-            transform.position = Vector2.MoveTowards(transform.position, targetPosition, 15f * Time.deltaTime);
+            transform.position = Vector2.MoveTowards(transform.position, target, 15f * Time.deltaTime);
+        }
 
-            anim.SetBool("IsMoving", true);
-        }
-        else
-        {
-            anim.SetBool("IsMoving", false);
-        }
+        bool hasRecentMovement = Time.unscaledTimeAsDouble - lastTargetChangeTime < AnimationHoldSeconds;
+        anim.SetBool("IsMoving", chasingTarget || hasRecentMovement);
     }
 }
