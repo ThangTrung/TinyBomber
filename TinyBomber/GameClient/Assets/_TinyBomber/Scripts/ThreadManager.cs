@@ -6,7 +6,6 @@ public class ThreadManager : MonoBehaviour
 {
     private static readonly List<Action> executeOnMainThread = new List<Action>();
     private static readonly List<Action> executeCopiedOnMainThread = new List<Action>();
-    private static bool actionToExecute = false;
 
     private void Update()
     {
@@ -20,26 +19,29 @@ public class ThreadManager : MonoBehaviour
         lock (executeOnMainThread)
         {
             executeOnMainThread.Add(_action);
-            actionToExecute = true;
         }
     }
 
     public static void UpdateMain()
     {
-        if (actionToExecute)
+        lock (executeOnMainThread)
         {
-            executeCopiedOnMainThread.Clear();
-            lock (executeOnMainThread)
-            {
-                executeCopiedOnMainThread.AddRange(executeOnMainThread);
-                executeOnMainThread.Clear();
-                actionToExecute = false;
-            }
+            if (executeOnMainThread.Count == 0) return;
+            executeCopiedOnMainThread.AddRange(executeOnMainThread);
+            executeOnMainThread.Clear();
+        }
 
-            for (int i = 0; i < executeCopiedOnMainThread.Count; i++)
+        for (int i = 0; i < executeCopiedOnMainThread.Count; i++)
+        {
+            try
             {
                 executeCopiedOnMainThread[i]();
             }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex);
+            }
         }
+        executeCopiedOnMainThread.Clear();
     }
 }

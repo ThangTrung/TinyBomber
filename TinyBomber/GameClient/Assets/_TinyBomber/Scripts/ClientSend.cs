@@ -10,13 +10,6 @@ public class ClientSend : MonoBehaviour
         Client.instance.tcp.SendData(_packet);
     }
 
-    private static void SendUDPData(Packet _packet)
-    {
-        _packet.WriteLength();
-        _packet.EncryptPayload();
-        Client.instance.udp.SendData(_packet);
-    }
-
     public static void PlaceBomb()
     {
         using (var packet = new Packet((int)ClientPackets.placeBomb))
@@ -27,13 +20,10 @@ public class ClientSend : MonoBehaviour
         }
     }
 
-    public static void ConfirmUdp(int challenge)
+    public static void ConfirmUdp(byte[] token, byte[] nonce)
     {
-        using (var packet = new Packet((int)ClientPackets.udpReady))
-        {
-            packet.Write(challenge);
-            SendTCPData(packet);
-        }
+        using var packet = ProtocolV2.CreateUdpConfirm(token, nonce);
+        Client.instance.tcp.SendData(packet);
     }
 
     public static void RequestStart(int roomId, int roundId)
@@ -66,25 +56,20 @@ public class ClientSend : MonoBehaviour
         SendTCPData(packet);
     }
 
-    public static void WelcomeReceived()
+    public static void SendClientHello()
     {
-        using (Packet _packet = new Packet((int)ClientPackets.welcomeReceived))
-        {
-            _packet.Write(Client.instance.myId);
-            _packet.Write("Player_" + Client.instance.myId);
-            SendTCPData(_packet);
-        }
+        int slotId = Client.instance.myId;
+        using var packet = ProtocolV3.CreateClientHello(slotId, "Player_" + slotId);
+        Client.instance.tcp.SendData(packet);
     }
 
     public static void SendPlayerMovement(Vector2 _position)
     {
-        using (Packet _packet = new Packet((int)ClientPackets.playerMovement))
-        {
-            _packet.Write(GameManager.instance.RoomId);
-            _packet.Write(GameManager.instance.ActiveRoundId);
-            _packet.Write(_position.x);
-            _packet.Write(_position.y);
-            SendUDPData(_packet);
-        }
+        Client client = Client.instance;
+        if (client == null || client.IsConnecting || client.tcp?.SessionToken == null || client.udp == null) return;
+
+        using var packet = ProtocolV2.CreateUdpPlayerMovement(client.myId, client.tcp.SessionToken,
+            GameManager.instance.RoomId, GameManager.instance.ActiveRoundId, _position.x, _position.y);
+        client.udp.SendData(packet);
     }
 }

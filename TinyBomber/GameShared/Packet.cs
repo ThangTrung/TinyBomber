@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using System.Security.Cryptography;
 
@@ -7,6 +8,7 @@ namespace GameShared
 {
     public class Packet : IDisposable
     {
+        private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, true);
         private List<byte> buffer;
         private byte[] readableBuffer = null!;
         private int readPos;
@@ -86,8 +88,9 @@ namespace GameShared
         public void Write(bool _value) { buffer.AddRange(BitConverter.GetBytes(_value)); }
         public void Write(string _value)
         {
-            Write(_value.Length);
-            buffer.AddRange(Encoding.UTF8.GetBytes(_value));
+            byte[] bytes = StrictUtf8.GetBytes(_value);
+            Write(bytes.Length);
+            buffer.AddRange(bytes);
         }
 
         public byte ReadByte(bool _moveReadPos = true)
@@ -147,16 +150,23 @@ namespace GameShared
 
         public string ReadString(bool _moveReadPos = true)
         {
+            if (readableBuffer == null || readPos < 0 || readPos > readableBuffer.Length - sizeof(int))
+                throw new InvalidDataException("Incomplete string length prefix.");
+
+            int byteLength = ReadInt(false);
+            int payloadStart = readPos + sizeof(int);
+            if (byteLength < 0 || byteLength > readableBuffer.Length - payloadStart)
+                throw new InvalidDataException("Invalid string byte length.");
+
             try
             {
-                int _length = ReadInt(); 
-                string _value = Encoding.UTF8.GetString(readableBuffer, readPos, _length); 
-                if (_moveReadPos) { readPos += _length; }
-                return _value;
+                string value = StrictUtf8.GetString(readableBuffer, payloadStart, byteLength);
+                if (_moveReadPos) readPos = payloadStart + byteLength;
+                return value;
             }
-            catch
+            catch (DecoderFallbackException ex)
             {
-                throw new Exception("Could not read value of type 'string'!");
+                throw new InvalidDataException("Invalid UTF-8 string payload.", ex);
             }
         }
 

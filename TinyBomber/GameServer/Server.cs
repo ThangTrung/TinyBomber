@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -40,106 +42,168 @@ namespace GameServer
         private static volatile bool isRunning = false;
         private static volatile bool stopping;
         private static readonly object slotLock = new object();
+        private static ServerMetrics metrics = null!;
+        private static ProcessMetricsSampler processMetrics = null!;
+        private static MetricsExporter exporter = null!;
+        internal static MetricsExporterStatus? ExporterStatus => exporter?.ReadStatus();
+        internal static MetricsExporterStopResult? LastExporterStopResult { get; private set; }
+        internal static ServerMetricsSnapshot? LatestMetrics => metrics?.Latest;
+        internal static string? MetricsCaptureError => metrics?.CaptureError;
+        // One collector for the server process, including late socket completions.
+        internal static NetworkMetrics Network { get; } = new();
 
-        public static void Start(int maxConnections, int _port)
+        public static void Start(int maxConnections, int port) =>
+            Start(maxConnections, IPAddress.Any, port, Constants.UDP_PORT);
+
+        internal static (int TcpPort, int UdpPort) Start(int maxConnections, IPAddress address, int tcpPort, int udpPort)
         {
             MaxConnections = maxConnections;
-            Port = _port;
 
             Console.WriteLine("Dang khoi dong may chu Tiny Bomber...");
             ThreadManager.Initialize();
             InitializeServerData();
 
-            tcpListener = new TcpListener(IPAddress.Any, Port);
+            tcpListener = new TcpListener(address, tcpPort);
             tcpListener.Start();
-            tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
+            Port = ((IPEndPoint)tcpListener.LocalEndpoint).Port;
             Console.WriteLine($"[THANH CONG] May chu da mo tren cong {Port}.");
 
             try
             {
-                udpSocket = new UdpClient(Constants.UDP_PORT);
+                udpSocket = new UdpClient(new IPEndPoint(address, udpPort));
                 udpSocket.DontFragment = true;
-                udpSocket.BeginReceive(UDPReceiveCallback, null);
-                Console.WriteLine($"[THANH CONG] UDP socket da mo tren cong {Constants.UDP_PORT}.");
             }
             catch (Exception ex)
             {
+                tcpListener.Stop();
                 Console.WriteLine($"[ERROR] Khong the tao UDP socket: {ex.Message}");
                 throw;
             }
 
+            int boundUdpPort = ((IPEndPoint)udpSocket.Client.LocalEndPoint!).Port;
+            Console.WriteLine($"[THANH CONG] UDP socket da mo tren cong {boundUdpPort}.");
             StartUpdateLoop();
+            tcpListener.BeginAcceptTcpClient(TCPConnectCallback, null);
+            udpSocket.BeginReceive(UDPReceiveCallback, null);
+            return (Port, boundUdpPort);
         }
 
         private static void UDPReceiveCallback(IAsyncResult _result)
         {
+            var endpoint = new IPEndPoint(IPAddress.Any, 0);
+            byte[]? data = null;
             try
             {
-                IPEndPoint _clientEndPoint = new IPEndPoint(IPAddress.Any, 0);
-                byte[] _data = udpSocket.EndReceive(_result, ref _clientEndPoint!);
+                data = udpSocket.EndReceive(_result, ref endpoint!);
+                Network.RecordUdpReceive(data.Length);
+            }
+            catch (ObjectDisposedException) when (!isRunning) { return; }
+            catch (SocketException ex)
+            {
+                if (isRunning) Console.WriteLine($"[UDP Receive Warning] {ex.Message}");
+            }
+
+            if (!isRunning) return;
+            try
+            {
                 udpSocket.BeginReceive(UDPReceiveCallback, null);
+            }
+            catch (ObjectDisposedException) when (!isRunning) { return; }
+            catch (SocketException ex)
+            {
+                if (isRunning) Console.WriteLine($"[UDP Receive Warning] {ex.Message}");
+                return;
+            }
 
-                if (_data.Length < 4)
+            if (data != null) HandleUdpDatagram(data, endpoint);
+        }
+
+        private static void HandleUdpDatagram(byte[] data, IPEndPoint endpoint)
+        {
+            if (data.Length <= sizeof(int)) return;
+            int slotId = BinaryPrimitives.ReadInt32LittleEndian(data);
+            if (slotId < 1 || slotId > MaxConnections) return;
+
+            Client.TCP connection;
+            Client.UDP udp;
+            lock (slotLock)
+            {
+                Client slot = clients[slotId];
+                connection = slot.tcp;
+                if (connection.socket == null) return;
+                udp = slot.udp;
+            }
+            if (udp.endPoint is IPEndPoint bound && !endpoint.Equals(bound)) return;
+
+            try
+            {
+                using Packet packet = ProtocolV2.OpenClientDatagram(data, out _);
+                if (packet.UnreadLength() < sizeof(int)) return;
+                switch ((ClientPackets)packet.ReadInt(false))
                 {
-                    return;
-                }
-
-                int _clientId = BitConverter.ToInt32(_data, 0);
-                if (_clientId < 1 || _clientId > MaxConnections)
-                {
-                    return;
-                }
-
-                Client.UDP udp;
-                lock (slotLock)
-                {
-                    Client slot = clients[_clientId];
-                    if (slot.tcp.socket == null) return;
-                    udp = slot.udp;
-                }
-
-                if (_data.Length == sizeof(int))
-                {
-                    ThreadManager.EnqueueAction(() =>
-                    {
-                        Client slot = clients[_clientId];
-                        if (slot.udp != udp || slot.Username == null || slot.UdpConfirmed) return;
-
-                        if (udp.endPoint == null) udp.Connect(_clientEndPoint);
-                        if (_clientEndPoint.Equals(udp.endPoint)) ServerSend.UdpProbe(slot);
-                    });
-                    return;
-                }
-
-                if (_clientEndPoint.Equals(udp.endPoint))
-                {
-                    byte[] _encryptedPayload = new byte[_data.Length - 4];
-                    Array.Copy(_data, 4, _encryptedPayload, 0, _encryptedPayload.Length);
-                    udp.HandleData(_encryptedPayload);
+                    case ClientPackets.udpRegistration:
+                        byte[] token = ProtocolV2.ReadUdpRegistration(packet);
+                        ThreadManager.EnqueueAction(() =>
+                        {
+                            Client slot = clients[slotId];
+                            if (ServerHandle.RegisterUdp(slot, connection, udp, endpoint, token))
+                                ServerSend.UdpProbe(slot);
+                        });
+                        break;
+                    case ClientPackets.udpPlayerMovement:
+                        var move = ProtocolV2.ReadUdpPlayerMovement(packet);
+                        ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
+                            endpoint, move.Token, move.RoomId, move.RoundId, move.X, move.Y));
+                        break;
+                    case ClientPackets.udpHealthProbe:
+                        var probe = ProtocolV3.ReadUdpHealthProbe(packet);
+                        ThreadManager.EnqueueAction(() => ServerHandle.UdpHealthProbe(clients[slotId], connection, udp,
+                            endpoint, probe.Token, probe.Sequence));
+                        break;
                 }
             }
-            catch (Exception _ex)
+            catch (InvalidDataException)
             {
-                Console.WriteLine($"[UDP Receive Warning] {_ex.Message}");
-                if (isRunning && udpSocket != null)
-                {
-                    try { udpSocket.BeginReceive(UDPReceiveCallback, null); } catch { }
-                }
+                // Receive is already armed. Discard malformed or unauthenticated datagrams.
             }
         }
 
         public static void SendUDPData(IPEndPoint _clientEndPoint, Packet _packet)
         {
+            var sender = udpSocket;
+            var counters = Network;
+            if (_clientEndPoint == null || sender == null) return;
+
             try
             {
-                if (_clientEndPoint != null && udpSocket != null)
+                byte[] data = _packet.ToArray();
+                try
                 {
-                    udpSocket.BeginSend(_packet.ToArray(), _packet.Length(), _clientEndPoint, null, null);
+                    sender.BeginSend(data, data.Length, _clientEndPoint, UdpSendCallback, (sender, counters));
+                }
+                catch
+                {
+                    counters.RecordUdpSendError();
+                    throw;
                 }
             }
             catch (Exception _ex)
             {
                 Console.WriteLine($"[ERROR] Loi gui UDP toi {_clientEndPoint}: {_ex.Message}");
+            }
+        }
+
+        private static void UdpSendCallback(IAsyncResult result)
+        {
+            var (sender, counters) = ((UdpClient, NetworkMetrics))result.AsyncState!;
+            try
+            {
+                counters.RecordUdpSend(sender.EndSend(result));
+            }
+            catch (Exception)
+            {
+                // Completion belongs to this socket operation, independent of client slots.
+                counters.RecordUdpSendError();
             }
         }
 
@@ -151,6 +215,10 @@ namespace GameServer
                 return;
             }
 
+            metrics = new ServerMetrics(Stopwatch.GetTimestamp());
+            processMetrics = new ProcessMetricsSampler();
+            processMetrics.Start();
+            exporter = new MetricsExporter(Path.Combine(AppContext.BaseDirectory, "metrics"));
             isRunning = true;
             updateThread = new Thread(UpdateLoop)
             {
@@ -163,11 +231,84 @@ namespace GameServer
 
         private static void UpdateLoop()
         {
+            var dueConnections = new List<(int Id, Client.TCP Connection)>();
             while (isRunning)
             {
+                long now = Stopwatch.GetTimestamp();
+                metrics.BeginTick(now);
+                UpdateConnections(now, dueConnections);
                 ThreadManager.UpdateMain();
-                long now = System.Diagnostics.Stopwatch.GetTimestamp();
-                foreach (var room in rooms.Values) room.UpdateRound(now);
+                long roomStarted = Stopwatch.GetTimestamp();
+                foreach (var room in rooms.Values) room.UpdateRound(roomStarted);
+                metrics.EndGameplay(ThreadManager.LastBatchMetrics,
+                    Stopwatch.GetElapsedTime(roomStarted).TotalMilliseconds);
+                if (metrics.IsSnapshotDue(Stopwatch.GetTimestamp()))
+                    CaptureMetrics();
+            }
+        }
+
+        private static void UpdateConnections(long now, List<(int Id, Client.TCP Connection)> due)
+        {
+            lock (slotLock)
+            {
+                foreach (var slot in clients.Values)
+                {
+                    Client.TCP connection = slot.tcp;
+                    if (connection.socket != null && (slot.IsReady
+                        ? connection.HeartbeatIsDue(now)
+                        : connection.HandshakeHasExpired(now)))
+                        due.Add((slot.id, connection));
+                }
+            }
+
+            foreach (var (id, connection) in due)
+                UpdateConnection(id, connection, Stopwatch.GetTimestamp());
+            due.Clear();
+        }
+
+        internal static void UpdateConnection(int id, Client.TCP connection, long now)
+        {
+            Client slot = clients[id];
+            if (slot.tcp != connection || connection.socket == null) return;
+            if (!slot.IsReady)
+            {
+                ExpireHandshake(id, connection, now);
+                return;
+            }
+
+            if (connection.HeartbeatHasExpired(now)) Disconnect(id, connection);
+            else connection.SendHeartbeatIfDue(now);
+        }
+
+        // Runs on the update thread. Ignore a timeout for a TCP wrapper that has already been removed.
+        internal static void ExpireHandshake(int id, Client.TCP connection, long now)
+        {
+            Client slot = clients[id];
+            if (slot.tcp == connection && connection.socket != null && !slot.IsReady && connection.HandshakeHasExpired(now))
+                Disconnect(id, connection);
+        }
+
+        private static void CaptureMetrics()
+        {
+            try
+            {
+                long captureStarted = Stopwatch.GetTimestamp();
+                int connected;
+                lock (slotLock)
+                    connected = clients.Values.Count(slot => slot.tcp.socket != null);
+                int ready = clients.Values.Count(slot => slot.IsReady);
+                var roomMetrics = rooms.Values.Select(RoomMetrics.Capture).ToArray();
+                int waiting = ThreadManager.GetWaitingActionCount();
+                var process = processMetrics.Latest;
+                var network = Network.Capture(Stopwatch.GetTimestamp());
+                var snapshot = metrics.Publish(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow,
+                    connected, ready, roomMetrics, waiting, captureStarted, process, network);
+                exporter.TryEnqueue(snapshot);
+            }
+            catch (Exception ex)
+            {
+                // Keep the previous snapshot and expose the failure without doing I/O on this thread.
+                metrics.RecordCaptureFailure(ex);
             }
         }
 
@@ -176,6 +317,7 @@ namespace GameServer
             Console.WriteLine("[INFO] Dang tat may chu...");
             stopping = true;
             isRunning = false;
+            processMetrics?.Dispose();
 
             if (updateThread != null && updateThread.IsAlive)
             {
@@ -184,9 +326,15 @@ namespace GameServer
 
             tcpListener?.Stop();
             udpSocket?.Close();
+            Client.TCP[] connections;
             lock (slotLock)
+                connections = clients.Values.Select(slot => slot.tcp).ToArray();
+            foreach (var connection in connections) connection.Close();
+            if (exporter != null)
             {
-                foreach (var slot in clients.Values) slot.tcp.socket?.Close();
+                LastExporterStopResult = exporter.StopAsync().GetAwaiter().GetResult();
+                try { Console.Error.WriteLine(MetricsExporter.FormatStopResult(LastExporterStopResult)); }
+                catch (Exception) { /* The shutdown result remains available to the host/debugger. */ }
             }
             Console.WriteLine("[INFO] May chu da tat.");
         }
@@ -213,31 +361,36 @@ namespace GameServer
             }
             Console.WriteLine($"[KẾT NỐI MỚI] Co nguoi vua truy cap tu IP: {_client.Client.RemoteEndPoint}");
 
+            Client.TCP? connection = null;
+            int slotId = 0;
             lock (slotLock)
             {
-                if (stopping)
-                {
-                    _client.Close();
-                    return;
-                }
-                for (int i = 1; i <= MaxConnections; i++)
+                for (int i = 1; !stopping && i <= MaxConnections; i++)
                 {
                     if (clients[i].tcp.socket == null)
                     {
-                        try { clients[i].tcp.Connect(_client); }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"TCP setup failed for slot {i}: {ex.Message}");
-                            var failed = clients[i].tcp;
-                            int failedId = i;
-                            ThreadManager.EnqueueAction(() => Disconnect(failedId, failed));
-                        }
-                        return;
+                        connection = clients[i].tcp;
+                        connection.Attach(_client);
+                        slotId = i;
+                        break;
                     }
                 }
             }
-            Console.WriteLine($"[TỪ CHỐI] Server da day, khong the nhan them {_client.Client.RemoteEndPoint}");
-            _client.Close();
+            if (connection == null)
+            {
+                if (!stopping)
+                    Console.WriteLine($"[TỪ CHỐI] Server da day, khong the nhan them {_client.Client.RemoteEndPoint}");
+                _client.Close();
+                return;
+            }
+
+            try { connection.StartReceiving(); }
+            catch (Exception ex)
+            {
+                if (stopping) return;
+                Console.WriteLine($"TCP setup failed for slot {slotId}: {ex.Message}");
+                ThreadManager.EnqueueAction(() => Disconnect(slotId, connection));
+            }
         }
 
         public static void Disconnect(int id, Client.TCP connection)
@@ -246,12 +399,12 @@ namespace GameServer
             lock (slotLock)
             {
                 if (slot.tcp != connection) return;
-                connection.socket?.Close();
                 slot.Username = null;
                 slot.UdpConfirmed = false;
                 slot.tcp = new Client.TCP(id);
                 slot.udp = new Client.UDP(id);
             }
+            connection.Close();
             RemoveFromRoom(slot);
         }
 

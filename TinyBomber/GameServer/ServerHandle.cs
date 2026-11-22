@@ -1,31 +1,84 @@
 ﻿using System;
+using System.Diagnostics;
+using System.Net;
+using System.Security.Cryptography;
 using GameShared;
 
 namespace GameServer
 {
     class ServerHandle
     {
-        public static void WelcomeReceived(Client slot, int _clientIdCheck, string _username)
+        internal static void ClientHello(Client slot, Client.TCP connection, int version, int slotId,
+            string username, long? now = null)
         {
-            if (slot.id != _clientIdCheck)
+            if (slot.tcp != connection || connection.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp())) return;
+
+            if (version != ProtocolV3.Version || slotId != slot.id)
             {
-                Console.WriteLine($"[CẢNH BÁO] ID không khớp! Có dấu hiệu gian lận từ người chơi {_username}");
+                Console.WriteLine(version != ProtocolV3.Version
+                    ? $"Client protocol version {version} does not match {ProtocolV3.Version}."
+                    : $"ClientHello slot does not match connection {slot.id}.");
+                Server.Disconnect(slot.id, connection);
                 return;
             }
 
-            if (slot.Username != null) return;
-            slot.Username = _username;
-            Console.WriteLine($"[ĐĂNG NHẬP] Người chơi ID {slot.id} (Tên: {_username}) đã kết nối.");
+            if (connection.SessionToken != null) return;
+            byte[] sessionToken = ProtocolV2.NewSessionToken();
+            connection.SessionToken = sessionToken;
+            slot.Username = username;
+            ServerSend.SessionGranted(connection, sessionToken);
         }
 
-        internal static void ConfirmUdp(Client slot, int challenge)
+        internal static bool RegisterUdp(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
+            byte[] token, long? now = null)
         {
-            if (slot.Username == null || slot.UdpConfirmed || slot.udp.endPoint == null ||
-                challenge != slot.tcp.UdpChallenge) return;
+            if (slot.tcp != connection || slot.udp != udp || slot.Username == null || slot.UdpConfirmed ||
+                connection.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp()) || !HasToken(connection, token))
+                return false;
+
+            if (udp.endPoint == null) udp.Connect(endpoint);
+            return endpoint.Equals(udp.endPoint);
+        }
+
+        internal static void ConfirmUdp(Client slot, Client.TCP connection, byte[] token, byte[] nonce, long? now = null)
+        {
+            long appliedAt = now ?? Stopwatch.GetTimestamp();
+            if (slot.tcp != connection || slot.Username == null || slot.UdpConfirmed || slot.udp.endPoint == null ||
+                slot.udp.ProbeNonce is not byte[] probeNonce || !HasToken(connection, token) ||
+                !CryptographicOperations.FixedTimeEquals(probeNonce, nonce) ||
+                connection.HandshakeHasExpired(appliedAt)) return;
 
             slot.UdpConfirmed = true;
+            connection.StartHeartbeat(appliedAt);
             ServerSend.LobbyReady(slot);
         }
+
+        internal static void HeartbeatPong(Client slot, Client.TCP connection, long sequence, long? now = null)
+        {
+            if (slot.tcp != connection || !slot.IsReady) return;
+            connection.AcceptHeartbeatPong(sequence, now ?? Stopwatch.GetTimestamp());
+        }
+
+        internal static void UdpMovement(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
+            byte[] token, int roomId, int roundId, float x, float y)
+        {
+            if (slot.tcp != connection || slot.udp != udp || !slot.IsReady ||
+                !endpoint.Equals(udp.endPoint) || !HasToken(connection, token)) return;
+
+            PlayerMovement(slot, roomId, roundId, x, y);
+        }
+
+        internal static void UdpHealthProbe(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
+            byte[] token, long sequence)
+        {
+            if (slot.tcp != connection || slot.udp != udp || !slot.IsReady ||
+                !endpoint.Equals(udp.endPoint) || !HasToken(connection, token)) return;
+
+            ServerSend.UdpHealthEcho(udp, token, sequence);
+        }
+
+        private static bool HasToken(Client.TCP connection, byte[] token) =>
+            connection.SessionToken is byte[] expected && CryptographicOperations.FixedTimeEquals(expected, token);
 
         internal static void CreateRoom(Client slot)
         {

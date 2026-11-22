@@ -30,6 +30,7 @@ public class GameManager : MonoBehaviour
     private bool roomRequestPending;
     private string roomError;
     private string connectionStatus = "Nhập địa chỉ server.";
+    private string udpHealthWarning;
 
     public int RoomId { get; private set; }
     public int ActiveRoundId { get; private set; }
@@ -44,6 +45,14 @@ public class GameManager : MonoBehaviour
     public void SetConnectionStatus(string status)
     {
         connectionStatus = status;
+        RefreshMatchUi();
+    }
+
+    internal void SetUdpHealth(bool degraded, bool unavailable)
+    {
+        string warning = unavailable ? "UDP không khả dụng" : degraded ? "Kết nối UDP gián đoạn" : null;
+        if (udpHealthWarning == warning) return;
+        udpHealthWarning = warning;
         RefreshMatchUi();
     }
 
@@ -170,6 +179,7 @@ public class GameManager : MonoBehaviour
         else if (!IsPlaying && phase == MatchPhase.Playing) matchStatus.text = "Chờ ván sau";
         else if (!IsPlaying) matchStatus.text = $"Sẵn sàng: {readyCount}/{Constants.MAX_PLAYERS}";
         else matchStatus.text = CanControl ? "Đang chơi" : "Bạn đã bị loại";
+        if (IsReady && udpHealthWarning != null) matchStatus.text += $"\n{udpHealthWarning}";
     }
 
     private static Vector2 CellCenter(Vector2Int cell) => new Vector2(cell.x - 8.5f, cell.y - 7.5f);
@@ -308,6 +318,7 @@ public class GameManager : MonoBehaviour
         if (!instance) return;
 
         instance.IsReady = false;
+        instance.udpHealthWarning = null;
         instance.connectionStatus = status;
         instance.ChangeRoom(0);
     }

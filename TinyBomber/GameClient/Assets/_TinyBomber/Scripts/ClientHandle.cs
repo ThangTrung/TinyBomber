@@ -3,15 +3,6 @@ using GameShared;
 
 public class ClientHandle : MonoBehaviour
 {
-    public static void Welcome(Packet _packet)
-    {
-        string _msg = _packet.ReadString();
-        int _myId = _packet.ReadInt();
-
-        Debug.Log($"[SERVER NÓI]: {_msg}");
-        Client.instance.BeginUdpHandshake(_myId);
-    }
-
     public static void RoundBegin(Packet packet)
     {
         if (!IsCurrentRoom(packet)) return;
@@ -67,11 +58,23 @@ public class ClientHandle : MonoBehaviour
 
     public static void PlayerPosition(Packet _packet)
     {
-        if (!IsCurrentRound(_packet) || !GameManager.instance.IsPlaying) return;
-        int _id = _packet.ReadInt();
-        float _x = _packet.ReadFloat();
-        float _y = _packet.ReadFloat();
+        int roomId = _packet.ReadInt();
+        int roundId = _packet.ReadInt();
+        if (!AcceptsPlayerPosition(roomId, roundId)) return;
+        ApplyPlayerPosition(_packet.ReadInt(), _packet.ReadFloat(), _packet.ReadFloat());
+    }
 
+    internal static void ApplyPlayerPosition(int roomId, int roundId, int id, float x, float y)
+    {
+        if (AcceptsPlayerPosition(roomId, roundId)) ApplyPlayerPosition(id, x, y);
+    }
+
+    private static bool AcceptsPlayerPosition(int roomId, int roundId) =>
+        roomId > 0 && roomId == GameManager.instance.RoomId && roundId > 0 &&
+        roundId == GameManager.instance.ActiveRoundId && GameManager.instance.IsPlaying;
+
+    private static void ApplyPlayerPosition(int _id, float _x, float _y)
+    {
         if (GameManager.players.ContainsKey(_id))
         {
             if (_id == Client.instance.myId)

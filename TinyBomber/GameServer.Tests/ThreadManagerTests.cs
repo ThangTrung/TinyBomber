@@ -101,11 +101,23 @@ namespace GameServer.Tests
             int executedAfterException = 0;
 
             ThreadManager.EnqueueAction(() => throw new InvalidOperationException("Test error"));
-            ThreadManager.EnqueueAction(() => Interlocked.Increment(ref executedAfterException));
+            ThreadManager.EnqueueAction(() =>
+            {
+                Interlocked.Increment(ref executedAfterException);
+                ThreadManager.EnqueueAction(() => Interlocked.Increment(ref executedAfterException));
+            });
 
             ThreadManager.UpdateMain();
 
             Assert.Equal(1, executedAfterException);
+            Assert.Equal(1, ThreadManager.LastBatchMetrics.Failed);
+            Assert.Equal(1, ThreadManager.LastBatchMetrics.Succeeded);
+            Assert.Equal(2, ThreadManager.LastBatchMetrics.BatchSize);
+            Assert.Equal(1, ThreadManager.GetWaitingActionCount());
+            Assert.Equal(1, ThreadManager.GetWaitingActionCount());
+            ThreadManager.UpdateMain();
+            Assert.Equal(2, executedAfterException);
+            Assert.Equal(0, ThreadManager.GetWaitingActionCount());
         }
 
         [Fact]
