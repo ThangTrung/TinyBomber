@@ -16,26 +16,28 @@ namespace GameServer
             packet.EncryptPayload();
         }
 
-        public static void Welcome(Client.TCP connection, int clientId, string message)
+        internal static void ServerHello(Client.TCP connection, int slotId)
         {
-            using var packet = new Packet((int)ServerPackets.welcome);
-            packet.Write(message);
-            packet.Write(clientId);
-            SendTCPData(connection, packet);
+            using var packet = ProtocolV2.CreateServerHello(slotId);
+            connection.SendData(packet);
+        }
+
+        internal static void SessionGranted(Client.TCP connection, byte[] token)
+        {
+            using var packet = ProtocolV2.CreateSessionGranted(token);
+            connection.SendData(packet);
         }
 
         internal static void UdpProbe(Client slot)
         {
-            using var packet = new Packet((int)ServerPackets.udpProbe);
-            packet.Write(slot.tcp.UdpChallenge);
-            Prepare(packet);
+            using var packet = ProtocolV2.CreateUdpProbe(slot.tcp.SessionToken!, slot.udp.ProbeNonce!);
             slot.udp.SendData(packet);
         }
 
         internal static void LobbyReady(Client slot)
         {
-            using var packet = new Packet((int)ServerPackets.lobbyReady);
-            SendTCPData(slot.tcp, packet);
+            using var packet = ProtocolV2.CreateLobbyReady();
+            slot.tcp.SendData(packet);
         }
 
         internal static void RoomChanged(Client slot, int roomId)
@@ -102,16 +104,34 @@ namespace GameServer
 
         internal static void BroadcastPlayerPosition(GameLogic room, Player player)
         {
-            using var packet = new Packet((int)ServerPackets.playerPosition);
-            WritePosition(packet, room, player);
-            Prepare(packet);
-
-            foreach (var slot in room.Members)
+            Packet? tcpPosition = null;
+            try
             {
-                if (slot.id == player.id || slot.player == null) continue;
+                foreach (var slot in room.Members)
+                {
+                    if (slot.id == player.id || slot.player == null) continue;
 
-                if (slot.UdpConfirmed) slot.udp.SendData(packet);
-                else slot.tcp.SendData(packet);
+                    if (slot.UdpConfirmed && slot.tcp.SessionToken is byte[] token && slot.udp.endPoint != null)
+                    {
+                        using var position = ProtocolV2.CreateUdpPlayerPosition(token,
+                            room.Id, room.RoundId, player.id, player.x, player.y);
+                        slot.udp.SendData(position);
+                    }
+                    else
+                    {
+                        if (tcpPosition == null)
+                        {
+                            tcpPosition = new Packet((int)ServerPackets.playerPosition);
+                            WritePosition(tcpPosition, room, player);
+                            Prepare(tcpPosition);
+                        }
+                        slot.tcp.SendData(tcpPosition);
+                    }
+                }
+            }
+            finally
+            {
+                tcpPosition?.Dispose();
             }
         }
 

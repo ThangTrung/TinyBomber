@@ -16,8 +16,9 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private readonly CancellationTokenSource lifetime;
     private readonly RunErrors errors;
     private readonly int index;
-    private readonly TaskCompletionSource<int> welcome = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource<int> udpChallenge = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<int> serverHello = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<byte[]> sessionGranted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<byte[]> udpProbe = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource lobbyReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly HashSet<int> roster = new();
     private readonly Dictionary<int, Position> spawns = new();
@@ -28,6 +29,9 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private Task receiveUdp = Task.CompletedTask;
     private long? handshakeDeadline;
     private bool handshakeTimedOut;
+    private bool clientHelloSent;
+    private bool udpConfirmSent;
+    private byte[]? sessionToken;
     private bool connected;
     private bool ready;
     private bool alive;
@@ -110,8 +114,6 @@ internal sealed class SimulatedClient : IAsyncDisposable
         {
             tcp = new TcpClient(AddressFamily.InterNetwork);
             await tcp.ConnectAsync(address, Constants.PORT, token).ConfigureAwait(false);
-            udp = new UdpClient(AddressFamily.InterNetwork);
-            udp.Connect(address, Constants.UDP_PORT);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -126,35 +128,44 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
         lock (stateLock) connected = true;
         receiveTcp = ReceiveTcpAsync(lifetime.Token);
-        receiveUdp = ReceiveUdpAsync(lifetime.Token);
         try
         {
-            int slot = await welcome.Task.WaitAsync(token).ConfigureAwait(false);
-            await SendTcpAsync(ClientPackets.welcomeReceived, packet =>
-            {
-                packet.Write(slot);
-                packet.Write($"LoadClient_{slot}");
-            }, token).ConfigureAwait(false);
+            int slot = await serverHello.Task.WaitAsync(token).ConfigureAwait(false);
+            using var hello = ProtocolV2.CreateClientHello(slot, $"LoadClient_{slot}");
+            lock (stateLock) clientHelloSent = true;
+            await SendTcpFrameAsync(hello, ClientPackets.clientHello, token).ConfigureAwait(false);
 
-            byte[] registration = BitConverter.GetBytes(slot);
-            while (!udpChallenge.Task.IsCompleted)
+            byte[] grantedToken = await sessionGranted.Task.WaitAsync(token).ConfigureAwait(false);
+            udp = new UdpClient(AddressFamily.InterNetwork);
+            udp.Connect(address, Constants.UDP_PORT);
+            receiveUdp = ReceiveUdpAsync(lifetime.Token);
+
+            while (!udpProbe.Task.IsCompleted)
             {
-                await SendUdpAsync(registration, token).ConfigureAwait(false);
+                using var registration = ProtocolV2.CreateUdpRegistration(slot, grantedToken);
+                await SendUdpAsync(registration.ToArray(), token).ConfigureAwait(false);
                 try
                 {
-                    await udpChallenge.Task.WaitAsync(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
+                    await udpProbe.Task.WaitAsync(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false);
                 }
                 catch (TimeoutException) { /* Repeat registration until the handshake deadline. */ }
             }
-            int challenge = await udpChallenge.Task.ConfigureAwait(false);
-            await SendTcpAsync(ClientPackets.udpReady, packet => packet.Write(challenge), token).ConfigureAwait(false);
+            byte[] nonce = await udpProbe.Task.ConfigureAwait(false);
+            token.ThrowIfCancellationRequested();
+            using var confirm = ProtocolV2.CreateUdpConfirm(grantedToken, nonce);
+            lock (stateLock) udpConfirmSent = true;
+            await SendTcpFrameAsync(confirm, ClientPackets.udpConfirm, token).ConfigureAwait(false);
             await lobbyReady.Task.WaitAsync(token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
             ExpireHandshake("Handshake TCP/UDP quá hạn.");
         }
-        catch (Exception ex) when (ex is SocketException or IOException)
+        catch (SocketException ex)
+        {
+            if (!token.IsCancellationRequested) Fail(ErrorKind.Connection, $"UDP setup: {ex.Message}");
+        }
+        catch (IOException)
         {
             // The sending method has already recorded the failure.
         }
@@ -167,6 +178,11 @@ internal sealed class SimulatedClient : IAsyncDisposable
         write?.Invoke(packet);
         packet.WriteLength();
         packet.EncryptPayload();
+        await SendTcpFrameAsync(packet, type, token).ConfigureAwait(false);
+    }
+
+    private async Task SendTcpFrameAsync(Packet packet, ClientPackets type, CancellationToken token)
+    {
         try
         {
             await tcp!.GetStream().WriteAsync(packet.ToArray(), token).ConfigureAwait(false);
@@ -188,7 +204,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         catch (Exception ex) when (ex is SocketException or IOException)
         {
             if (!token.IsCancellationRequested) Fail(ErrorKind.Send, $"UDP: {ex.Message}");
-            throw;
+            throw new IOException("Không gửi được UDP datagram.", ex);
         }
     }
 
@@ -203,7 +219,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
             {
                 int length = await stream.ReadAsync(buffer, token).ConfigureAwait(false);
                 if (length == 0) throw new EndOfStreamException("Server đã đóng TCP.");
-                frames.Feed(buffer.AsSpan(0, length), data => HandlePacket(data, isUdp: false));
+                frames.Feed(buffer.AsSpan(0, length), HandleTcpPacket);
             }
         }
         catch (Exception ex)
@@ -219,7 +235,11 @@ internal sealed class SimulatedClient : IAsyncDisposable
             while (!token.IsCancellationRequested)
             {
                 var result = await udp!.ReceiveAsync(token).ConfigureAwait(false);
-                HandlePacket(result.Buffer, isUdp: true);
+                try
+                {
+                    HandleUdpPacket(result.Buffer);
+                }
+                catch (InvalidDataException) { /* Discard just this datagram. */ }
             }
         }
         catch (Exception ex)
@@ -228,35 +248,51 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
     }
 
-    private void HandlePacket(byte[] data, bool isUdp)
+    private void HandleTcpPacket(byte[] data)
     {
         using var packet = new Packet(data);
         packet.DecryptPayload();
         if (packet.ReadInt() != data.Length - sizeof(int))
             throw new InvalidDataException("Độ dài packet không khớp.");
-        var type = (ServerPackets)packet.ReadInt();
-        if (isUdp && type is not (ServerPackets.udpProbe or ServerPackets.playerPosition))
-            throw new InvalidDataException($"Packet UDP không hợp lệ: {type}.");
+        var type = (ServerPackets)packet.ReadInt(false);
 
-        if (type == ServerPackets.lobbyReady)
+        switch (type)
         {
-            FinishHandshake();
-            return;
+            case ServerPackets.serverHello:
+                AcceptServerHello(ProtocolV2.ReadServerHello(packet));
+                return;
+            case ServerPackets.sessionGranted:
+                byte[] granted = ProtocolV2.ReadSessionGranted(packet);
+                lock (stateLock)
+                {
+                    if (!connected || lifetime.IsCancellationRequested) return;
+                    if (!clientHelloSent || sessionToken != null)
+                        throw new InvalidDataException("SessionGranted đến sai giai đoạn.");
+                    if (HandshakeHasExpired()) return;
+                    sessionToken = granted;
+                    sessionGranted.TrySetResult(granted);
+                }
+                return;
+            case ServerPackets.lobbyReady:
+                ProtocolV2.ReadLobbyReady(packet);
+                FinishHandshake();
+                return;
+            case ServerPackets.welcome when !serverHello.Task.IsCompleted:
+                packet.ReadInt();
+                packet.ReadString();
+                if (packet.UnreadLength() != sizeof(int) || packet.ReadInt() <= 0)
+                    throw new InvalidDataException("Welcome v1 không hợp lệ.");
+                RejectProtocolVersion(1);
+                return;
         }
 
+        packet.ReadInt();
         lock (stateLock)
         {
+            if (!ready) throw new InvalidDataException("TCP packet đến sai giai đoạn bắt tay.");
+
             switch (type)
             {
-                case ServerPackets.welcome:
-                    packet.ReadString();
-                    id = packet.ReadInt();
-                    if (id <= 0 || !welcome.TrySetResult(id))
-                        throw new InvalidDataException("Server trả về welcome không hợp lệ.");
-                    break;
-                case ServerPackets.udpProbe:
-                    udpChallenge.TrySetResult(packet.ReadInt());
-                    break;
                 case ServerPackets.roomChanged:
                     roomId = packet.ReadInt();
                     phase = MatchPhase.Waiting;
@@ -283,7 +319,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     }
                     break;
                 case ServerPackets.playerPosition:
-                    if (IsCurrentRound(packet)) ReadPlayerPosition(packet);
+                    if (IsCurrentRound(packet)) ApplyPlayerPosition(packet.ReadInt(), ReadPosition(packet), isTcp: true);
                     break;
                 case ServerPackets.playerEliminated:
                 case ServerPackets.playerDisconnected:
@@ -303,6 +339,61 @@ internal sealed class SimulatedClient : IAsyncDisposable
                 default:
                     throw new InvalidDataException($"Packet server không được nhận diện: {type}.");
             }
+        }
+    }
+
+    private void AcceptServerHello((int Version, int SlotId) hello)
+    {
+        if (hello.SlotId <= 0 || serverHello.Task.IsCompleted)
+            throw new InvalidDataException("ServerHello không hợp lệ.");
+        if (HandshakeHasExpired()) return;
+        if (hello.Version != ProtocolV2.Version)
+        {
+            RejectProtocolVersion(hello.Version);
+            return;
+        }
+
+        lock (stateLock)
+        {
+            if (!connected || lifetime.IsCancellationRequested || HandshakeHasExpired()) return;
+            id = hello.SlotId;
+            serverHello.TrySetResult(id);
+        }
+    }
+
+    private void RejectProtocolVersion(int version)
+    {
+        Fail(ErrorKind.Connection, $"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV2.Version}.");
+        tcp?.Dispose();
+    }
+
+    private void HandleUdpPacket(byte[] data)
+    {
+        using Packet packet = ProtocolV2.OpenServerDatagram(data);
+        switch ((ServerPackets)packet.ReadInt(false))
+        {
+            case ServerPackets.udpProbeV2:
+                var probe = ProtocolV2.ReadUdpProbe(packet);
+                lock (stateLock)
+                {
+                    if (connected && !ready && !HandshakeHasExpired() && sessionToken is byte[] token &&
+                        probe.Token.AsSpan().SequenceEqual(token))
+                        udpProbe.TrySetResult(probe.Nonce);
+                }
+                break;
+            case ServerPackets.udpPlayerPosition:
+                var update = ProtocolV2.ReadUdpPlayerPosition(packet);
+                lock (stateLock)
+                {
+                    if (!connected || !ready || sessionToken is not byte[] token ||
+                        !update.Token.AsSpan().SequenceEqual(token) ||
+                        update.RoomId != roomId || update.RoundId != roundId || roomId <= 0 || roundId <= 0)
+                        return;
+                    var position = new Position(update.X, update.Y);
+                    if (!position.IsFinite) throw new InvalidDataException("Tọa độ server không hữu hạn.");
+                    ApplyPlayerPosition(update.PlayerId, position, isTcp: false);
+                }
+                break;
         }
     }
 
@@ -356,12 +447,13 @@ internal sealed class SimulatedClient : IAsyncDisposable
         map = terrain;
     }
 
-    private void ReadPlayerPosition(Packet packet)
+    private void ApplyPlayerPosition(int player, Position position, bool isTcp)
     {
-        int player = packet.ReadInt();
-        Position position = ReadPosition(packet);
         if (phase != MatchPhase.Playing || !roster.Contains(player)) return;
-        if (player == id) corrected = true; // This is the server's TCP correction, not a peer observation.
+        if (player == id)
+        {
+            if (isTcp) corrected = true;
+        }
         else if (player == watchedPlayer) watchedTrace?.Observe(id, position);
     }
 
@@ -412,6 +504,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         CancellationToken token = run.Token;
         Position position;
         MovementPath path;
+        byte[] grantedToken;
         long period = (Stopwatch.Frequency + hz - 1) / hz;
         int steps = window.TotalSeconds * hz;
         long start = window.StartsAt;
@@ -422,6 +515,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         {
             lock (stateLock)
             {
+                grantedToken = sessionToken ?? throw new InvalidDataException("Phiên chưa được cấp token.");
                 position = spawns[id];
                 path = new MovementPath(position, map!);
             }
@@ -447,14 +541,8 @@ internal sealed class SimulatedClient : IAsyncDisposable
                         throw new InvalidDataException("Bước di chuyển không hợp lệ.");
                 }
 
-                using var packet = new Packet((int)ClientPackets.playerMovement);
-                packet.Write(round.RoomId);
-                packet.Write(round.RoundId);
-                packet.Write(target.X);
-                packet.Write(target.Y);
-                packet.WriteLength();
-                packet.EncryptPayload();
-                packet.InsertInt(round.Id);
+                using var packet = ProtocolV2.CreateUdpPlayerMovement(round.Id, grantedToken,
+                    round.RoomId, round.RoundId, target.X, target.Y);
                 byte[] data = packet.ToArray();
                 long sendAt = Stopwatch.GetTimestamp();
                 if (sendAt >= end) break;
@@ -488,13 +576,17 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
     }
 
+    private bool HandshakeHasExpired() => Stopwatch.GetTimestamp() >= handshakeDeadline!.Value;
+
     private void FinishHandshake()
     {
         lock (stateLock)
         {
             if (!connected || ready || handshakeTimedOut || lifetime.IsCancellationRequested) return;
+            if (!udpConfirmSent)
+                throw new InvalidDataException("lobbyReady đến trước khi xác nhận UDP.");
 
-            if (Stopwatch.GetTimestamp() < handshakeDeadline!.Value)
+            if (!HandshakeHasExpired())
             {
                 ready = true;
                 lobbyReady.TrySetResult();

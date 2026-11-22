@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -89,56 +90,75 @@ namespace GameServer
 
         private static void UDPReceiveCallback(IAsyncResult _result)
         {
+            var endpoint = new IPEndPoint(IPAddress.Any, 0);
+            byte[]? data = null;
             try
             {
-                IPEndPoint _clientEndPoint = new IPEndPoint(IPAddress.Any, 0);
-                byte[] _data = udpSocket.EndReceive(_result, ref _clientEndPoint!);
-                Network.RecordUdpReceive(_data.Length);
+                data = udpSocket.EndReceive(_result, ref endpoint!);
+                Network.RecordUdpReceive(data.Length);
+            }
+            catch (ObjectDisposedException) when (!isRunning) { return; }
+            catch (SocketException ex)
+            {
+                if (isRunning) Console.WriteLine($"[UDP Receive Warning] {ex.Message}");
+            }
+
+            if (!isRunning) return;
+            try
+            {
                 udpSocket.BeginReceive(UDPReceiveCallback, null);
+            }
+            catch (ObjectDisposedException) when (!isRunning) { return; }
+            catch (SocketException ex)
+            {
+                if (isRunning) Console.WriteLine($"[UDP Receive Warning] {ex.Message}");
+                return;
+            }
 
-                if (_data.Length < 4)
-                {
-                    return;
-                }
+            if (data != null) HandleUdpDatagram(data, endpoint);
+        }
 
-                int _clientId = BitConverter.ToInt32(_data, 0);
-                if (_clientId < 1 || _clientId > MaxConnections)
-                {
-                    return;
-                }
+        private static void HandleUdpDatagram(byte[] data, IPEndPoint endpoint)
+        {
+            if (data.Length <= sizeof(int)) return;
+            int slotId = BinaryPrimitives.ReadInt32LittleEndian(data);
+            if (slotId < 1 || slotId > MaxConnections) return;
 
-                Client.UDP udp;
-                lock (slotLock)
-                {
-                    Client slot = clients[_clientId];
-                    if (slot.tcp.socket == null) return;
-                    udp = slot.udp;
-                }
+            Client.TCP connection;
+            Client.UDP udp;
+            lock (slotLock)
+            {
+                Client slot = clients[slotId];
+                connection = slot.tcp;
+                if (connection.socket == null) return;
+                udp = slot.udp;
+            }
+            if (udp.endPoint is IPEndPoint bound && !endpoint.Equals(bound)) return;
 
-                if (_data.Length == sizeof(int))
+            try
+            {
+                using Packet packet = ProtocolV2.OpenClientDatagram(data, out _);
+                switch ((ClientPackets)packet.ReadInt(false))
                 {
-                    ThreadManager.EnqueueAction(() =>
-                    {
-                        Client slot = clients[_clientId];
-                        if (ServerHandle.RegisterUdp(slot, udp, _clientEndPoint)) ServerSend.UdpProbe(slot);
-                    });
-                    return;
-                }
-
-                if (_clientEndPoint.Equals(udp.endPoint))
-                {
-                    byte[] _encryptedPayload = new byte[_data.Length - 4];
-                    Array.Copy(_data, 4, _encryptedPayload, 0, _encryptedPayload.Length);
-                    udp.HandleData(_encryptedPayload);
+                    case ClientPackets.udpRegistration:
+                        byte[] token = ProtocolV2.ReadUdpRegistration(packet);
+                        ThreadManager.EnqueueAction(() =>
+                        {
+                            Client slot = clients[slotId];
+                            if (ServerHandle.RegisterUdp(slot, connection, udp, endpoint, token))
+                                ServerSend.UdpProbe(slot);
+                        });
+                        break;
+                    case ClientPackets.udpPlayerMovement:
+                        var move = ProtocolV2.ReadUdpPlayerMovement(packet);
+                        ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
+                            endpoint, move.Token, move.RoomId, move.RoundId, move.X, move.Y));
+                        break;
                 }
             }
-            catch (Exception _ex)
+            catch (InvalidDataException)
             {
-                Console.WriteLine($"[UDP Receive Warning] {_ex.Message}");
-                if (isRunning && udpSocket != null)
-                {
-                    try { udpSocket.BeginReceive(UDPReceiveCallback, null); } catch { }
-                }
+                // Receive is already armed. Discard malformed or unauthenticated datagrams.
             }
         }
 

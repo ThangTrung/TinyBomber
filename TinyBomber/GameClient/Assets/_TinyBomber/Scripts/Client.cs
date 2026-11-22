@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
+using System.IO;
 using System.Threading.Tasks;
 using UnityEngine;
 using GameShared;
@@ -43,8 +44,8 @@ public class Client : MonoBehaviour
     {
         if (!tcp.HandshakeHasExpired(Stopwatch.GetTimestamp())) return false;
 
-        Disconnect(myId == 0
-            ? "Máy chủ không phản hồi qua TCP."
+        Disconnect(tcp.SessionToken == null
+            ? "Máy chủ chưa hoàn tất bắt tay TCP."
             : "Máy chủ chưa xác nhận kết nối UDP.");
         return true;
     }
@@ -75,12 +76,29 @@ public class Client : MonoBehaviour
         }
     }
 
-    public void BeginUdpHandshake(int clientId)
+    private void AcceptServerHello(int version, int slotId)
     {
-        if (!IsConnecting || udp != null || CheckHandshakeDeadline()) return;
+        if (!IsConnecting || myId != 0 || slotId <= 0)
+            throw new InvalidDataException("ServerHello không hợp lệ.");
+        if (CheckHandshakeDeadline()) return;
+        if (version != ProtocolV2.Version)
+        {
+            Disconnect($"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV2.Version}.");
+            return;
+        }
 
-        myId = clientId;
-        ClientSend.WelcomeReceived();
+        myId = slotId;
+        ClientSend.SendClientHello();
+        GameManager.instance.SetConnectionStatus("Đang chờ cấp phiên…");
+    }
+
+    private void BeginUdpHandshake(byte[] token)
+    {
+        if (!IsConnecting || myId == 0 || tcp.SessionToken != null)
+            throw new InvalidDataException("SessionGranted đến sai giai đoạn.");
+        if (CheckHandshakeDeadline()) return;
+
+        tcp.SessionToken = token;
         GameManager.instance.SetConnectionStatus("Đang xác nhận UDP…");
 
         try
@@ -99,7 +117,10 @@ public class Client : MonoBehaviour
 
     private void FinishHandshake()
     {
-        if (!IsConnecting || udp == null || CheckHandshakeDeadline()) return;
+        if (!IsConnecting) return;
+        if (!tcp.UdpConfirmSent)
+            throw new InvalidDataException("lobbyReady đến trước khi xác nhận UDP.");
+        if (CheckHandshakeDeadline()) return;
 
         IsConnecting = false;
         GameManager.instance.ConfirmLobbyReady();
@@ -145,6 +166,8 @@ public class Client : MonoBehaviour
         private readonly Queue<byte[]> pendingWrites = new Queue<byte[]>();
         private bool writing;
         private bool sendFailed;
+        internal byte[] SessionToken { get; set; }
+        internal bool UdpConfirmSent { get; set; }
 
         internal bool HandshakeHasExpired(long now) => now >= handshakeDeadline;
 
@@ -286,15 +309,40 @@ public class Client : MonoBehaviour
             using (Packet _packet = new Packet(_data))
             {
                 _packet.DecryptPayload();
-                int _packetLength = _packet.ReadInt();
-                int _packetId = _packet.ReadInt();
+                _packet.ReadInt();
+                int _packetId = _packet.ReadInt(false);
 
-                // Điều hướng
-                if (_packetId == (int)ServerPackets.welcome)
+                if (_packetId == (int)ServerPackets.serverHello)
                 {
-                    ClientHandle.Welcome(_packet);
+                    var hello = ProtocolV2.ReadServerHello(_packet);
+                    instance.AcceptServerHello(hello.Version, hello.SlotId);
+                    return;
                 }
-                else if (_packetId == (int)ServerPackets.spawnPlayer)
+                if (_packetId == (int)ServerPackets.sessionGranted)
+                {
+                    instance.BeginUdpHandshake(ProtocolV2.ReadSessionGranted(_packet));
+                    return;
+                }
+                if (_packetId == (int)ServerPackets.lobbyReady)
+                {
+                    ProtocolV2.ReadLobbyReady(_packet);
+                    instance.FinishHandshake();
+                    return;
+                }
+
+                _packet.ReadInt();
+                if (_packetId == (int)ServerPackets.welcome && instance.IsConnecting && instance.myId == 0)
+                {
+                    _packet.ReadString();
+                    if (_packet.UnreadLength() != sizeof(int) || _packet.ReadInt() <= 0)
+                        throw new InvalidDataException("Welcome v1 không hợp lệ.");
+                    instance.Disconnect($"Máy chủ dùng protocol v1. Client yêu cầu v{ProtocolV2.Version}.");
+                    return;
+                }
+                if (instance.IsConnecting)
+                    throw new InvalidDataException("TCP packet đến sai giai đoạn bắt tay.");
+
+                if (_packetId == (int)ServerPackets.spawnPlayer)
                 {
                     ClientHandle.SpawnPlayer(_packet);
                 }
@@ -329,10 +377,6 @@ public class Client : MonoBehaviour
                 else if (_packetId == (int)ServerPackets.playerEliminated)
                 {
                     ClientHandle.PlayerEliminated(_packet);
-                }
-                else if (_packetId == (int)ServerPackets.lobbyReady)
-                {
-                    instance.FinishHandshake();
                 }
                 else if (_packetId == (int)ServerPackets.roomChanged)
                 {
@@ -401,20 +445,21 @@ public class Client : MonoBehaviour
 
         public void RetryRegistration()
         {
-            if (closed || socket == null || Time.unscaledTime < nextRegistrationAt) return;
+            if (closed || socket == null || instance.tcp.UdpConfirmSent || Time.unscaledTime < nextRegistrationAt) return;
 
             nextRegistrationAt = Time.unscaledTime + 1f;
-            using (var packet = new Packet()) SendData(packet);
+            using var packet = ProtocolV2.CreateUdpRegistration(instance.myId, instance.tcp.SessionToken);
+            SendData(packet);
         }
 
         public void SendData(Packet _packet)
         {
             try
             {
-                _packet.InsertInt(instance.myId);
                 if (!closed && socket != null)
                 {
-                    socket.BeginSend(_packet.ToArray(), _packet.Length(), null, null);
+                    byte[] frame = _packet.ToArray();
+                    socket.BeginSend(frame, frame.Length, null, null);
                 }
             }
             catch (Exception _ex)
@@ -447,51 +492,37 @@ public class Client : MonoBehaviour
 
         private void HandleData(byte[] data)
         {
-            using (Packet packet = new Packet(data))
+            try
             {
-                int packetId;
-                try
+                using Packet packet = ProtocolV2.OpenServerDatagram(data);
+                TCP connection = instance.tcp;
+                byte[] token = connection.SessionToken;
+                switch ((ServerPackets)packet.ReadInt(false))
                 {
-                    if (data.Length < sizeof(int) || BitConverter.ToInt32(data, 0) != data.Length - sizeof(int))
-                        throw new System.IO.InvalidDataException("Header độ dài UDP không khớp datagram.");
-                    packet.DecryptPayload();
-                    packet.ReadInt();
-                    packetId = packet.ReadInt();
-                    // Validate the datagram structure before calling a handler that can change state.
-                    if (packetId == (int)ServerPackets.playerPosition)
-                    {
-                        if (packet.UnreadLength() != 3 * sizeof(int) + 2 * sizeof(float))
-                            throw new System.IO.InvalidDataException("Độ dài UDP playerPosition không hợp lệ.");
-                    }
-                    else if (packetId == (int)ServerPackets.udpProbe)
-                    {
-                        if (packet.UnreadLength() != sizeof(int))
-                            throw new System.IO.InvalidDataException("Độ dài UDP udpProbe không hợp lệ.");
-                    }
-                    else
-                    {
-                        throw new System.IO.InvalidDataException($"Không nhận diện được UDP packet ID {packetId}.");
-                    }
+                    case ServerPackets.udpProbeV2:
+                        var probe = ProtocolV2.ReadUdpProbe(packet);
+                        if (!instance.IsConnecting || connection.UdpConfirmSent ||
+                            !probe.Token.AsSpan().SequenceEqual(token) || instance.CheckHandshakeDeadline()) return;
+                        ClientSend.ConfirmUdp(token, probe.Nonce);
+                        connection.UdpConfirmSent = true;
+                        break;
+                    case ServerPackets.udpPlayerPosition:
+                        var position = ProtocolV2.ReadUdpPlayerPosition(packet);
+                        if (instance.IsConnecting || !position.Token.AsSpan().SequenceEqual(token)) return;
+                        ClientHandle.ApplyPlayerPosition(position.RoomId, position.RoundId, position.PlayerId,
+                            position.X, position.Y);
+                        break;
                 }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning($"Bỏ gói UDP không hợp lệ: {ex}");
-                    return;
-                }
-
-                try
-                {
-                    if (packetId == (int)ServerPackets.playerPosition)
-                        ClientHandle.PlayerPosition(packet);
-                    else
-                        ClientSend.ConfirmUdp(packet.ReadInt());
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogException(ex);
-                    if (!closed && instance != null && instance.udp == this)
-                        instance.Disconnect("Không áp dụng được dữ liệu UDP từ máy chủ.");
-                }
+            }
+            catch (InvalidDataException)
+            {
+                // Drop this datagram. The current UDP receive stays armed.
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex);
+                if (!closed && instance != null && instance.udp == this)
+                    instance.Disconnect("Không áp dụng được dữ liệu UDP từ máy chủ.");
             }
         }
     }

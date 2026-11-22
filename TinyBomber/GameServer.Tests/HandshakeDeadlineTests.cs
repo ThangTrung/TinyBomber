@@ -16,14 +16,15 @@ public sealed class HandshakeDeadlineTests
     [InlineData(-1, true)]
     [InlineData(0, false)]
     [InlineData(1, false)]
-    public void WelcomeOnlySetsUsernameBeforeDeadline(int offset, bool accepted)
+    public void ClientHelloOnlyGrantsSessionBeforeDeadline(int offset, bool accepted)
     {
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
 
-        ServerHandle.WelcomeReceived(slot, slot.id, "Player", Deadline + offset);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV2.Version, slot.id, "Player", Deadline + offset);
 
         Assert.Equal(accepted ? "Player" : null, slot.Username);
+        Assert.Equal(accepted, slot.tcp.SessionToken?.Length == 16);
     }
 
     [Theory]
@@ -32,11 +33,13 @@ public sealed class HandshakeDeadlineTests
     [InlineData(1, false)]
     public void RegistrationOnlyBindsBeforeDeadline(int offset, bool accepted)
     {
-        var slot = new Client(1) { Username = "Player" };
+        var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV2.Version, slot.id, "Player", AcceptedAt);
         var endpoint = new IPEndPoint(IPAddress.Loopback, 12345);
 
-        Assert.Equal(accepted, ServerHandle.RegisterUdp(slot, slot.udp, endpoint, Deadline + offset));
+        Assert.Equal(accepted, ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp, endpoint,
+            slot.tcp.SessionToken!, Deadline + offset));
         Assert.Equal(accepted ? endpoint : null, slot.udp.endPoint);
     }
 
@@ -48,11 +51,13 @@ public sealed class HandshakeDeadlineTests
     {
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
-        ServerHandle.WelcomeReceived(slot, slot.id, "Player", AcceptedAt);
-        Assert.True(ServerHandle.RegisterUdp(slot, slot.udp, new IPEndPoint(IPAddress.Loopback, 12345), Deadline - 2));
-        Assert.True(ServerHandle.RegisterUdp(slot, slot.udp, slot.udp.endPoint!, Deadline - 1));
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV2.Version, slot.id, "Player", AcceptedAt);
+        byte[] token = slot.tcp.SessionToken!;
+        Assert.True(ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp,
+            new IPEndPoint(IPAddress.Loopback, 12345), token, Deadline - 2));
+        Assert.True(ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp, slot.udp.endPoint!, token, Deadline - 1));
 
-        ServerHandle.ConfirmUdp(slot, slot.tcp.UdpChallenge, Deadline + offset);
+        ServerHandle.ConfirmUdp(slot, slot.tcp, token, slot.udp.ProbeNonce!, Deadline + offset);
 
         Assert.Equal(accepted, slot.IsReady);
     }
@@ -81,13 +86,13 @@ public sealed class HandshakeDeadlineTests
             Assert.Null(slot.udp.endPoint);
             Assert.True(firstHandle.IsClosed);
 
-            next.socket = nextSocket;
             next.StartHandshake(Deadline);
+            ServerHandle.ClientHello(slot, next, ProtocolV2.Version, slot.id, "Replacement", Deadline + 1);
+            next.socket = nextSocket;
             Server.ExpireHandshake(slot.id, first, Deadline + 1);
             Server.Disconnect(slot.id, first);
-            ServerHandle.WelcomeReceived(slot, slot.id, "Replacement", Deadline + 1);
-            Assert.False(ServerHandle.RegisterUdp(slot, firstUdp,
-                new IPEndPoint(IPAddress.Loopback, 12345), Deadline + 1));
+            Assert.False(ServerHandle.RegisterUdp(slot, first, firstUdp,
+                new IPEndPoint(IPAddress.Loopback, 12345), next.SessionToken!, Deadline + 1));
             Assert.Same(nextSocket, slot.tcp.socket);
             Assert.Same(next, slot.tcp);
             Assert.Equal("Replacement", slot.Username);
@@ -105,9 +110,10 @@ public sealed class HandshakeDeadlineTests
         var slot = new Client(int.MaxValue);
         var connection = slot.tcp;
         connection.StartHandshake(AcceptedAt);
-        ServerHandle.WelcomeReceived(slot, slot.id, "Player", AcceptedAt);
-        ServerHandle.RegisterUdp(slot, slot.udp, new IPEndPoint(IPAddress.Loopback, 12345), Deadline - 2);
-        ServerHandle.ConfirmUdp(slot, connection.UdpChallenge, Deadline - 1);
+        ServerHandle.ClientHello(slot, connection, ProtocolV2.Version, slot.id, "Player", AcceptedAt);
+        ServerHandle.RegisterUdp(slot, connection, slot.udp, new IPEndPoint(IPAddress.Loopback, 12345),
+            connection.SessionToken!, Deadline - 2);
+        ServerHandle.ConfirmUdp(slot, connection, connection.SessionToken!, slot.udp.ProbeNonce!, Deadline - 1);
         using var socket = new TcpClient();
         connection.socket = socket;
         Server.clients.Add(slot.id, slot);
@@ -135,20 +141,17 @@ public sealed class HandshakeDeadlineTests
         try
         {
             using var ready = await Peer.OpenAsync(tcpPort, token);
-            await ready.CompleteHandshakeAsync(udpPort, token);
+            await AssertRegistrationAndRetryAsync(ready, udpPort, token);
             using var silent = await Peer.OpenAsync(tcpPort, token);
             using var partial = await Peer.OpenAsync(tcpPort, token);
             using var noRegistration = await Peer.OpenAsync(tcpPort, token);
             using var noConfirmation = await Peer.OpenAsync(tcpPort, token);
             using var retrying = await Peer.OpenAsync(tcpPort, token);
 
-            byte[] partialFrame = ClientFrame(ClientPackets.welcomeReceived, packet =>
-            {
-                packet.Write(partial.SlotId);
-                packet.Write("Partial");
-            });
+            using var partialHello = ProtocolV2.CreateClientHello(partial.SlotId, "Partial");
+            byte[] partialFrame = partialHello.ToArray();
             await partial.Stream.WriteAsync(partialFrame.AsMemory(0, 10), token);
-            await noRegistration.SendWelcomeReceivedAsync(token);
+            await noRegistration.GrantSessionAsync(token);
             await noRegistration.SendAsync(ClientPackets.createRoom, token);
             using (Packet roomError = await noRegistration.ReadAsync(ServerPackets.roomError, token))
                 Assert.Equal((int)RoomError.NotReady, roomError.ReadInt());
@@ -179,10 +182,25 @@ public sealed class HandshakeDeadlineTests
             using var replacement = await Peer.OpenAsync(tcpPort, token);
             Assert.Equal(silent.SlotId, replacement.SlotId);
             await replacement.CompleteHandshakeAsync(udpPort, token);
-            await AssertRoomCanStartAsync(ready, replacement, token);
+            var firstRoom = await StartRoomAsync(ready, replacement, token);
 
-            ready.Dispose();
+            using var otherHost = await Peer.OpenAsync(tcpPort, token);
+            await otherHost.CompleteHandshakeAsync(udpPort, token);
+            using var otherMember = await Peer.OpenAsync(tcpPort, token);
+            await otherMember.CompleteHandshakeAsync(udpPort, token);
+            var secondRoom = await StartRoomAsync(otherHost, otherMember, token);
+            Assert.NotEqual(firstRoom.Id, secondRoom.Id);
+            await AssertMovementAsync(ready, replacement, otherMember, udpPort, firstRoom, token);
+            await otherHost.SendMovementAsync(secondRoom.Id, secondRoom.Round, secondRoom.X + 0.125f,
+                secondRoom.Y, otherHost.SessionToken, otherHost.Udp, token);
+            await AssertUdpPositionAsync(otherMember, otherHost, secondRoom.Id, secondRoom.Round,
+                secondRoom.X + 0.125f, secondRoom.Y, token);
+            await AssertUdpQuietAsync(replacement.Udp, token);
+
+            await AssertSameEndpointReconnectAsync(ready, tcpPort, token);
             replacement.Dispose();
+            otherHost.Dispose();
+            otherMember.Dispose();
             while (Server.LatestMetrics is not { ConnectedClients: 0, ReadyClients: 0, RoomCount: 0 })
                 await Task.Delay(50, token);
         }
@@ -192,7 +210,31 @@ public sealed class HandshakeDeadlineTests
         }
     }
 
-    private static async Task AssertRoomCanStartAsync(Peer ready, Peer replacement, CancellationToken token)
+    private static async Task AssertRegistrationAndRetryAsync(Peer peer, int port, CancellationToken token)
+    {
+        await peer.GrantSessionAsync(token);
+        using var wrongEndpoint = new UdpClient();
+        wrongEndpoint.Connect(IPAddress.Loopback, port);
+        using var wrong = ProtocolV2.CreateUdpRegistration(peer.SlotId, Alter(peer.SessionToken));
+        await wrongEndpoint.SendAsync(wrong.ToArray(), token);
+        await AssertUdpQuietAsync(wrongEndpoint, token);
+
+        peer.Udp.Connect(IPAddress.Loopback, port);
+        using var valid = ProtocolV2.CreateUdpRegistration(peer.SlotId, peer.SessionToken);
+        byte[] malformed = valid.ToArray();
+        malformed[^1] ^= 1;
+        await peer.Udp.SendAsync(malformed, token);
+        await AssertUdpQuietAsync(peer.Udp, token);
+
+        byte[] nonce = await peer.RegisterUdpAsync(token);
+        Assert.Equal(nonce, await peer.RegisterUdpAsync(token));
+        await wrongEndpoint.SendAsync(valid.ToArray(), token);
+        await AssertUdpQuietAsync(wrongEndpoint, token);
+        await peer.ConfirmAsync(nonce, token);
+    }
+
+    private static async Task<(int Id, int Round, float X, float Y)> StartRoomAsync(
+        Peer ready, Peer replacement, CancellationToken token)
     {
         await ready.SendAsync(ClientPackets.createRoom, token);
         using Packet created = await ready.ReadAsync(ServerPackets.roomChanged, token);
@@ -209,8 +251,88 @@ public sealed class HandshakeDeadlineTests
         });
         using Packet started = await ready.ReadAsync(ServerPackets.roundBegin, token, skipMatchState: true);
         Assert.Equal(room, started.ReadInt());
-        Assert.Equal(1, started.ReadInt());
+        int round = started.ReadInt();
+        Assert.Equal(1, round);
         Assert.Equal(2, started.ReadInt());
+        using (Packet map = await ready.ReadAsync(ServerPackets.mapData, token))
+            Assert.Equal(room, map.ReadInt());
+        using Packet spawn = await ready.ReadAsync(ServerPackets.spawnPlayer, token);
+        Assert.Equal(room, spawn.ReadInt());
+        Assert.Equal(round, spawn.ReadInt());
+        Assert.Equal(ready.SlotId, spawn.ReadInt());
+        float x = spawn.ReadFloat();
+        float y = spawn.ReadFloat();
+        using (Packet otherSpawn = await ready.ReadAsync(ServerPackets.spawnPlayer, token))
+            Assert.Equal(room, otherSpawn.ReadInt());
+        using (Packet match = await ready.ReadAsync(ServerPackets.matchState, token))
+            Assert.Equal(room, match.ReadInt());
+        return (room, round, x, y);
+    }
+
+    private static async Task AssertMovementAsync(Peer mover, Peer recipient, Peer otherRoom, int udpPort,
+        (int Id, int Round, float X, float Y) room, CancellationToken token)
+    {
+        using var wrongEndpoint = new UdpClient();
+        wrongEndpoint.Connect(IPAddress.Loopback, udpPort);
+        await mover.SendMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
+            mover.SessionToken, wrongEndpoint, token);
+        await mover.SendMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
+            Alter(mover.SessionToken), mover.Udp, token);
+        await mover.SendMovementAsync(room.Id, room.Round + 1, room.X + 0.0625f, room.Y,
+            mover.SessionToken, mover.Udp, token);
+        await AssertUdpQuietAsync(recipient.Udp, token);
+
+        float x = room.X + 0.125f;
+        await mover.SendMovementAsync(room.Id, room.Round, x, room.Y, mover.SessionToken, mover.Udp, token);
+        await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, x, room.Y, token);
+        await AssertUdpQuietAsync(otherRoom.Udp, token);
+
+        await mover.SendMovementAsync(room.Id, room.Round, 999f, 999f, mover.SessionToken, mover.Udp, token);
+        using Packet correction = await mover.ReadAsync(ServerPackets.playerPosition, token);
+        Assert.Equal((room.Id, room.Round, mover.SlotId, x, room.Y),
+            (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(), correction.ReadFloat(), correction.ReadFloat()));
+    }
+
+    private static async Task AssertUdpPositionAsync(Peer recipient, Peer mover, int room, int round,
+        float x, float y, CancellationToken token)
+    {
+        using Packet packet = ProtocolV2.OpenServerDatagram((await recipient.Udp.ReceiveAsync(token)).Buffer);
+        var position = ProtocolV2.ReadUdpPlayerPosition(packet);
+        Assert.Equal(recipient.SessionToken, position.Token);
+        Assert.Equal((room, round, mover.SlotId, x, y),
+            (position.RoomId, position.RoundId, position.PlayerId, position.X, position.Y));
+    }
+
+    private static async Task AssertSameEndpointReconnectAsync(Peer original, int tcpPort, CancellationToken token)
+    {
+        original.CloseTcp();
+        while (Server.LatestMetrics?.ConnectedClients != 3)
+            await Task.Delay(50, token);
+
+        using var replacement = await Peer.OpenAsync(tcpPort, token, original.Udp);
+        Assert.Equal(original.SlotId, replacement.SlotId);
+        await replacement.GrantSessionAsync(token);
+        Assert.False(replacement.SessionToken.AsSpan().SequenceEqual(original.SessionToken));
+
+        using var stale = ProtocolV2.CreateUdpRegistration(original.SlotId, original.SessionToken);
+        await original.Udp.SendAsync(stale.ToArray(), token);
+        await AssertUdpQuietAsync(original.Udp, token);
+        await replacement.ConfirmAsync(await replacement.RegisterUdpAsync(token), token);
+    }
+
+    private static async Task AssertUdpQuietAsync(UdpClient udp, CancellationToken token)
+    {
+        using var wait = CancellationTokenSource.CreateLinkedTokenSource(token);
+        wait.CancelAfter(TimeSpan.FromMilliseconds(250));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await udp.ReceiveAsync(wait.Token));
+        token.ThrowIfCancellationRequested();
+    }
+
+    private static byte[] Alter(byte[] token)
+    {
+        byte[] different = (byte[])token.Clone();
+        different[0] ^= 1;
+        return different;
     }
 
     private static byte[] ClientFrame(ClientPackets type, Action<Packet>? write)
@@ -237,20 +359,29 @@ public sealed class HandshakeDeadlineTests
     private sealed class Peer : IDisposable
     {
         private readonly TcpClient tcp = new();
-        private readonly UdpClient udp = new();
+        internal readonly UdpClient Udp;
         private readonly long started = Stopwatch.GetTimestamp();
         internal NetworkStream Stream => tcp.GetStream();
         internal int SlotId { get; private set; }
+        internal byte[] SessionToken { get; private set; } = null!;
+        private readonly bool ownsUdp;
 
-        internal static async Task<Peer> OpenAsync(int port, CancellationToken token)
+        private Peer(UdpClient? reuseUdp)
         {
-            var peer = new Peer();
+            Udp = reuseUdp ?? new UdpClient();
+            ownsUdp = reuseUdp == null;
+        }
+
+        internal static async Task<Peer> OpenAsync(int port, CancellationToken token, UdpClient? reuseUdp = null)
+        {
+            var peer = new Peer(reuseUdp);
             try
             {
                 await peer.tcp.ConnectAsync(IPAddress.Loopback, port, token);
-                using Packet welcome = await peer.ReadAsync(ServerPackets.welcome, token);
-                welcome.ReadString();
-                peer.SlotId = welcome.ReadInt();
+                using Packet hello = await peer.ReadAsync(ServerPackets.serverHello, token, leaveId: true);
+                var server = ProtocolV2.ReadServerHello(hello);
+                Assert.Equal(ProtocolV2.Version, server.Version);
+                peer.SlotId = server.SlotId;
                 return peer;
             }
             catch
@@ -269,42 +400,47 @@ public sealed class HandshakeDeadlineTests
         internal Task SendAsync(ClientPackets type, CancellationToken token, Action<Packet>? write = null) =>
             Stream.WriteAsync(ClientFrame(type, write), token).AsTask();
 
-        internal Task SendWelcomeReceivedAsync(CancellationToken token) =>
-            SendAsync(ClientPackets.welcomeReceived, token, packet =>
-            {
-                packet.Write(SlotId);
-                packet.Write($"Peer{SlotId}");
-            });
-
-        internal async Task<int> BeginUdpAsync(int port, CancellationToken token)
+        internal async Task GrantSessionAsync(CancellationToken cancellation)
         {
-            await SendWelcomeReceivedAsync(token);
-            udp.Connect(IPAddress.Loopback, port);
-            using var stopRetries = CancellationTokenSource.CreateLinkedTokenSource(token);
-            Task retries = RepeatRegistrationAsync(stopRetries.Token);
-            try
-            {
-                using var probe = new Packet((await udp.ReceiveAsync(token)).Buffer);
-                probe.DecryptPayload();
-                probe.ReadInt();
-                Assert.Equal((int)ServerPackets.udpProbe, probe.ReadInt());
-                return probe.ReadInt();
-            }
-            finally
-            {
-                stopRetries.Cancel();
-                await retries;
-            }
+            using var hello = ProtocolV2.CreateClientHello(SlotId, $"Peer{SlotId}");
+            await Stream.WriteAsync(hello.ToArray(), cancellation);
+            using Packet granted = await ReadAsync(ServerPackets.sessionGranted, cancellation, leaveId: true);
+            SessionToken = ProtocolV2.ReadSessionGranted(granted);
+        }
+
+        internal async Task<byte[]> BeginUdpAsync(int port, CancellationToken token)
+        {
+            await GrantSessionAsync(token);
+            Udp.Connect(IPAddress.Loopback, port);
+            return await RegisterUdpAsync(token);
+        }
+
+        internal async Task<byte[]> RegisterUdpAsync(CancellationToken token)
+        {
+            using var registration = ProtocolV2.CreateUdpRegistration(SlotId, SessionToken);
+            await Udp.SendAsync(registration.ToArray(), token);
+            using var packet = ProtocolV2.OpenServerDatagram((await Udp.ReceiveAsync(token)).Buffer);
+            var probe = ProtocolV2.ReadUdpProbe(packet);
+            Assert.Equal(SessionToken, probe.Token);
+            return probe.Nonce;
+        }
+
+        internal async Task SendMovementAsync(int room, int round, float x, float y, byte[] token,
+            UdpClient sender, CancellationToken cancellation)
+        {
+            using var movement = ProtocolV2.CreateUdpPlayerMovement(SlotId, token, room, round, x, y);
+            await sender.SendAsync(movement.ToArray(), cancellation);
         }
 
         internal async Task RepeatRegistrationAsync(CancellationToken token)
         {
-            byte[] registration = BitConverter.GetBytes(SlotId);
+            using var packet = ProtocolV2.CreateUdpRegistration(SlotId, SessionToken);
+            byte[] registration = packet.ToArray();
             try
             {
                 while (!token.IsCancellationRequested)
                 {
-                    await udp.SendAsync(registration, token);
+                    await Udp.SendAsync(registration, token);
                     await Task.Delay(100, token);
                 }
             }
@@ -313,13 +449,21 @@ public sealed class HandshakeDeadlineTests
 
         internal async Task CompleteHandshakeAsync(int udpPort, CancellationToken token)
         {
-            int challenge = await BeginUdpAsync(udpPort, token);
-            await SendAsync(ClientPackets.udpReady, token, packet => packet.Write(challenge));
-            using Packet ready = await ReadAsync(ServerPackets.lobbyReady, token);
+            byte[] nonce = await BeginUdpAsync(udpPort, token);
+            await ConfirmAsync(nonce, token);
+        }
+
+        internal async Task ConfirmAsync(byte[] nonce, CancellationToken token)
+        {
+            using var confirm = ProtocolV2.CreateUdpConfirm(SessionToken, nonce);
+            await Stream.WriteAsync(confirm.ToArray(), token);
+            using Packet ready = await ReadAsync(ServerPackets.lobbyReady, token, leaveId: true);
+            ProtocolV2.ReadLobbyReady(ready);
             Assert.Equal(0, ready.UnreadLength());
         }
 
-        internal async Task<Packet> ReadAsync(ServerPackets expected, CancellationToken token, bool skipMatchState = false)
+        internal async Task<Packet> ReadAsync(ServerPackets expected, CancellationToken token,
+            bool skipMatchState = false, bool leaveId = false)
         {
             byte[] header = new byte[4];
             while (true)
@@ -335,10 +479,11 @@ public sealed class HandshakeDeadlineTests
                 {
                     packet.DecryptPayload();
                     packet.ReadInt();
-                    var type = (ServerPackets)packet.ReadInt();
+                    var type = (ServerPackets)packet.ReadInt(false);
                     if (!skipMatchState || type != ServerPackets.matchState)
                     {
                         Assert.Equal(expected, type);
+                        if (!leaveId) packet.ReadInt();
                         return packet;
                     }
                 }
@@ -351,10 +496,12 @@ public sealed class HandshakeDeadlineTests
             }
         }
 
+        internal void CloseTcp() => tcp.Dispose();
+
         public void Dispose()
         {
             tcp.Dispose();
-            udp.Dispose();
+            if (ownsUdp) Udp.Dispose();
         }
     }
 }

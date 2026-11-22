@@ -36,8 +36,8 @@ namespace GameServer
             private readonly Queue<byte[]> pendingWrites = new();
             private bool writing;
             private volatile bool closed;
-            internal int UdpChallenge { get; } =
-                System.Security.Cryptography.RandomNumberGenerator.GetInt32(int.MaxValue);
+            // Read and written by the server update thread.
+            internal byte[]? SessionToken { get; set; }
 
             public TCP(int _id)
             {
@@ -65,7 +65,7 @@ namespace GameServer
 
                 stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
 
-                ServerSend.Welcome(this, id, "Chao mung ban den voi may chu Tiny Bomber!");
+                ServerSend.ServerHello(this, id);
             }
 
             internal void Close()
@@ -130,23 +130,32 @@ namespace GameServer
                 {
                     _packet.DecryptPayload();
 
-                    int _packetLength = _packet.ReadInt();
-                    int _packetId = _packet.ReadInt();
+                    _packet.ReadInt();
+                    int packetId = _packet.ReadInt(false);
 
-                    if (_packetId == (int)ClientPackets.welcomeReceived)
+                    if (packetId == (int)ClientPackets.clientHello)
                     {
-                        int _clientIdCheck = _packet.ReadInt();
-                        string _username = _packet.ReadString();
-
-                        EnqueueCurrent(slot => ServerHandle.WelcomeReceived(slot, _clientIdCheck, _username));
+                        var hello = ProtocolV2.ReadClientHello(_packet);
+                        EnqueueCurrent(slot => ServerHandle.ClientHello(slot, this, hello.Version, hello.SlotId, hello.Username));
+                        return;
                     }
-                    else if (_packetId == (int)ClientPackets.placeBomb)
+                    if (packetId == (int)ClientPackets.udpConfirm)
+                    {
+                        var confirm = ProtocolV2.ReadUdpConfirm(_packet);
+                        EnqueueCurrent(slot => ServerHandle.ConfirmUdp(slot, this, confirm.Token, confirm.Nonce));
+                        return;
+                    }
+                    if (packetId is (int)ClientPackets.welcomeReceived or (int)ClientPackets.udpReady)
+                        throw new InvalidDataException("Legacy v1 handshake packet on a v2 connection.");
+
+                    _packet.ReadInt();
+                    if (packetId == (int)ClientPackets.placeBomb)
                     {
                         int roomId = _packet.ReadInt();
                         int roundId = _packet.ReadInt();
                         EnqueueCurrent(slot => slot.Room?.PlaceBomb(slot, roomId, roundId));
                     }
-                    else if (_packetId == (int)ClientPackets.playerMovement)
+                    else if (packetId == (int)ClientPackets.playerMovement)
                     {
                         int roomId = _packet.ReadInt();
                         int roundId = _packet.ReadInt();
@@ -154,27 +163,22 @@ namespace GameServer
                         float _y = _packet.ReadFloat();
                         EnqueueCurrent(slot => ServerHandle.PlayerMovement(slot, roomId, roundId, _x, _y));
                     }
-                    else if (_packetId == (int)ClientPackets.udpReady)
-                    {
-                        int challenge = _packet.ReadInt();
-                        EnqueueCurrent(slot => ServerHandle.ConfirmUdp(slot, challenge));
-                    }
-                    else if (_packetId == (int)ClientPackets.requestStart)
+                    else if (packetId == (int)ClientPackets.requestStart)
                     {
                         int roomId = _packet.ReadInt();
                         int roundId = _packet.ReadInt();
                         EnqueueCurrent(slot => slot.Room?.StartRound(slot, roomId, roundId));
                     }
-                    else if (_packetId == (int)ClientPackets.createRoom)
+                    else if (packetId == (int)ClientPackets.createRoom)
                     {
                         EnqueueCurrent(ServerHandle.CreateRoom);
                     }
-                    else if (_packetId == (int)ClientPackets.joinRoom)
+                    else if (packetId == (int)ClientPackets.joinRoom)
                     {
                         int roomId = _packet.ReadInt();
                         EnqueueCurrent(slot => ServerHandle.JoinRoom(slot, roomId));
                     }
-                    else if (_packetId == (int)ClientPackets.leaveRoom)
+                    else if (packetId == (int)ClientPackets.leaveRoom)
                     {
                         int roomId = _packet.ReadInt();
                         EnqueueCurrent(slot => ServerHandle.LeaveRoom(slot, roomId));
@@ -218,6 +222,7 @@ namespace GameServer
         public class UDP
         {
             public volatile IPEndPoint? endPoint;
+            internal byte[]? ProbeNonce { get; private set; }
             private readonly int id;
 
             public UDP(int _id)
@@ -227,6 +232,7 @@ namespace GameServer
 
             public void Connect(IPEndPoint _endPoint)
             {
+                ProbeNonce = ProtocolV2.NewProbeNonce();
                 endPoint = _endPoint;
                 Console.WriteLine($"[UDP] Client {id} UDP endpoint discovered: {endPoint}");
             }
@@ -237,39 +243,6 @@ namespace GameServer
                 if (recipient != null) Server.SendUDPData(recipient, _packet);
             }
 
-            public void HandleData(byte[] _packetData)
-            {
-                try
-                {
-                    using (Packet _packet = new Packet(_packetData))
-                    {
-                        _packet.DecryptPayload();
-
-                        int _packetLength = _packet.ReadInt();
-                        int _packetId = _packet.ReadInt();
-
-                        if (_packetId == (int)ClientPackets.playerMovement)
-                        {
-                            // Bóc tách dữ liệu nguyên thủy ngay trên luồng mạng trước khi Packet bị Dispose
-                            int roomId = _packet.ReadInt();
-                            int roundId = _packet.ReadInt();
-                            float _x = _packet.ReadFloat();
-                            float _y = _packet.ReadFloat();
-
-                            ThreadManager.EnqueueAction(() =>
-                            {
-                                Client slot = Server.clients[id];
-                                if (slot.udp != this) return;
-                                ServerHandle.PlayerMovement(slot, roomId, roundId, _x, _y);
-                            });
-                        }
-                    }
-                }
-                catch (Exception _ex)
-                {
-                    Console.WriteLine($"[ERROR] Loi giai ma/xu ly UDP tu Client {id}: {_ex.Message}");
-                }
-            }
         }
     }
 }
