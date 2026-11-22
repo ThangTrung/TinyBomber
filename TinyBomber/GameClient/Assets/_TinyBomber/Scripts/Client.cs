@@ -36,14 +36,22 @@ public class Client : MonoBehaviour
 
     private void Update()
     {
+        long now = Stopwatch.GetTimestamp();
             if (IsConnecting)
             {
-                if (!CheckHandshakeDeadline()) udp?.RetryRegistration();
+            if (CheckHandshakeDeadline()) return;
+            udp?.UpdateReceive(now);
+            udp?.RetryRegistration();
             }
-            else if (tcp != null && tcp.Heartbeat.HasExpired(Stopwatch.GetTimestamp()))
+        else if (tcp != null && tcp.Heartbeat.HasExpired(now))
             {
                 Disconnect("Máy chủ không phản hồi heartbeat.");
             }
+        else if (udp != null)
+        {
+            udp.UpdateReceive(now);
+            udp.UpdateHealth(now);
+        }
     }
 
     private bool CheckHandshakeDeadline()
@@ -129,7 +137,9 @@ public class Client : MonoBehaviour
         if (CheckHandshakeDeadline()) return;
 
         IsConnecting = false;
-        tcp.Heartbeat.Start(Stopwatch.GetTimestamp());
+        long now = Stopwatch.GetTimestamp();
+        tcp.Heartbeat.Start(now);
+        udp?.StartHealth(now);
         GameManager.instance.ConfirmLobbyReady();
     }
 
@@ -450,10 +460,11 @@ public class Client : MonoBehaviour
         private readonly IPEndPoint serverEndPoint;
         private readonly TCP connection;
         private volatile bool closed;
+        private volatile bool socketUnavailable;
         private float nextRegistrationAt;
-        private long healthSequence;
-        private long? healthDeadline;
-        internal long LastConfirmedHealthSequence { get; private set; }
+        private long? receiveRetryAt;
+        private long nextSendErrorLogAt;
+        private readonly UdpHealthMonitor health = new UdpHealthMonitor();
 
         public void Close()
         {
@@ -471,7 +482,7 @@ public class Client : MonoBehaviour
         {
             socket = new UdpClient(0);
             socket.Connect(serverEndPoint);
-            socket.BeginReceive(ReceiveCallback, null);
+            ArmReceive();
 
             RetryRegistration();
         }
@@ -485,58 +496,127 @@ public class Client : MonoBehaviour
             SendData(packet);
         }
 
-        // Explicit request from the main thread. Periodic health checks are owned by a later change.
-        internal bool TrySendHealthProbe()
-        {
-            if (closed || socket == null || instance == null || instance.udp != this || instance.tcp != connection ||
-                instance.IsConnecting || connection.SessionToken is not byte[] token) return false;
+        internal void StartHealth(long now) => health.Start(now);
 
-            long now = Stopwatch.GetTimestamp();
-            if (healthDeadline is long deadline && now < deadline) return false;
-            healthSequence = checked(healthSequence + 1);
-            healthDeadline = now + 5 * Stopwatch.Frequency;
-            using var probe = ProtocolV3.CreateUdpHealthProbe(instance.myId, token, healthSequence);
-            SendData(probe);
-            return true;
+        internal void UpdateHealth(long now)
+        {
+            health.Advance(now);
+            TrySendHealthProbe(now, scheduled: true);
+            PublishHealth();
         }
 
-        public void SendData(Packet _packet)
+        internal bool TrySendHealthProbe() => TrySendHealthProbe(Stopwatch.GetTimestamp(), scheduled: false);
+
+        private bool TrySendHealthProbe(long now, bool scheduled)
         {
+            if (!IsCurrent() || instance.IsConnecting || connection.SessionToken is not byte[] token ||
+                health.BeginProbe(now, scheduled) is not long sequence) return false;
+
+            using var probe = ProtocolV3.CreateUdpHealthProbe(instance.myId, token, sequence);
+            if (TrySendData(probe))
+            {
+                health.RecordProbeSent();
+                return true;
+            }
+            health.AbandonProbe(sequence);
+            return false;
+        }
+
+        public void SendData(Packet packet) => TrySendData(packet);
+
+        private bool TrySendData(Packet packet)
+        {
+            if (closed || socketUnavailable || socket == null) return false;
             try
             {
-                if (!closed && socket != null)
+                byte[] frame = packet.ToArray();
+                socket.BeginSend(frame, frame.Length, null, null);
+                return true;
+            }
+            catch (ObjectDisposedException) { MarkSocketUnavailable(); }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.NotSocket) { MarkSocketUnavailable(); }
+            catch (Exception ex)
+            {
+                long now = Stopwatch.GetTimestamp();
+                if (now >= nextSendErrorLogAt)
                 {
-                    byte[] frame = _packet.ToArray();
-                    socket.BeginSend(frame, frame.Length, null, null);
+                    nextSendErrorLogAt = now + 5 * Stopwatch.Frequency;
+                    Debug.LogWarning($"Lỗi gửi UDP: {ex.Message}");
                 }
             }
-            catch (Exception _ex)
-            {
-                Debug.Log($"Lỗi gửi UDP: {_ex}");
-            }
+            return false;
         }
 
         private void ReceiveCallback(IAsyncResult _result)
         {
+            byte[] data;
             try
             {
                 IPEndPoint sender = null;
-                byte[] _data = socket.EndReceive(_result, ref sender);
-                if (closed) return;
-                socket.BeginReceive(ReceiveCallback, null);
-
-                if (_data.Length < 4) return;
-
-                ThreadManager.ExecuteOnMainThread(() =>
-                {
-                    if (closed || instance == null || instance.udp != this || instance.tcp != connection) return;
-                    HandleData(_data);
-                });
+                data = socket.EndReceive(_result, ref sender);
             }
-            catch (Exception _ex)
+            catch (Exception ex)
             {
-                if (!closed) Debug.Log($"Lỗi nhận UDP: {_ex}");
+                ScheduleReceiveRecovery(ex);
+                return;
             }
+
+            ArmReceive();
+            if (data.Length < 4) return;
+            ThreadManager.ExecuteOnMainThread(() =>
+            {
+                if (IsCurrent() && !socketUnavailable) HandleData(data);
+            });
+        }
+
+        private void ArmReceive()
+        {
+            if (closed || socketUnavailable) return;
+            try { socket.BeginReceive(ReceiveCallback, null); }
+            catch (Exception ex) { ScheduleReceiveRecovery(ex); }
+        }
+
+        internal void UpdateReceive(long now)
+        {
+            if (!IsCurrent() || receiveRetryAt is not long retryAt || now < retryAt) return;
+            receiveRetryAt = null;
+            ArmReceive();
+        }
+
+        private void ScheduleReceiveRecovery(Exception error)
+        {
+            if (closed || socketUnavailable) return;
+            ThreadManager.ExecuteOnMainThread(() =>
+            {
+                if (!IsCurrent() || socketUnavailable) return;
+                if (error is SocketException ex && IsRecoverableReceiveError(ex.SocketErrorCode))
+                    receiveRetryAt = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
+                else
+                    MarkSocketUnavailable();
+            });
+        }
+
+        private static bool IsRecoverableReceiveError(SocketError error) => error is
+            SocketError.ConnectionReset or SocketError.ConnectionRefused or SocketError.TimedOut or
+            SocketError.Interrupted or SocketError.NetworkDown or SocketError.NetworkReset or SocketError.NetworkUnreachable or
+            SocketError.HostUnreachable or SocketError.NoBufferSpaceAvailable or SocketError.WouldBlock or SocketError.MessageSize;
+
+        private bool IsCurrent() => !closed && instance != null && instance.udp == this && instance.tcp == connection;
+
+        private void MarkSocketUnavailable()
+        {
+            if (!IsCurrent() || socketUnavailable) return;
+            socketUnavailable = true;
+            receiveRetryAt = null;
+            health.MarkSocketUnavailable();
+            socket?.Close();
+            PublishHealth();
+        }
+
+        private void PublishHealth()
+        {
+            if (!instance.IsConnecting && GameManager.instance)
+                GameManager.instance.SetUdpHealth(health.IsDegraded, health.SocketUnavailable);
         }
 
         private void HandleData(byte[] data)
@@ -566,11 +646,7 @@ public class Client : MonoBehaviour
                     case ServerPackets.udpHealthEcho:
                         var echo = ProtocolV3.ReadUdpHealthEcho(packet);
                         if (!instance.IsConnecting && echo.Token.AsSpan().SequenceEqual(token) &&
-                            healthDeadline is long deadline && Stopwatch.GetTimestamp() < deadline && echo.Sequence == healthSequence)
-                        {
-                            healthDeadline = null;
-                            LastConfirmedHealthSequence = echo.Sequence;
-                        }
+                            health.AcceptEcho(echo.Sequence, Stopwatch.GetTimestamp())) PublishHealth();
                         break;
                 }
             }

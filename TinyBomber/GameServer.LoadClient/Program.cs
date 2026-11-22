@@ -161,6 +161,7 @@ internal static class Program
         finally
         {
             var states = clients.Select(client => client.ReadState()).ToArray();
+            var udpHealth = clients.Select(client => client.ReadUdpHealth()).ToArray();
             var counts = clients.Select(client => client.Trace.Read()).ToArray();
             var reports = clients.Select((_, i) => new
                 { ClientId = states[i].Id, states[i].RoomId, states[i].RoundId, counts[i].FirstMatch })
@@ -206,6 +207,18 @@ internal static class Program
                 ProcessWorkingSetBytes = workingSetBytes,
                 Errors = errors.Counts(),
                 ErrorDetails = errors.Details(),
+                UdpHealth = new
+                {
+                    ProbesSent = udpHealth.Sum(health => health.ProbesSent),
+                    EchoesAccepted = udpHealth.Sum(health => health.EchoesAccepted),
+                    ProbesExpired = udpHealth.Sum(health => health.ProbesExpired),
+                    Degradations = udpHealth.Sum(health => health.Degradations),
+                    Recoveries = udpHealth.Sum(health => health.Recoveries),
+                    SendErrors = udpHealth.Sum(health => health.SendErrors),
+                    ReceiveErrors = udpHealth.Sum(health => health.ReceiveErrors),
+                    DegradedClients = udpHealth.Count(health => health.IsDegraded),
+                    UnavailableSockets = udpHealth.Count(health => health.SocketUnavailable)
+                },
                 MovementExamples = reports
             };
             Console.WriteLine(JsonSerializer.Serialize(summary, new JsonSerializerOptions { WriteIndented = true }));

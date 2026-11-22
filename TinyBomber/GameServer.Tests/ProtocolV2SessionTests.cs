@@ -215,6 +215,14 @@ public sealed class ProtocolV2SessionTests
                 await ConfirmLoadClientAsync(tcp.GetStream(), firstToken, firstNonce, token);
                 await connect.WaitAsync(token);
                 Assert.True(ReadReady(first));
+
+                var checkedHealth = (Task<bool>)Invoke(first, "ProbeUdpHealthAsync", token)!;
+                var health = await ReadHealthProbeAsync(udp, token);
+                Assert.Equal(endpoint, health.Endpoint);
+                using var echo = ProtocolV3.CreateUdpHealthEcho(firstToken, health.Sequence);
+                await udp.SendAsync(echo.ToArray(), endpoint, token);
+                Assert.True(await checkedHealth.WaitAsync(token));
+                Assert.Equal(1L, ReadHealth<long>(first, "EchoesAccepted"));
             }
 
             await using IAsyncDisposable replacement = NewLoadClient(clientAssembly, token);
@@ -233,6 +241,18 @@ public sealed class ProtocolV2SessionTests
             await ConfirmLoadClientAsync(stream, nextToken, nextNonce, token);
             await reconnect.WaitAsync(token);
             Assert.True(ReadReady(replacement));
+            Assert.Equal(0L, ReadHealth<long>(replacement, "EchoesAccepted"));
+            Assert.False(ReadHealth<bool>(replacement, "IsDegraded"));
+
+            var replacementHealth = (Task<bool>)Invoke(replacement, "ProbeUdpHealthAsync", token)!;
+            var newHealth = await ReadHealthProbeAsync(udp, token);
+            Assert.Equal((nextEndpoint, 1L), (newHealth.Endpoint, newHealth.Sequence));
+            using var retiredEcho = ProtocolV3.CreateUdpHealthEcho(firstToken, newHealth.Sequence);
+            Invoke(replacement, "HandleUdpPacket", retiredEcho.ToArray());
+            Assert.False(replacementHealth.IsCompleted);
+            using var currentEcho = ProtocolV3.CreateUdpHealthEcho(nextToken, newHealth.Sequence);
+            await udp.SendAsync(currentEcho.ToArray(), nextEndpoint, token);
+            Assert.True(await replacementHealth.WaitAsync(token));
 
             await SendServerPacketAsync(stream, ServerPackets.roomChanged, new[] { room }, token);
             await SendServerPacketAsync(stream, ServerPackets.roundBegin, new[] { room, round, 2, slot, actor }, token);
@@ -425,6 +445,228 @@ public sealed class ProtocolV2SessionTests
         Assert.True(ReadReady(client));
     }
 
+    [Fact]
+    [Trait("Category", "LoadClientIntegration")]
+    public async Task PeriodicUdpLossDegradesAndRecoversWithoutLeavingTcpSessionOrRound()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(35));
+        CancellationToken token = timeout.Token;
+        var address = IPAddress.Parse("127.0.0.3");
+        using var udp = new UdpClient(new IPEndPoint(address, Constants.UDP_PORT));
+        using var listener = new TcpListener(address, Constants.PORT);
+        listener.Start();
+        var peers = new Dictionary<IPEndPoint, (IAsyncDisposable Client, TcpClient Tcp, int Slot, byte[] Session)>();
+        var clients = new List<IAsyncDisposable>();
+        var sockets = new List<TcpClient>();
+        const int room = 9;
+        const int round = 1;
+        try
+        {
+            // Relay policies by slot: drop outbound, drop inbound, drop both.
+            for (int slot = 1; slot <= 3; slot++)
+            {
+                var client = NewLoadClient(LoadClientAssembly(), token);
+                clients.Add(client);
+                Task connect = (Task)Invoke(client, "ConnectAsync", address)!;
+                TcpClient tcp = await listener.AcceptTcpClientAsync(token);
+                sockets.Add(tcp);
+                byte[] session = ProtocolV2.NewSessionToken();
+                byte[] nonce = ProtocolV2.NewProbeNonce();
+                NetworkStream stream = tcp.GetStream();
+                IPEndPoint endpoint = await GrantLoadClientAsync(stream, udp, slot, session, token);
+                using (var probe = ProtocolV2.CreateUdpProbe(session, nonce))
+                    await udp.SendAsync(probe.ToArray(), endpoint, token);
+                await ConfirmLoadClientAsync(stream, session, nonce, token);
+                await connect.WaitAsync(token);
+                peers.Add(endpoint, (client, tcp, slot, session));
+                await SendServerPacketAsync(stream, ServerPackets.roomChanged, [room], token);
+                await SendServerPacketAsync(stream, ServerPackets.roundBegin, [room, round, 3, 1, 2, 3], token);
+                await SendServerPacketAsync(stream, ServerPackets.matchState, [room, round, (int)MatchPhase.Playing, 3, 0], token);
+            }
+
+            for (long sequence = 1; sequence <= 3; sequence++)
+            {
+                foreach (var peer in peers.Values)
+                    await ExchangeHeartbeatAsync(peer.Tcp.GetStream(), sequence, token);
+
+                var seen = new HashSet<IPEndPoint>();
+                for (int i = 0; i < peers.Count; i++)
+                {
+                    var datagram = await udp.ReceiveAsync(token);
+                    Assert.True(seen.Add(datagram.RemoteEndPoint));
+                    var peer = peers[datagram.RemoteEndPoint];
+                    bool dropProbe = peer.Slot is 1 or 3;
+                    bool dropEcho = peer.Slot is 2 or 3;
+                    if (!dropProbe)
+                    {
+                        using Packet packet = ProtocolV2.OpenClientDatagram(datagram.Buffer, out int slotId);
+                        var health = ProtocolV3.ReadUdpHealthProbe(packet);
+                        Assert.Equal(peer.Slot, slotId);
+                        Assert.Equal(peer.Session, health.Token);
+                        Assert.Equal(sequence, health.Sequence);
+                        using var echo = ProtocolV3.CreateUdpHealthEcho(peer.Session, sequence);
+                        if (!dropEcho) await udp.SendAsync(echo.ToArray(), datagram.RemoteEndPoint, token);
+                    }
+                    Assert.True(ReadReady(peer.Client));
+                }
+            }
+
+            Assert.All(clients, client =>
+            {
+                Assert.True(ReadHealth<bool>(client, "IsDegraded"));
+                Assert.Equal(0L, ReadHealth<long>(client, "EchoesAccepted"));
+                Assert.Equal(1L, ReadHealth<long>(client, "Degradations"));
+            });
+
+            for (int i = 0; i < peers.Count; i++)
+            {
+                var request = await ReadHealthProbeAsync(udp, token);
+                var peer = peers[request.Endpoint];
+                Assert.Equal((peer.Slot, 4L), (request.Slot, request.Sequence));
+                Assert.Equal(peer.Session, request.Token);
+                using var echo = ProtocolV3.CreateUdpHealthEcho(peer.Session, request.Sequence);
+                await udp.SendAsync(echo.ToArray(), request.Endpoint, token);
+            }
+
+            foreach (var peer in peers.Values)
+            {
+                while (ReadHealth<bool>(peer.Client, "IsDegraded")) await Task.Delay(5, token);
+                Assert.Equal(1L, ReadHealth<long>(peer.Client, "Recoveries"));
+                Assert.Equal(1L, ReadHealth<long>(peer.Client, "EchoesAccepted"));
+                Assert.True(ReadReady(peer.Client));
+                object state = Invoke(peer.Client, "ReadState")!;
+                Assert.Equal((room, round, MatchPhase.Playing), ((int)ReadProperty(state, "RoomId"),
+                    (int)ReadProperty(state, "RoundId"), (MatchPhase)ReadProperty(state, "Phase")));
+                await ExchangeHeartbeatAsync(peer.Tcp.GetStream(), 4, token);
+            }
+
+            var sender = peers.First();
+            var observer = peers.Skip(1).First();
+            const float x = 1.0625f;
+            const float y = 1f;
+            object trace = ReadProperty(observer.Value.Client, "Trace");
+            Type positionType = LoadClientAssembly().GetType("GameServer.LoadClient.Position", throwOnError: true)!;
+            object origin = Activator.CreateInstance(positionType, 1f, y)!;
+            object target = Activator.CreateInstance(positionType, x, y)!;
+            Invoke(trace, "Prepare", origin, target, true);
+            Invoke(trace, "MarkSent", target, 0d);
+            Invoke(observer.Value.Client, "Watch", sender.Value.Slot, trace);
+            using var movement = ProtocolV2.CreateUdpPlayerMovement(sender.Value.Slot, sender.Value.Session, room, round, x, y);
+            await (Task)Invoke(sender.Value.Client, "SendUdpAsync", movement.ToArray(), token)!;
+            var moved = await udp.ReceiveAsync(token);
+            Assert.Equal(sender.Key, moved.RemoteEndPoint);
+            using Packet frame = ProtocolV2.OpenClientDatagram(moved.Buffer, out int actor);
+            var move = ProtocolV2.ReadUdpPlayerMovement(frame);
+            Assert.Equal(sender.Value.Slot, actor);
+            Assert.Equal(sender.Value.Session, move.Token);
+            Assert.Equal((room, round, x, y), (move.RoomId, move.RoundId, move.X, move.Y));
+            using var position = ProtocolV2.CreateUdpPlayerPosition(observer.Value.Session, room, round, actor, move.X, move.Y);
+            await udp.SendAsync(position.ToArray(), observer.Key, token);
+            while (ReadObserved(trace) == 0) await Task.Delay(5, token);
+            Assert.Equal(1, ReadObserved(trace));
+        }
+        finally
+        {
+            await Task.WhenAll(clients.Select(client => client.DisposeAsync().AsTask()));
+            foreach (var tcp in sockets) tcp.Dispose();
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "LoadClientIntegration")]
+    public async Task RecoverableUdpReceiveFailureRearmsOnceAndTerminalFailureLeavesTcpReady()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        CancellationToken token = timeout.Token;
+        var address = IPAddress.Parse("127.0.0.3");
+        using var udp = new UdpClient(new IPEndPoint(address, Constants.UDP_PORT));
+        using var listener = new TcpListener(address, Constants.PORT);
+        listener.Start();
+        int activeReads = 0;
+        int readStarts = 0;
+        int injectError = 0;
+        async ValueTask<UdpReceiveResult> Receive(UdpClient socket, CancellationToken stop)
+        {
+            if (Interlocked.Increment(ref activeReads) != 1)
+                throw new InvalidOperationException("Overlapping UDP receive.");
+            Interlocked.Increment(ref readStarts);
+            try
+            {
+                var datagram = await socket.ReceiveAsync(stop);
+                int error = Interlocked.Exchange(ref injectError, 0);
+                if (error != 0) throw new SocketException(error);
+                return datagram;
+            }
+            finally { Interlocked.Decrement(ref activeReads); }
+        }
+
+        await using var client = NewLoadClient(LoadClientAssembly(), token, Receive);
+        var connecting = (Task)Invoke(client, "ConnectAsync", address)!;
+        using TcpClient peer = await listener.AcceptTcpClientAsync(token);
+        NetworkStream stream = peer.GetStream();
+        byte[] session = ProtocolV2.NewSessionToken();
+        byte[] nonce = ProtocolV2.NewProbeNonce();
+        IPEndPoint endpoint = await GrantLoadClientAsync(stream, udp, 1, session, token);
+        using (var probe = ProtocolV2.CreateUdpProbe(session, nonce))
+            await udp.SendAsync(probe.ToArray(), endpoint, token);
+        await ConfirmLoadClientAsync(stream, session, nonce, token);
+        await connecting.WaitAsync(token);
+
+        var pending = (Task<bool>)Invoke(client, "ProbeUdpHealthAsync", token)!;
+        var health = await ReadHealthProbeAsync(udp, token);
+        using var echo = ProtocolV3.CreateUdpHealthEcho(session, health.Sequence);
+        while (Volatile.Read(ref activeReads) == 0) await Task.Delay(5, token);
+        int beforeError = Volatile.Read(ref readStarts);
+        long sentAt = Stopwatch.GetTimestamp();
+        Interlocked.Exchange(ref injectError, (int)SocketError.ConnectionReset);
+        await udp.SendAsync(echo.ToArray(), endpoint, token);
+        while (Volatile.Read(ref readStarts) == beforeError) await Task.Delay(5, token);
+        Assert.Equal(beforeError + 1, Volatile.Read(ref readStarts));
+        Assert.True(Stopwatch.GetElapsedTime(sentAt) >= TimeSpan.FromSeconds(1));
+        Assert.False(pending.IsCompleted);
+        await udp.SendAsync(echo.ToArray(), endpoint, token);
+        Assert.True(await pending.WaitAsync(token));
+        Assert.Equal(1L, ReadHealth<long>(client, "ReceiveErrors"));
+
+        var next = (Task<bool>)Invoke(client, "ProbeUdpHealthAsync", token)!;
+        var nextHealth = await ReadHealthProbeAsync(udp, token);
+        var udpHandle = ReadField<UdpClient>(client, "udp").Client.SafeHandle;
+        using var nextEcho = ProtocolV3.CreateUdpHealthEcho(session, nextHealth.Sequence);
+        Interlocked.Exchange(ref injectError, (int)SocketError.NotSocket);
+        await udp.SendAsync(nextEcho.ToArray(), endpoint, token);
+        Assert.False(await next.WaitAsync(token));
+        await ReadField<Task>(client, "receiveUdp").WaitAsync(token);
+        Assert.True(udpHandle.IsClosed);
+        Assert.Equal(0, Volatile.Read(ref activeReads));
+        Assert.Equal(2L, ReadHealth<long>(client, "ReceiveErrors"));
+        Assert.True(ReadHealth<bool>(client, "SocketUnavailable"));
+        Assert.True(ReadHealth<bool>(client, "IsDegraded"));
+        Assert.False(await (Task<bool>)Invoke(client, "ProbeUdpHealthAsync", token)!);
+        Assert.True(ReadReady(client));
+        await ExchangeHeartbeatAsync(stream, 1, token);
+        Assert.Equal(0, ReadProperty(ReadField<object>(client, "errors"), "Total"));
+    }
+
+    private static T ReadHealth<T>(IAsyncDisposable client, string field) =>
+        (T)ReadProperty(Invoke(client, "ReadUdpHealth")!, field);
+
+    private static async Task<(IPEndPoint Endpoint, int Slot, byte[] Token, long Sequence)> ReadHealthProbeAsync(
+        UdpClient udp, CancellationToken token)
+    {
+        var datagram = await udp.ReceiveAsync(token);
+        using Packet packet = ProtocolV2.OpenClientDatagram(datagram.Buffer, out int slot);
+        var health = ProtocolV3.ReadUdpHealthProbe(packet);
+        return (datagram.RemoteEndPoint, slot, health.Token, health.Sequence);
+    }
+
+    private static async Task ExchangeHeartbeatAsync(NetworkStream stream, long sequence, CancellationToken token)
+    {
+        using var ping = ProtocolV3.CreateHeartbeatPing(sequence);
+        await stream.WriteAsync(ping.ToArray(), token);
+        using var pong = await ReadFrameAsync(stream, token);
+        Assert.Equal(sequence, ProtocolV3.ReadHeartbeatPong(pong));
+    }
+
     private static Assembly LoadClientAssembly()
     {
         // Load the executable produced by a solution build without changing the test project reference graph.
@@ -437,13 +679,14 @@ public sealed class ProtocolV2SessionTests
 
     private const BindingFlags InstanceMembers = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
 
-    private static IAsyncDisposable NewLoadClient(Assembly assembly, CancellationToken token)
+    private static IAsyncDisposable NewLoadClient(Assembly assembly, CancellationToken token,
+        Func<UdpClient, CancellationToken, ValueTask<UdpReceiveResult>>? receiveDatagram = null)
     {
         Type errorType = assembly.GetType("GameServer.LoadClient.RunErrors", throwOnError: true)!;
         object errors = Activator.CreateInstance(errorType, nonPublic: true)!;
         Type clientType = assembly.GetType("GameServer.LoadClient.SimulatedClient", throwOnError: true)!;
         return (IAsyncDisposable)Activator.CreateInstance(clientType, InstanceMembers, null,
-            new[] { (object)1, errors, token }, null)!;
+            new[] { (object?)1, errors, token, receiveDatagram }, null)!;
     }
 
     private static object? Invoke(object instance, string method, params object[] args) =>

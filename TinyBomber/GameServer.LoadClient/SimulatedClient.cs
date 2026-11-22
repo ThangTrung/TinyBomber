@@ -9,12 +9,18 @@ internal readonly record struct ClientState(
     bool Connected, bool Ready, int Id, int RoomId, int RoundId, MatchPhase Phase,
     int ReadyInRoom, bool HasRoundData, bool Alive);
 
+internal readonly record struct UdpHealthStats(
+    long ProbesSent, long EchoesAccepted, long ProbesExpired, long Degradations, long Recoveries,
+    long SendErrors, long ReceiveErrors, bool IsDegraded, bool SocketUnavailable);
+
 internal sealed class SimulatedClient : IAsyncDisposable
 {
     private const int HandshakeTimeoutSeconds = 16;
     private readonly object stateLock = new();
     private readonly SemaphoreSlim tcpWriteGate = new(1, 1);
     private readonly HeartbeatWatchdog heartbeat = new();
+    private readonly UdpHealthMonitor udpHealth = new();
+    private readonly Func<UdpClient, CancellationToken, ValueTask<UdpReceiveResult>> receiveDatagram;
     private readonly CancellationTokenSource lifetime;
     private readonly RunErrors errors;
     private readonly int index;
@@ -30,14 +36,15 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private Task receiveTcp = Task.CompletedTask;
     private Task receiveUdp = Task.CompletedTask;
     private Task heartbeatMonitor = Task.CompletedTask;
+    private Task udpHealthMonitor = Task.CompletedTask;
     private long? handshakeDeadline;
     private bool ended;
     private bool clientHelloSent;
     private bool udpConfirmSent;
     private byte[]? sessionToken;
-    private long udpHealthSequence;
-    private long udpHealthDeadline;
-    private TaskCompletionSource? udpHealthEcho;
+    private TaskCompletionSource<bool>? udpHealthResponse;
+    private long udpSendErrors;
+    private long udpReceiveErrors;
     private bool connected;
     private bool ready;
     private bool alive;
@@ -53,11 +60,13 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     internal MovementTrace Trace { get; } = new();
 
-    internal SimulatedClient(int index, RunErrors errors, CancellationToken stop)
+    internal SimulatedClient(int index, RunErrors errors, CancellationToken stop,
+        Func<UdpClient, CancellationToken, ValueTask<UdpReceiveResult>>? receiveDatagram = null)
     {
         this.index = index;
         this.errors = errors;
         lifetime = CancellationTokenSource.CreateLinkedTokenSource(stop);
+        this.receiveDatagram = receiveDatagram ?? ((socket, token) => socket.ReceiveAsync(token));
     }
 
     internal ClientState ReadState()
@@ -65,6 +74,14 @@ internal sealed class SimulatedClient : IAsyncDisposable
         lock (stateLock)
             return new ClientState(connected, ready, id, roomId, roundId, phase, readyInRoom,
                 map != null && roster.Contains(id) && roster.SetEquals(spawns.Keys), alive);
+    }
+
+    internal UdpHealthStats ReadUdpHealth()
+    {
+        lock (stateLock)
+            return new UdpHealthStats(udpHealth.ProbesSent, udpHealth.EchoesAccepted, udpHealth.ProbesExpired,
+                udpHealth.Degradations, udpHealth.Recoveries, udpSendErrors, udpReceiveErrors,
+                udpHealth.IsDegraded, udpHealth.SocketUnavailable);
     }
 
     internal bool HasRoster(IEnumerable<int> ids)
@@ -232,9 +249,10 @@ internal sealed class SimulatedClient : IAsyncDisposable
             if (await udp!.SendAsync(data.AsMemory(), token).ConfigureAwait(false) != data.Length)
                 throw new IOException("UDP send chưa hoàn tất datagram.");
         }
-        catch (Exception ex) when (ex is SocketException or IOException)
+        catch (Exception ex) when (ex is SocketException or IOException or ObjectDisposedException)
         {
-            if (!token.IsCancellationRequested) Fail(ErrorKind.Send, $"UDP: {ex.Message}");
+            if (!token.IsCancellationRequested && RecordUdpError(ex, sending: true))
+                Fail(ErrorKind.Send, $"UDP: {ex.Message}");
             throw new IOException("Không gửi được UDP datagram.", ex);
         }
     }
@@ -242,44 +260,111 @@ internal sealed class SimulatedClient : IAsyncDisposable
     internal async Task<bool> ProbeUdpHealthAsync(CancellationToken token)
     {
         using var request = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
-        var response = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var response = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await SendHealthProbeAsync(scheduled: false, response, request.Token).ConfigureAwait(false);
+            return await response.Task.WaitAsync(request.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { return false; }
+    }
+
+    private async Task SendHealthProbeAsync(bool scheduled, TaskCompletionSource<bool>? response, CancellationToken token)
+    {
         UdpClient socket;
         byte[] session;
         long sequence;
         long deadline;
         lock (stateLock)
         {
-            if (ended || request.IsCancellationRequested || !ready || sessionToken == null || udp == null || udpHealthEcho != null)
-                return false;
+            long now = Stopwatch.GetTimestamp();
+            AdvanceUdpHealth(now);
+            long? started = !ended && !token.IsCancellationRequested && ready && sessionToken != null && udp != null
+                ? udpHealth.BeginProbe(now, scheduled) : null;
+            if (started is not long pending)
+            {
+                response?.TrySetResult(false);
+                return;
+            }
 
-            socket = udp;
-            session = sessionToken;
-            sequence = checked(++udpHealthSequence);
-            deadline = Stopwatch.GetTimestamp() + 5 * Stopwatch.Frequency;
-            udpHealthDeadline = deadline;
-            udpHealthEcho = response;
+            socket = udp!;
+            session = sessionToken!;
+            sequence = pending;
+            deadline = udpHealth.ProbeDeadline!.Value;
+            udpHealthResponse = response;
         }
 
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
         Task requestTimeout = CancelAtDeadlineAsync(deadline, request);
+        bool sent = false;
         try
         {
             using var probe = ProtocolV3.CreateUdpHealthProbe(id, session, sequence);
             byte[] data = probe.ToArray();
-            if (await socket.SendAsync(data.AsMemory(), request.Token).ConfigureAwait(false) != data.Length)
-                return false;
-            await response.Task.WaitAsync(request.Token).ConfigureAwait(false);
-            return true;
+            sent = await socket.SendAsync(data.AsMemory(), request.Token).ConfigureAwait(false) == data.Length;
         }
-        catch (OperationCanceledException) when (request.IsCancellationRequested) { return false; }
-        catch (SocketException) { return false; }
-        catch (ObjectDisposedException) when (request.IsCancellationRequested) { return false; }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+        {
+            if (!request.IsCancellationRequested) RecordUdpError(ex, sending: true);
+        }
         finally
         {
             request.Cancel();
             await requestTimeout.ConfigureAwait(false);
-            lock (stateLock) udpHealthEcho = null;
+            lock (stateLock)
+            {
+                AdvanceUdpHealth(Stopwatch.GetTimestamp());
+                if (sent) udpHealth.RecordProbeSent();
+                else if (udpHealth.AbandonProbe(sequence)) CompleteUdpHealthProbe(false);
+            }
         }
     }
+
+    // The monitor owns the request identity and deadline. The optional waiter observes that same request.
+    private void AdvanceUdpHealth(long now)
+    {
+        bool pending = udpHealth.PendingSequence.HasValue;
+        udpHealth.Advance(now);
+        if (pending && !udpHealth.PendingSequence.HasValue) CompleteUdpHealthProbe(false);
+    }
+
+    private void CompleteUdpHealthProbe(bool success)
+    {
+        udpHealthResponse?.TrySetResult(success);
+        udpHealthResponse = null;
+    }
+
+    private bool RecordUdpError(Exception error, bool sending)
+    {
+        UdpClient? unavailableSocket = null;
+        bool duringHandshake;
+        lock (stateLock)
+        {
+            if (ended || lifetime.IsCancellationRequested) return false;
+            if (sending) udpSendErrors++;
+            else udpReceiveErrors++;
+
+            var socketError = (error as SocketException)?.SocketErrorCode;
+            bool unavailable = sending
+                ? error is ObjectDisposedException || socketError == SocketError.NotSocket
+                : socketError is not SocketError code || !IsRecoverableReceiveError(code);
+            if (unavailable)
+            {
+                udpHealth.MarkSocketUnavailable();
+                CompleteUdpHealthProbe(false);
+                unavailableSocket = udp;
+            }
+            duringHandshake = !ready;
+        }
+        unavailableSocket?.Dispose();
+        return duringHandshake;
+    }
+
+    private static bool IsRecoverableReceiveError(SocketError error) => error is
+        SocketError.ConnectionReset or SocketError.ConnectionRefused or SocketError.TimedOut or
+        SocketError.Interrupted or SocketError.NetworkDown or SocketError.NetworkReset or SocketError.NetworkUnreachable or
+        SocketError.HostUnreachable or SocketError.NoBufferSpaceAvailable or SocketError.WouldBlock or SocketError.MessageSize;
 
     private async Task ReceiveTcpAsync(CancellationToken token)
     {
@@ -313,11 +398,23 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     private async Task ReceiveUdpAsync(CancellationToken token)
     {
+        UdpClient socket = udp!;
         try
         {
             while (!token.IsCancellationRequested)
             {
-                var result = await udp!.ReceiveAsync(token).ConfigureAwait(false);
+                lock (stateLock)
+                {
+                    if (ended || udp != socket || udpHealth.SocketUnavailable) return;
+                }
+                UdpReceiveResult result;
+                try { result = await receiveDatagram(socket, token).ConfigureAwait(false); }
+                catch (SocketException ex) when (IsRecoverableReceiveError(ex.SocketErrorCode))
+                {
+                    RecordUdpError(ex, sending: false);
+                    await DelayUntilAsync(Stopwatch.GetTimestamp() + Stopwatch.Frequency, token).ConfigureAwait(false);
+                    continue;
+                }
                 try
                 {
                     HandleUdpPacket(result.Buffer);
@@ -327,7 +424,8 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            if (!token.IsCancellationRequested) Fail(ErrorKind.Receive, $"UDP: {ex.Message}");
+            if (!token.IsCancellationRequested && RecordUdpError(ex, sending: false))
+                Fail(ErrorKind.Receive, $"UDP: {ex.Message}");
         }
     }
 
@@ -501,8 +599,8 @@ internal sealed class SimulatedClient : IAsyncDisposable
                 lock (stateLock)
                 {
                     if (ready && !ended && sessionToken is byte[] token && echo.Token.AsSpan().SequenceEqual(token) &&
-                        echo.Sequence == udpHealthSequence && Stopwatch.GetTimestamp() < udpHealthDeadline)
-                        udpHealthEcho?.TrySetResult();
+                        udpHealth.AcceptEcho(echo.Sequence, Stopwatch.GetTimestamp()))
+                        CompleteUdpHealthProbe(true);
                 }
                 break;
         }
@@ -661,7 +759,11 @@ internal sealed class SimulatedClient : IAsyncDisposable
                 // Use the latest due slot. Never emit a burst to make up missed slots.
                 slot = (sendAt - start) / period;
                 try { await SendUdpAsync(data, token).ConfigureAwait(false); }
-                catch (Exception ex) when (ex is SocketException or IOException) { return; }
+                catch (IOException ex)
+                {
+                    if (!token.IsCancellationRequested) errors.Add(ErrorKind.Send, $"Client {index}: {ex.Message}");
+                    return;
+                }
                 lastWriteCompleted = Stopwatch.GetTimestamp();
                 Trace.MarkSent(target, Stopwatch.GetElapsedTime(start + slot * period, sendAt).TotalMilliseconds);
                 position = target;
@@ -704,15 +806,39 @@ internal sealed class SimulatedClient : IAsyncDisposable
             {
                 ready = true;
                 heartbeat.Start(now);
+                udpHealth.Start(now);
             }
         }
 
         if (!expired)
         {
             heartbeatMonitor = WatchHeartbeatAsync(lifetime.Token);
+            udpHealthMonitor = WatchUdpHealthAsync(lifetime.Token);
             lobbyReady.TrySetResult();
         }
         else ExpireHandshake("Handshake TCP/UDP quá hạn.");
+    }
+
+    private async Task WatchUdpHealthAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                long now = Stopwatch.GetTimestamp();
+                long? next;
+                lock (stateLock)
+                {
+                    if (ended) return;
+                    AdvanceUdpHealth(now);
+                    next = udpHealth.NextCheckAt;
+                }
+                if (next is not long due) return;
+                if (now < due) await DelayUntilAsync(due, token).ConfigureAwait(false);
+                else await SendHealthProbeAsync(scheduled: true, response: null, token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
 
     private async Task WatchHeartbeatAsync(CancellationToken token)
@@ -780,7 +906,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
         CloseTransport();
         await Task.WhenAll(receiveTcp, receiveUdp).ConfigureAwait(false);
-        await heartbeatMonitor.ConfigureAwait(false);
+        await Task.WhenAll(heartbeatMonitor, udpHealthMonitor).ConfigureAwait(false);
         tcpWriteGate.Dispose();
         lifetime.Dispose();
     }
