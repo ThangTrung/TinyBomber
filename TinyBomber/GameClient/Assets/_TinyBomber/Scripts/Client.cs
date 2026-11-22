@@ -95,16 +95,14 @@ public class Client : MonoBehaviour
         if (!IsConnecting || myId != 0 || slotId <= 0)
             throw new InvalidDataException("ServerHello không hợp lệ.");
         if (CheckHandshakeDeadline()) return;
-        if (version != ProtocolV3.Version)
+        if (version != ProtocolV4.Version)
         {
-            Disconnect($"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV3.Version}.");
+            Disconnect($"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV4.Version}.");
             return;
         }
 
         myId = slotId;
-#if TINYBOMBER_PROTOCOL_V4
         tcp.AcceptedProtocolVersion = version;
-#endif
         ClientSend.SendClientHello();
         GameManager.instance.SetConnectionStatus("Đang chờ cấp phiên…");
     }
@@ -176,10 +174,8 @@ public class Client : MonoBehaviour
 
     public class TCP
     {
-#if TINYBOMBER_PROTOCOL_V4
         internal int AcceptedProtocolVersion { get; set; }
         internal bool UsesMovementOrdering => AcceptedProtocolVersion == ProtocolV4.Version;
-#endif
         private readonly long handshakeDeadline =
             Stopwatch.GetTimestamp() + HandshakeTimeoutSeconds * Stopwatch.Frequency;
         public TcpClient socket;
@@ -374,7 +370,6 @@ public class Client : MonoBehaviour
                     return;
                 }
 
-#if TINYBOMBER_PROTOCOL_V4
                 if (UsesMovementOrdering && !instance.IsConnecting)
                 {
                     if (_packetId == (int)ServerPackets.playerPositionV4)
@@ -394,14 +389,13 @@ public class Client : MonoBehaviour
                     }
                     if (_packetId == (int)ServerPackets.playerPosition) return;
                 }
-#endif
                 _packet.ReadInt();
                 if (_packetId == (int)ServerPackets.welcome && instance.IsConnecting && instance.myId == 0)
                 {
                     _packet.ReadString();
                     if (_packet.UnreadLength() != sizeof(int) || _packet.ReadInt() <= 0)
                         throw new InvalidDataException("Welcome v1 không hợp lệ.");
-                    instance.Disconnect($"Máy chủ dùng protocol v1. Client yêu cầu v{ProtocolV3.Version}.");
+                    instance.Disconnect($"Máy chủ dùng protocol v1. Client yêu cầu v{ProtocolV4.Version}.");
                     return;
                 }
                 if (instance.IsConnecting)
@@ -410,10 +404,6 @@ public class Client : MonoBehaviour
                 if (_packetId == (int)ServerPackets.spawnPlayer)
                 {
                     ClientHandle.SpawnPlayer(_packet);
-                }
-                else if (_packetId == (int)ServerPackets.playerPosition)
-                {
-                    ClientHandle.PlayerPosition(_packet);
                 }
                 else if (_packetId == (int)ServerPackets.mapData)
                 {
@@ -651,12 +641,7 @@ public class Client : MonoBehaviour
         {
             try
             {
-#if TINYBOMBER_PROTOCOL_V4
-                using Packet packet = connection.UsesMovementOrdering
-                    ? ProtocolV4.OpenServerDatagram(data) : ProtocolV3.OpenServerDatagram(data);
-#else
-                using Packet packet = ProtocolV3.OpenServerDatagram(data);
-#endif
+                using Packet packet = ProtocolV4.OpenServerDatagram(data);
                 if (packet.UnreadLength() < sizeof(int)) return;
                 byte[] token = connection.SessionToken;
                 switch ((ServerPackets)packet.ReadInt(false))
@@ -668,25 +653,12 @@ public class Client : MonoBehaviour
                         ClientSend.ConfirmUdp(token, probe.Nonce);
                         connection.UdpConfirmSent = true;
                         break;
-                    case ServerPackets.udpPlayerPosition:
-#if TINYBOMBER_PROTOCOL_V4
-                        if (connection.UsesMovementOrdering) return;
-#endif
-                        var position = ProtocolV2.ReadUdpPlayerPosition(packet);
-                        if (instance.IsConnecting || !position.Token.AsSpan().SequenceEqual(token) ||
-                            float.IsNaN(position.X) || float.IsInfinity(position.X) ||
-                            float.IsNaN(position.Y) || float.IsInfinity(position.Y)) return;
-                        ClientHandle.ApplyPlayerPosition(position.RoomId, position.RoundId, position.PlayerId,
-                            position.X, position.Y);
-                        break;
-#if TINYBOMBER_PROTOCOL_V4
                     case ServerPackets.udpPlayerPositionV4 when connection.UsesMovementOrdering:
                         var ordered = ProtocolV4.ReadUdpPlayerPosition(packet);
                         if (instance.IsConnecting || !ordered.Token.AsSpan().SequenceEqual(token)) return;
                         GameManager.instance.ApplyOrderedPeerPosition(ordered.RoomId, ordered.RoundId,
                             ordered.PlayerId, ordered.AcceptedMoveSeq, new Vector2(ordered.X, ordered.Y));
                         break;
-#endif
                     case ServerPackets.udpHealthEcho:
                         var echo = ProtocolV3.ReadUdpHealthEcho(packet);
                         if (!instance.IsConnecting && echo.Token.AsSpan().SequenceEqual(token) &&

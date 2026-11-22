@@ -201,10 +201,10 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
             await peer.Tcp.ConnectAsync((IPEndPoint)listener.LocalEndpoint, token);
             peer.Accept(await listener.AcceptTcpClientAsync(token));
             using (var hello = await peer.ReadAsync(token))
-                Assert.Equal((ProtocolV3.Version, slot.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV4.Version, slot.id), ProtocolV2.ReadServerHello(hello));
 
             // Drive the v2 state transitions in the fixture. The M3 integration test covers the UDP socket handshake.
-            ServerHandle.ClientHello(slot, peer.Connection, ProtocolV3.Version, slot.id, $"Peer{slot.id}");
+            ServerHandle.ClientHello(slot, peer.Connection, ProtocolV4.Version, slot.id, $"Peer{slot.id}");
             using var grant = await peer.ReadAsync(token);
             byte[] session = ProtocolV2.ReadSessionGranted(grant);
             Assert.True(ServerHandle.RegisterUdp(slot, peer.Connection, peer.Udp,

@@ -217,7 +217,7 @@ namespace GameServer
                         return;
                     }
                     if (packetId is (int)ClientPackets.welcomeReceived or (int)ClientPackets.udpReady)
-                        throw new InvalidDataException("Legacy v1 handshake packet on a v3 connection.");
+                        throw new InvalidDataException($"Legacy v1 handshake packet on a v{ProtocolV4.Version} server.");
                     if (packetId == (int)ClientPackets.playerMovementV4)
                     {
                         if (!UsesMovementOrdering) return;

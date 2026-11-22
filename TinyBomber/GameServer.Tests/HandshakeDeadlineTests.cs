@@ -21,7 +21,7 @@ public sealed class HandshakeDeadlineTests
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
 
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV3.Version, slot.id, "Player", Deadline + offset);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", Deadline + offset);
 
         Assert.Equal(accepted ? "Player" : null, slot.Username);
         Assert.Equal(accepted, slot.tcp.SessionToken?.Length == 16);
@@ -35,7 +35,7 @@ public sealed class HandshakeDeadlineTests
     {
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV3.Version, slot.id, "Player", AcceptedAt);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", AcceptedAt);
         var endpoint = new IPEndPoint(IPAddress.Loopback, 12345);
 
         Assert.Equal(accepted, ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp, endpoint,
@@ -51,7 +51,7 @@ public sealed class HandshakeDeadlineTests
     {
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV3.Version, slot.id, "Player", AcceptedAt);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", AcceptedAt);
         byte[] token = slot.tcp.SessionToken!;
         Assert.True(ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp,
             new IPEndPoint(IPAddress.Loopback, 12345), token, Deadline - 2));
@@ -87,7 +87,7 @@ public sealed class HandshakeDeadlineTests
             Assert.True(firstHandle.IsClosed);
 
             next.StartHandshake(Deadline);
-            ServerHandle.ClientHello(slot, next, ProtocolV3.Version, slot.id, "Replacement", Deadline + 1);
+            ServerHandle.ClientHello(slot, next, ProtocolV4.Version, slot.id, "Replacement", Deadline + 1);
             next.socket = nextSocket;
             Server.ExpireHandshake(slot.id, first, Deadline + 1);
             Server.Disconnect(slot.id, first);
@@ -110,7 +110,7 @@ public sealed class HandshakeDeadlineTests
         var slot = new Client(int.MaxValue);
         var connection = slot.tcp;
         connection.StartHandshake(AcceptedAt);
-        ServerHandle.ClientHello(slot, connection, ProtocolV3.Version, slot.id, "Player", AcceptedAt);
+        ServerHandle.ClientHello(slot, connection, ProtocolV4.Version, slot.id, "Player", AcceptedAt);
         ServerHandle.RegisterUdp(slot, connection, slot.udp, new IPEndPoint(IPAddress.Loopback, 12345),
             connection.SessionToken!, Deadline - 2);
         ServerHandle.ConfirmUdp(slot, connection, connection.SessionToken!, slot.udp.ProbeNonce!, Deadline - 1);
@@ -140,8 +140,9 @@ public sealed class HandshakeDeadlineTests
         var (tcpPort, udpPort) = Server.Start(7, IPAddress.Loopback, 0, 0);
         try
         {
-            await AssertBootstrapRejectedAsync(tcpPort, malformed: false, token);
-            await AssertBootstrapRejectedAsync(tcpPort, malformed: true, token);
+            await AssertBootstrapRejectedAsync(tcpPort, ProtocolV2.Version, malformed: false, token);
+            await AssertBootstrapRejectedAsync(tcpPort, ProtocolV3.Version, malformed: false, token);
+            await AssertBootstrapRejectedAsync(tcpPort, ProtocolV4.Version, malformed: true, token);
             using var ready = await Peer.OpenAsync(tcpPort, token);
             await AssertRegistrationAndRetryAsync(ready, udpPort, token);
             using var unresponsiveReady = await Peer.OpenAsync(tcpPort, token);
@@ -153,7 +154,7 @@ public sealed class HandshakeDeadlineTests
             using var noConfirmation = await Peer.OpenAsync(tcpPort, token);
             using var retrying = await Peer.OpenAsync(tcpPort, token);
 
-            using var partialHello = ProtocolV3.CreateClientHello(partial.SlotId, "Partial");
+            using var partialHello = ProtocolV4.CreateClientHello(partial.SlotId, "Partial");
             byte[] partialFrame = partialHello.ToArray();
             await partial.Stream.WriteAsync(partialFrame.AsMemory(0, 10), token);
             await noRegistration.GrantSessionAsync(token);
@@ -236,32 +237,17 @@ public sealed class HandshakeDeadlineTests
 
         // Omit B. C is clear but the segment from A to C cuts the corner.
         await mover.SendMovementAsync(room.Id, room.Round, cx, by, mover.SessionToken, mover.Udp, token);
-        await AssertCorrectionAsync();
+        await AssertCorrectionAsync(mover, room.Id, room.Round, ax, ay, token);
         await AssertUdpQuietAsync(recipient.Udp, token);
 
-        await mover.SendAsync(ClientPackets.playerMovement, token, packet =>
-        {
-            packet.Write(room.Id);
-            packet.Write(room.Round);
-            packet.Write(cx);
-            packet.Write(by);
-        });
-        await AssertCorrectionAsync();
+        await mover.SendTcpMovementAsync(room.Id, room.Round, cx, by, token);
+        await AssertCorrectionAsync(mover, room.Id, room.Round, ax, ay, token);
         await AssertUdpQuietAsync(recipient.Udp, token);
 
         await mover.SendMovementAsync(room.Id, room.Round, ax, by, mover.SessionToken, mover.Udp, token);
         await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, ax, by, token);
         await mover.SendMovementAsync(room.Id, room.Round, cx, by, mover.SessionToken, mover.Udp, token);
         await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, cx, by, token);
-
-        async Task AssertCorrectionAsync()
-        {
-            using Packet correction = await mover.ReadAsync(ServerPackets.playerPosition, token);
-            Assert.Equal((room.Id, room.Round, mover.SlotId, ax, ay),
-                (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(),
-                    correction.ReadFloat(), correction.ReadFloat()));
-            Assert.Equal(0, correction.UnreadLength());
-        }
     }
 
     private static async Task AssertSpeedRejectAndRecoveryAsync(Peer mover, Peer recipient,
@@ -272,40 +258,25 @@ public sealed class HandshakeDeadlineTests
         const float rejectedX = -7.625f; // Clear sweep, but the distance exceeds even a full budget.
 
         await mover.SendMovementAsync(room.Id, room.Round, rejectedX, y, mover.SessionToken, mover.Udp, token);
-        await AssertCorrectionAsync();
+        await AssertCorrectionAsync(mover, room.Id, room.Round, lastX, y, token);
         await AssertUdpQuietAsync(recipient.Udp, token);
 
-        await mover.SendAsync(ClientPackets.playerMovement, token, packet =>
-        {
-            packet.Write(room.Id);
-            packet.Write(room.Round);
-            packet.Write(rejectedX);
-            packet.Write(y);
-        });
-        await AssertCorrectionAsync();
+        await mover.SendTcpMovementAsync(room.Id, room.Round, rejectedX, y, token);
+        await AssertCorrectionAsync(mover, room.Id, room.Round, lastX, y, token);
         await AssertUdpQuietAsync(recipient.Udp, token);
 
         const float recoveredX = -7.25f;
         await mover.SendMovementAsync(room.Id, room.Round, recoveredX, y, mover.SessionToken, mover.Udp, token);
         await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, recoveredX, y, token);
-
-        async Task AssertCorrectionAsync()
-        {
-            using Packet correction = await mover.ReadAsync(ServerPackets.playerPosition, token);
-            Assert.Equal((room.Id, room.Round, mover.SlotId, lastX, y),
-                (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(),
-                    correction.ReadFloat(), correction.ReadFloat()));
-            Assert.Equal(0, correction.UnreadLength());
-        }
     }
 
-    private static async Task AssertBootstrapRejectedAsync(int tcpPort, bool malformed, CancellationToken token)
+    private static async Task AssertBootstrapRejectedAsync(int tcpPort, int version, bool malformed, CancellationToken token)
     {
         using var peer = await Peer.OpenAsync(tcpPort, token);
-        using var oldHello = ProtocolV2.CreateClientHello(peer.SlotId, "Legacy");
+        using var oldHello = ProtocolV2.CreateClientHello(peer.SlotId, "Legacy", version);
         byte[] frame = malformed ? ClientFrame(ClientPackets.clientHello, packet =>
         {
-            packet.Write(ProtocolV3.Version);
+            packet.Write(version);
             packet.Write(peer.SlotId);
             packet.Write(2);
             packet.Write((byte)'A');
@@ -403,39 +374,69 @@ public sealed class HandshakeDeadlineTests
         using var wrongEndpoint = new UdpClient();
         wrongEndpoint.Connect(IPAddress.Loopback, udpPort);
         await mover.SendMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
-            mover.SessionToken, wrongEndpoint, token);
+            mover.SessionToken, wrongEndpoint, token, long.MaxValue);
         await mover.SendMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
-            Alter(mover.SessionToken), mover.Udp, token);
+            Alter(mover.SessionToken), mover.Udp, token, long.MaxValue);
         await mover.SendMovementAsync(room.Id, room.Round + 1, room.X + 0.0625f, room.Y,
-            mover.SessionToken, mover.Udp, token);
+            mover.SessionToken, mover.Udp, token, long.MaxValue);
+        using (var legacy = ProtocolV2.CreateUdpPlayerMovement(mover.SlotId, mover.SessionToken,
+            room.Id, room.Round, room.X + 0.0625f, room.Y))
+            await mover.Udp.SendAsync(legacy.ToArray(), token);
+        await mover.SendAsync(ClientPackets.playerMovement, token, packet =>
+        {
+            packet.Write(room.Id);
+            packet.Write(room.Round);
+            packet.Write(room.X + 0.0625f);
+            packet.Write(room.Y);
+        });
         await AssertUdpQuietAsync(recipient.Udp, token);
+
+        // A correction proves the legacy packets did not change authority, even if no peer update was sent.
+        await mover.SendMovementAsync(room.Id, room.Round, 999f, 999f, mover.SessionToken, mover.Udp, token);
+        Assert.Equal(1L, mover.LastSentMoveSeq);
+        await AssertCorrectionAsync(mover, room.Id, room.Round, room.X, room.Y, token);
 
         float x = room.X + 0.125f;
         await mover.SendMovementAsync(room.Id, room.Round, x, room.Y, mover.SessionToken, mover.Udp, token);
         await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, x, room.Y, token);
         await AssertUdpQuietAsync(otherRoom.Udp, token);
 
+        await mover.SendMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
+            mover.SessionToken, mover.Udp, token, mover.LastAcceptedMoveSeq);
+        await mover.SendTcpMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
+            token, mover.LastAcceptedMoveSeq - 1);
+        await AssertUdpQuietAsync(recipient.Udp, token);
+
         await mover.SendMovementAsync(room.Id, room.Round, 999f, 999f, mover.SessionToken, mover.Udp, token);
-        using Packet correction = await mover.ReadAsync(ServerPackets.playerPosition, token);
-        Assert.Equal((room.Id, room.Round, mover.SlotId, x, room.Y),
-            (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(), correction.ReadFloat(), correction.ReadFloat()));
+        await AssertCorrectionAsync(mover, room.Id, room.Round, x, room.Y, token);
+    }
+
+    private static async Task AssertCorrectionAsync(Peer mover, int room, int round,
+        float x, float y, CancellationToken token)
+    {
+        using Packet packet = await mover.ReadAsync(ServerPackets.playerCorrectionV4, token, leaveId: true);
+        Assert.Equal((room, round, mover.SlotId, mover.LastSentMoveSeq, mover.LastAcceptedMoveSeq, x, y),
+            ProtocolV4.ReadTcpPlayerCorrection(packet));
+        Assert.Equal(0, packet.UnreadLength());
     }
 
     private static async Task AssertUdpPositionAsync(Peer recipient, Peer mover, int room, int round,
         float x, float y, CancellationToken token)
     {
-        using Packet packet = ProtocolV2.OpenServerDatagram((await recipient.Udp.ReceiveAsync(token)).Buffer);
-        var position = ProtocolV2.ReadUdpPlayerPosition(packet);
+        using Packet packet = ProtocolV4.OpenServerDatagram((await recipient.Udp.ReceiveAsync(token)).Buffer);
+        var position = ProtocolV4.ReadUdpPlayerPosition(packet);
         Assert.Equal(recipient.SessionToken, position.Token);
-        Assert.Equal((room, round, mover.SlotId, x, y),
-            (position.RoomId, position.RoundId, position.PlayerId, position.X, position.Y));
+        Assert.Equal((room, round, mover.SlotId, mover.LastSentMoveSeq, x, y),
+            (position.RoomId, position.RoundId, position.PlayerId, position.AcceptedMoveSeq, position.X, position.Y));
+        Assert.Equal(0, packet.UnreadLength());
+        mover.LastAcceptedMoveSeq = position.AcceptedMoveSeq;
     }
 
     private static async Task AssertSameEndpointReconnectAsync(Peer original,
         (int Id, int Round, float X, float Y) oldRoom, int tcpPort, int udpPort, CancellationToken token)
     {
-        using var oldMovement = ProtocolV2.CreateUdpPlayerMovement(original.SlotId, original.SessionToken,
-            oldRoom.Id, oldRoom.Round, oldRoom.X + 0.0625f, oldRoom.Y);
+        using var oldMovement = ProtocolV4.CreateUdpPlayerMovement(original.SlotId, original.SessionToken,
+            oldRoom.Id, oldRoom.Round, long.MaxValue, oldRoom.X + 0.0625f, oldRoom.Y);
         original.CloseTcp();
         while (Server.LatestMetrics?.ConnectedClients != 3)
             await Task.Delay(50, token);
@@ -460,13 +461,12 @@ public sealed class HandshakeDeadlineTests
 
         await original.Udp.SendAsync(oldMovement.ToArray(), token);
         await replacement.SendMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
-            original.SessionToken, original.Udp, token);
+            original.SessionToken, original.Udp, token, long.MaxValue);
         await AssertUdpQuietAsync(recipient.Udp, token);
         await replacement.SendMovementAsync(room.Id, room.Round, 999f, 999f, replacement.SessionToken,
             replacement.Udp, token);
-        using Packet correction = await replacement.ReadAsync(ServerPackets.playerPosition, token);
-        Assert.Equal((room.Id, room.Round, replacement.SlotId, room.X, room.Y),
-            (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(), correction.ReadFloat(), correction.ReadFloat()));
+        Assert.Equal(1L, replacement.LastSentMoveSeq);
+        await AssertCorrectionAsync(replacement, room.Id, room.Round, room.X, room.Y, token);
 
         float x = room.X + 0.125f;
         await replacement.SendMovementAsync(room.Id, room.Round, x, room.Y, replacement.SessionToken,
@@ -518,6 +518,8 @@ public sealed class HandshakeDeadlineTests
         internal NetworkStream Stream => tcp.GetStream();
         internal int SlotId { get; private set; }
         internal byte[] SessionToken { get; private set; } = null!;
+        internal long LastSentMoveSeq { get; private set; }
+        internal long LastAcceptedMoveSeq { get; set; }
         private readonly bool ownsUdp;
 
         private Peer(UdpClient? reuseUdp)
@@ -534,7 +536,7 @@ public sealed class HandshakeDeadlineTests
                 await peer.tcp.ConnectAsync(IPAddress.Loopback, port, token);
                 using Packet hello = await peer.ReadAsync(ServerPackets.serverHello, token, leaveId: true);
                 var server = ProtocolV2.ReadServerHello(hello);
-                Assert.Equal(ProtocolV3.Version, server.Version);
+                Assert.Equal(ProtocolV4.Version, server.Version);
                 peer.SlotId = server.SlotId;
                 return peer;
             }
@@ -583,7 +585,7 @@ public sealed class HandshakeDeadlineTests
 
         internal async Task GrantSessionAsync(CancellationToken cancellation)
         {
-            using var hello = ProtocolV3.CreateClientHello(SlotId, $"Peer{SlotId}");
+            using var hello = ProtocolV4.CreateClientHello(SlotId, $"Peer{SlotId}");
             await Stream.WriteAsync(hello.ToArray(), cancellation);
             using Packet granted = await ReadAsync(ServerPackets.sessionGranted, cancellation, leaveId: true);
             SessionToken = ProtocolV2.ReadSessionGranted(granted);
@@ -607,10 +609,19 @@ public sealed class HandshakeDeadlineTests
         }
 
         internal async Task SendMovementAsync(int room, int round, float x, float y, byte[] token,
-            UdpClient sender, CancellationToken cancellation)
+            UdpClient sender, CancellationToken cancellation, long? sequenceOverride = null)
         {
-            using var movement = ProtocolV2.CreateUdpPlayerMovement(SlotId, token, room, round, x, y);
+            using var movement = ProtocolV4.CreateUdpPlayerMovement(SlotId, token, room, round,
+                sequenceOverride ?? ++LastSentMoveSeq, x, y);
             await sender.SendAsync(movement.ToArray(), cancellation);
+        }
+
+        internal async Task SendTcpMovementAsync(int room, int round, float x, float y, CancellationToken cancellation,
+            long? sequenceOverride = null)
+        {
+            using var movement = ProtocolV4.CreateTcpPlayerMovement(room, round,
+                sequenceOverride ?? ++LastSentMoveSeq, x, y);
+            await Stream.WriteAsync(movement.ToArray(), cancellation);
         }
 
         internal async Task RepeatRegistrationAsync(CancellationToken token)

@@ -59,31 +59,22 @@ public class ClientSend : MonoBehaviour
     public static void SendClientHello()
     {
         int slotId = Client.instance.myId;
-        using var packet = ProtocolV3.CreateClientHello(slotId, "Player_" + slotId);
+        using var packet = ProtocolV4.CreateClientHello(slotId, "Player_" + slotId);
         Client.instance.tcp.SendData(packet);
     }
 
     public static void SendPlayerMovement(Vector2 _position)
     {
         Client client = Client.instance;
-        if (client == null || client.IsConnecting || client.tcp?.SessionToken == null || client.udp == null) return;
+        if (client == null || client.IsConnecting || client.tcp?.SessionToken == null || client.udp == null ||
+            !client.tcp.UsesMovementOrdering) return;
 
-#if TINYBOMBER_PROTOCOL_V4
-        // Compile with a v4 GameShared reference for validation. Hello still selects v3 in C3-C1.
-        if (client.tcp.UsesMovementOrdering)
+        GameManager game = GameManager.instance;
+        game.TrySendOrderedMovement(sequence =>
         {
-            GameManager game = GameManager.instance;
-            game.TrySendOrderedMovement(sequence =>
-            {
-                using var ordered = ProtocolV4.CreateUdpPlayerMovement(client.myId, client.tcp.SessionToken,
-                    game.RoomId, game.ActiveRoundId, sequence, _position.x, _position.y);
-                return client.udp.TrySendData(ordered);
-            });
-            return;
-        }
-#endif
-        using var packet = ProtocolV2.CreateUdpPlayerMovement(client.myId, client.tcp.SessionToken,
-            GameManager.instance.RoomId, GameManager.instance.ActiveRoundId, _position.x, _position.y);
-        client.udp.SendData(packet);
+            using var movement = ProtocolV4.CreateUdpPlayerMovement(client.myId, client.tcp.SessionToken,
+                game.RoomId, game.ActiveRoundId, sequence, _position.x, _position.y);
+            return client.udp.TrySendData(movement);
+        });
     }
 }

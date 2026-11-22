@@ -18,7 +18,7 @@ namespace GameServer
 
         internal static void ServerHello(Client.TCP connection, int slotId)
         {
-            using var packet = ProtocolV3.CreateServerHello(slotId);
+            using var packet = ProtocolV4.CreateServerHello(slotId);
             connection.SendData(packet);
         }
 

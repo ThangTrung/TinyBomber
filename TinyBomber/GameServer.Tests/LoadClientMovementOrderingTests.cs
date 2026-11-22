@@ -14,7 +14,7 @@ public sealed class LoadClientMovementOrderingTests
     private readonly byte[] token = ProtocolV2.NewSessionToken();
 
     [Fact]
-    public async Task TcpAndUdpEncodingUseTheSameSequenceAndKeepLegacyUdp()
+    public async Task TcpAndUdpEncodingUseTheSamePositiveSequence()
     {
         await using var client = ReadyClient();
         object round = Call(client, "ReadState")!;
@@ -30,9 +30,12 @@ public sealed class LoadClientMovementOrderingTests
         Assert.Equal(1, slot);
         Assert.Equal(token, ordered.Token);
         Assert.Equal((7, 1, 11L, 0.08f, 0f), (ordered.RoomId, ordered.RoundId, ordered.MoveSeq, ordered.X, ordered.Y));
-        using var legacy = (Packet)CallStatic("CreateMovementPacket", round, token, target, null, true)!;
-        using var legacyPacket = ProtocolV2.OpenClientDatagram(legacy.ToArray(), out _);
-        Assert.Equal(0.08f, ProtocolV2.ReadUdpPlayerMovement(legacyPacket).X);
+        foreach (bool viaUdp in new[] { true, false })
+        {
+            var error = Assert.Throws<TargetInvocationException>(() =>
+                CallStatic("CreateMovementPacket", round, token, target, 0L, viaUdp));
+            Assert.IsType<ArgumentOutOfRangeException>(error.InnerException);
+        }
     }
 
     [Theory]

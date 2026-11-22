@@ -13,10 +13,10 @@ namespace GameServer
         {
             if (slot.tcp != connection || connection.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp())) return;
 
-            if (version != ProtocolV3.Version || slotId != slot.id)
+            if (version != ProtocolV4.Version || slotId != slot.id)
             {
-                Console.WriteLine(version != ProtocolV3.Version
-                    ? $"Client protocol version {version} does not match {ProtocolV3.Version}."
+                Console.WriteLine(version != ProtocolV4.Version
+                    ? $"Client protocol version {version} does not match {ProtocolV4.Version}."
                     : $"ClientHello slot does not match connection {slot.id}.");
                 Server.Disconnect(slot.id, connection);
                 return;

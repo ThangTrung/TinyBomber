@@ -159,7 +159,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         try
         {
             int slot = await serverHello.Task.WaitAsync(token).ConfigureAwait(false);
-            using var hello = ProtocolV3.CreateClientHello(slot, $"LoadClient_{slot}");
+            using var hello = ProtocolV4.CreateClientHello(slot, $"LoadClient_{slot}");
             lock (stateLock) clientHelloSent = true;
             await SendTcpFrameAsync(hello, ClientPackets.clientHello, token).ConfigureAwait(false);
 
@@ -531,8 +531,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     }
                     break;
                 case ServerPackets.playerPosition:
-                    if (!UsesMovementOrdering && IsCurrentRound(packet))
-                        ApplyPlayerPosition(packet.ReadInt(), ReadPosition(packet), isTcp: true);
+                    // Legacy movement is ignored in a v4 session.
                     break;
                 case ServerPackets.playerEliminated:
                 case ServerPackets.playerDisconnected:
@@ -541,12 +540,9 @@ internal sealed class SimulatedClient : IAsyncDisposable
                         int player = packet.ReadInt();
                         if (player == id) alive = false;
                         if (type == ServerPackets.playerDisconnected) roster.Remove(player);
-                        if (UsesMovementOrdering)
-                        {
-                            spawns.Remove(player);
-                            peerMovementSequences.Remove(player);
-                            if (player == id) ResetLocalMovementOrdering();
-                        }
+                        spawns.Remove(player);
+                        peerMovementSequences.Remove(player);
+                        if (player == id) ResetLocalMovementOrdering();
                     }
                     break;
                 case ServerPackets.bombPlaced:
@@ -582,7 +578,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         if (hello.SlotId <= 0 || serverHello.Task.IsCompleted)
             throw new InvalidDataException("ServerHello không hợp lệ.");
         if (HandshakeHasExpired()) return;
-        if (hello.Version != ProtocolV3.Version)
+        if (hello.Version != ProtocolV4.Version)
         {
             RejectProtocolVersion(hello.Version);
             return;
@@ -599,13 +595,12 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     private void RejectProtocolVersion(int version)
     {
-        Fail(ErrorKind.Connection, $"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV3.Version}.");
+        Fail(ErrorKind.Connection, $"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV4.Version}.");
     }
 
     private void HandleUdpPacket(byte[] data)
     {
-        using Packet packet = UsesMovementOrdering
-            ? ProtocolV4.OpenServerDatagram(data) : ProtocolV3.OpenServerDatagram(data);
+        using Packet packet = ProtocolV4.OpenServerDatagram(data);
         if (packet.UnreadLength() < sizeof(int)) return;
         switch ((ServerPackets)packet.ReadInt(false))
         {
@@ -616,20 +611,6 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     if (connected && !ready && !HandshakeHasExpired() && sessionToken is byte[] token &&
                         probe.Token.AsSpan().SequenceEqual(token))
                         udpProbe.TrySetResult(probe.Nonce);
-                }
-                break;
-            case ServerPackets.udpPlayerPosition:
-                if (UsesMovementOrdering) return;
-                var update = ProtocolV2.ReadUdpPlayerPosition(packet);
-                lock (stateLock)
-                {
-                    if (!connected || !ready || sessionToken is not byte[] token ||
-                        !update.Token.AsSpan().SequenceEqual(token) ||
-                        update.RoomId != roomId || update.RoundId != roundId || roomId <= 0 || roundId <= 0)
-                        return;
-                    var position = new Position(update.X, update.Y);
-                    if (!position.IsFinite) throw new InvalidDataException("Tọa độ server không hữu hạn.");
-                    ApplyPlayerPosition(update.PlayerId, position, isTcp: false);
                 }
                 break;
             case ServerPackets.udpPlayerPositionV4 when UsesMovementOrdering:
@@ -721,16 +702,6 @@ internal sealed class SimulatedClient : IAsyncDisposable
         map = terrain;
     }
 
-    private void ApplyPlayerPosition(int player, Position position, bool isTcp)
-    {
-        if (phase != MatchPhase.Playing || !roster.Contains(player)) return;
-        if (player == id)
-        {
-            if (isTcp) corrected = true;
-        }
-        else if (player == watchedPlayer) watchedTrace?.Observe(id, position);
-    }
-
     private void ApplyOrderedPeerPosition(int room, int round, int player, long sequence, Position position)
     {
         // The workload starts only once round data and spawns have arrived.
@@ -738,7 +709,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         if (!position.IsFinite) throw new InvalidDataException("Tọa độ server không hữu hạn.");
         if (peerMovementSequences.TryGetValue(player, out long previous) && sequence <= previous) return;
         peerMovementSequences[player] = sequence;
-        ApplyPlayerPosition(player, position, isTcp: false);
+        if (player == watchedPlayer) watchedTrace?.Observe(id, position);
     }
 
     private static Position ReadPosition(Packet packet)
@@ -814,10 +785,10 @@ internal sealed class SimulatedClient : IAsyncDisposable
                 await DelayUntilAsync(earliest, token).ConfigureAwait(false);
                 long now = Stopwatch.GetTimestamp();
                 if (now >= end) break;
-                long? moveSeq = null;
+                long moveSeq;
                 lock (stateLock)
                 {
-                    if (!connected || !alive || corrected || roomId != round.RoomId ||
+                    if (!connected || !UsesMovementOrdering || !alive || corrected || roomId != round.RoomId ||
                         roundId != round.RoundId || phase != MatchPhase.Playing)
                         throw new InvalidDataException("Phiên/ván thay đổi hoặc server đã chỉnh vị trí.");
                     if (distance <= 0 || distance > MovementPath.MaxStep ||
@@ -825,12 +796,8 @@ internal sealed class SimulatedClient : IAsyncDisposable
                         bombs.Any(cell => BombCollision.BlocksStep(cell.Col, cell.Row,
                             position.X, position.Y, target.X, target.Y)))
                         throw new InvalidDataException("Bước di chuyển không hợp lệ.");
-                    if (UsesMovementOrdering)
-                    {
-                        if (!ProtocolV4.TryGetNextMovementSequence(lastSentMoveSeq, out long next))
-                            throw new InvalidDataException("Đã hết sequence di chuyển của ván.");
-                        moveSeq = next;
-                    }
+                    if (!ProtocolV4.TryGetNextMovementSequence(lastSentMoveSeq, out moveSeq))
+                        throw new InvalidDataException("Đã hết sequence di chuyển của ván.");
                 }
 
                 using var packet = CreateMovementPacket(round, grantedToken, target, moveSeq, viaUdp);
@@ -851,13 +818,10 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     return;
                 }
                 lastWriteCompleted = Stopwatch.GetTimestamp();
-                if (moveSeq is long sent)
+                lock (stateLock)
                 {
-                    lock (stateLock)
-                    {
-                        if (connected && alive && IsPlayingRound(round.RoomId, round.RoundId) &&
-                            ReferenceEquals(sessionToken, grantedToken)) lastSentMoveSeq = sent;
-                    }
+                    if (connected && alive && IsPlayingRound(round.RoomId, round.RoundId) &&
+                        ReferenceEquals(sessionToken, grantedToken)) lastSentMoveSeq = moveSeq;
                 }
                 Trace.MarkSent(target, Stopwatch.GetElapsedTime(start + slot * period, sendAt).TotalMilliseconds);
                 position = target;
@@ -871,17 +835,13 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
     }
 
-    private static Packet CreateMovementPacket(ClientState round, byte[] token, Position target, long? sequence,
+    private static Packet CreateMovementPacket(ClientState round, byte[] token, Position target, long sequence,
         bool viaUdp)
     {
         // The transport only chooses the wrapper. A caller retrying a move keeps the same sequence.
-        if (sequence is long moveSeq)
-            return viaUdp
-                ? ProtocolV4.CreateUdpPlayerMovement(round.Id, token, round.RoomId, round.RoundId, moveSeq, target.X, target.Y)
-                : ProtocolV4.CreateTcpPlayerMovement(round.RoomId, round.RoundId, moveSeq, target.X, target.Y);
-        if (viaUdp)
-            return ProtocolV2.CreateUdpPlayerMovement(round.Id, token, round.RoomId, round.RoundId, target.X, target.Y);
-        throw new InvalidOperationException("TCP movement của workload yêu cầu protocol v4.");
+        return viaUdp
+            ? ProtocolV4.CreateUdpPlayerMovement(round.Id, token, round.RoomId, round.RoundId, sequence, target.X, target.Y)
+            : ProtocolV4.CreateTcpPlayerMovement(round.RoomId, round.RoundId, sequence, target.X, target.Y);
     }
 
     private static async Task DelayUntilAsync(long due, CancellationToken token)

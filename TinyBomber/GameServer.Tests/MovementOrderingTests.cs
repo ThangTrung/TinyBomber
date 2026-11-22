@@ -299,7 +299,6 @@ public sealed class MovementOrderingTests
     public async Task OrderedDispatchSharesWatermarkAndOnlySendsCurrentPositionsAndLegitimateCorrections()
     {
         // Inject complete frames in a known order. Observe actual TCP/UDP writes on loopback.
-        // Only these fixture connections use v4. The production hello still advertises v3.
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         CancellationToken cancellation = timeout.Token;
         using var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -337,9 +336,9 @@ public sealed class MovementOrderingTests
             mover.tcp.StartReceiving();
             peer.tcp.StartReceiving();
             using (Packet hello = await ReadFrameAsync(ownerStream, cancellation))
-                Assert.Equal((ProtocolV3.Version, mover.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV4.Version, mover.id), ProtocolV2.ReadServerHello(hello));
             using (Packet hello = await ReadFrameAsync(peerStream, cancellation))
-                Assert.Equal((ProtocolV3.Version, peer.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV4.Version, peer.id), ProtocolV2.ReadServerHello(hello));
 
             mover.tcp.AcceptedProtocolVersion = ProtocolV3.Version;
             SendTcp(100, 0.06f);
