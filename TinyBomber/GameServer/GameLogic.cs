@@ -150,7 +150,7 @@ namespace GameServer
 
         internal bool CanMove(Player player, float x, float y)
         {
-            if (!CanMoveTo(x, y)) return false;
+            if (!TerrainCollision.CanSweep(mapData, player.x, player.y, x, y)) return false;
             foreach (var bomb in bombs)
                 if (BombCollision.BlocksStep(bomb.Col, bomb.Row, player.x, player.y, x, y)) return false;
             return true;
@@ -230,11 +230,6 @@ namespace GameServer
         public static (float x, float y) GridToWorld(int col, int row)
         {
             return (col - 8.5f, row - 7.5f);
-        }
-
-        private bool CanMoveTo(float targetX, float targetY)
-        {
-            return TerrainCollision.CanStandAt(mapData, targetX, targetY);
         }
     }
 }

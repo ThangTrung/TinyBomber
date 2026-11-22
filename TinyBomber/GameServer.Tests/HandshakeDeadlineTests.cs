@@ -200,6 +200,7 @@ public sealed class HandshakeDeadlineTests
             var secondRoom = await StartRoomAsync(otherHost, otherMember, token);
             Assert.NotEqual(firstRoom.Id, secondRoom.Id);
             await AssertMovementAsync(ready, replacement, otherMember, udpPort, firstRoom, token);
+            await AssertCornerSweepAsync(ready, replacement, firstRoom, token);
             await otherHost.SendMovementAsync(secondRoom.Id, secondRoom.Round, secondRoom.X + 0.125f,
                 secondRoom.Y, otherHost.SessionToken, otherHost.Udp, token);
             await AssertUdpPositionAsync(otherMember, otherHost, secondRoom.Id, secondRoom.Round,
@@ -216,6 +217,46 @@ public sealed class HandshakeDeadlineTests
         finally
         {
             Server.Shutdown();
+        }
+    }
+
+    private static async Task AssertCornerSweepAsync(Peer mover, Peer recipient,
+        (int Id, int Round, float X, float Y) room, CancellationToken token)
+    {
+        Assert.Equal((-7.5f, 5.5f), (room.X, room.Y));
+
+        // Top-left spawn: the route turns around the hard block at (2,12).
+        const float ax = -7.32f, ay = 5.22f, by = 5.32f, cx = -7.22f;
+        await mover.SendMovementAsync(room.Id, room.Round, ax, ay, mover.SessionToken, mover.Udp, token);
+        await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, ax, ay, token);
+
+        // Omit B. C is clear but the segment from A to C cuts the corner.
+        await mover.SendMovementAsync(room.Id, room.Round, cx, by, mover.SessionToken, mover.Udp, token);
+        await AssertCorrectionAsync();
+        await AssertUdpQuietAsync(recipient.Udp, token);
+
+        await mover.SendAsync(ClientPackets.playerMovement, token, packet =>
+        {
+            packet.Write(room.Id);
+            packet.Write(room.Round);
+            packet.Write(cx);
+            packet.Write(by);
+        });
+        await AssertCorrectionAsync();
+        await AssertUdpQuietAsync(recipient.Udp, token);
+
+        await mover.SendMovementAsync(room.Id, room.Round, ax, by, mover.SessionToken, mover.Udp, token);
+        await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, ax, by, token);
+        await mover.SendMovementAsync(room.Id, room.Round, cx, by, mover.SessionToken, mover.Udp, token);
+        await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, cx, by, token);
+
+        async Task AssertCorrectionAsync()
+        {
+            using Packet correction = await mover.ReadAsync(ServerPackets.playerPosition, token);
+            Assert.Equal((room.Id, room.Round, mover.SlotId, ax, ay),
+                (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(),
+                    correction.ReadFloat(), correction.ReadFloat()));
+            Assert.Equal(0, correction.UnreadLength());
         }
     }
 

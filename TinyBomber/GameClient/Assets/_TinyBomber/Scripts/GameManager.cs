@@ -202,7 +202,8 @@ public class GameManager : MonoBehaviour
 
     private bool CanStep(Vector2 start, Vector2 target)
     {
-        return TerrainCollision.CanStandAt(terrain, target.x, target.y) && !BombBlocksStep(start, target);
+        return TerrainCollision.CanSweep(terrain, start.x, start.y, target.x, target.y)
+            && !BombBlocksStep(start, target);
     }
 
     public bool BombBlocksStep(Vector2 start, Vector2 target)
