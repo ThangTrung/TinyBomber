@@ -13,6 +13,8 @@ internal sealed class SimulatedClient : IAsyncDisposable
 {
     private const int HandshakeTimeoutSeconds = 16;
     private readonly object stateLock = new();
+    private readonly SemaphoreSlim tcpWriteGate = new(1, 1);
+    private readonly HeartbeatWatchdog heartbeat = new();
     private readonly CancellationTokenSource lifetime;
     private readonly RunErrors errors;
     private readonly int index;
@@ -27,11 +29,15 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private UdpClient? udp;
     private Task receiveTcp = Task.CompletedTask;
     private Task receiveUdp = Task.CompletedTask;
+    private Task heartbeatMonitor = Task.CompletedTask;
     private long? handshakeDeadline;
-    private bool handshakeTimedOut;
+    private bool ended;
     private bool clientHelloSent;
     private bool udpConfirmSent;
     private byte[]? sessionToken;
+    private long udpHealthSequence;
+    private long udpHealthDeadline;
+    private TaskCompletionSource? udpHealthEcho;
     private bool connected;
     private bool ready;
     private bool alive;
@@ -86,7 +92,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        Task deadlineTask = CancelAtHandshakeDeadlineAsync(deadline, timeout);
+        Task deadlineTask = CancelAtDeadlineAsync(deadline, timeout);
         try
         {
             await ConnectAttemptAsync(address, timeout.Token).ConfigureAwait(false);
@@ -98,7 +104,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
     }
 
-    private static async Task CancelAtHandshakeDeadlineAsync(long deadline, CancellationTokenSource timeout)
+    private static async Task CancelAtDeadlineAsync(long deadline, CancellationTokenSource timeout)
     {
         try
         {
@@ -131,13 +137,25 @@ internal sealed class SimulatedClient : IAsyncDisposable
         try
         {
             int slot = await serverHello.Task.WaitAsync(token).ConfigureAwait(false);
-            using var hello = ProtocolV2.CreateClientHello(slot, $"LoadClient_{slot}");
+            using var hello = ProtocolV3.CreateClientHello(slot, $"LoadClient_{slot}");
             lock (stateLock) clientHelloSent = true;
             await SendTcpFrameAsync(hello, ClientPackets.clientHello, token).ConfigureAwait(false);
 
             byte[] grantedToken = await sessionGranted.Task.WaitAsync(token).ConfigureAwait(false);
-            udp = new UdpClient(AddressFamily.InterNetwork);
-            udp.Connect(address, Constants.UDP_PORT);
+            var udpSocket = new UdpClient(AddressFamily.InterNetwork);
+            try { udpSocket.Connect(address, Constants.UDP_PORT); }
+            catch { udpSocket.Dispose(); throw; }
+
+            lock (stateLock)
+            {
+                if (!ended && !token.IsCancellationRequested) udp = udpSocket;
+            }
+            if (udp == null)
+            {
+                udpSocket.Dispose();
+                token.ThrowIfCancellationRequested();
+                return;
+            }
             receiveUdp = ReceiveUdpAsync(lifetime.Token);
 
             while (!udpProbe.Task.IsCompleted)
@@ -173,7 +191,6 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     internal async Task SendTcpAsync(ClientPackets type, Action<Packet>? write, CancellationToken token)
     {
-        // Commands are serialized by the caller for each client.
         using var packet = new Packet((int)type);
         write?.Invoke(packet);
         packet.WriteLength();
@@ -183,15 +200,29 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     private async Task SendTcpFrameAsync(Packet packet, ClientPackets type, CancellationToken token)
     {
+        byte[] frame = packet.ToArray();
+        using var send = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
+        await tcpWriteGate.WaitAsync(send.Token).ConfigureAwait(false);
         try
         {
-            await tcp!.GetStream().WriteAsync(packet.ToArray(), token).ConfigureAwait(false);
+            send.Token.ThrowIfCancellationRequested();
+            try
+            {
+                await tcp!.GetStream().WriteAsync(frame, send.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (send.IsCancellationRequested)
+            {
+                // A canceled write may have put part of this frame on the stream.
+                Fail(ErrorKind.Send, $"Đã hủy khi đang ghi TCP {type}.");
+                throw;
+            }
+            catch (Exception ex) when (ex is SocketException or IOException or InvalidOperationException)
+            {
+                Fail(ErrorKind.Send, $"TCP {type}: {ex.Message}");
+                throw new IOException($"Không gửi được TCP {type}.", ex);
+            }
         }
-        catch (Exception ex) when (ex is SocketException or IOException or InvalidOperationException)
-        {
-            Fail(ErrorKind.Send, $"TCP {type}: {ex.Message}");
-            throw new IOException($"Không gửi được TCP {type}.", ex);
-        }
+        finally { tcpWriteGate.Release(); }
     }
 
     private async Task SendUdpAsync(byte[] data, CancellationToken token)
@@ -208,10 +239,54 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
     }
 
+    internal async Task<bool> ProbeUdpHealthAsync(CancellationToken token)
+    {
+        using var request = CancellationTokenSource.CreateLinkedTokenSource(token, lifetime.Token);
+        var response = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        UdpClient socket;
+        byte[] session;
+        long sequence;
+        long deadline;
+        lock (stateLock)
+        {
+            if (ended || request.IsCancellationRequested || !ready || sessionToken == null || udp == null || udpHealthEcho != null)
+                return false;
+
+            socket = udp;
+            session = sessionToken;
+            sequence = checked(++udpHealthSequence);
+            deadline = Stopwatch.GetTimestamp() + 5 * Stopwatch.Frequency;
+            udpHealthDeadline = deadline;
+            udpHealthEcho = response;
+        }
+
+        Task requestTimeout = CancelAtDeadlineAsync(deadline, request);
+        try
+        {
+            using var probe = ProtocolV3.CreateUdpHealthProbe(id, session, sequence);
+            byte[] data = probe.ToArray();
+            if (await socket.SendAsync(data.AsMemory(), request.Token).ConfigureAwait(false) != data.Length)
+                return false;
+            await response.Task.WaitAsync(request.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException) when (request.IsCancellationRequested) { return false; }
+        catch (SocketException) { return false; }
+        catch (ObjectDisposedException) when (request.IsCancellationRequested) { return false; }
+        finally
+        {
+            request.Cancel();
+            await requestTimeout.ConfigureAwait(false);
+            lock (stateLock) udpHealthEcho = null;
+        }
+    }
+
     private async Task ReceiveTcpAsync(CancellationToken token)
     {
         var frames = new TcpFrameReader();
         byte[] buffer = new byte[Constants.DATA_BUFFER_SIZE];
+        var received = new List<byte[]>();
+        Action<byte[]> collectFrame = received.Add;
         try
         {
             var stream = tcp!.GetStream();
@@ -219,7 +294,15 @@ internal sealed class SimulatedClient : IAsyncDisposable
             {
                 int length = await stream.ReadAsync(buffer, token).ConfigureAwait(false);
                 if (length == 0) throw new EndOfStreamException("Server đã đóng TCP.");
-                frames.Feed(buffer.AsSpan(0, length), HandleTcpPacket);
+                frames.Feed(buffer.AsSpan(0, length), collectFrame);
+                foreach (byte[] frame in received)
+                {
+                    if (token.IsCancellationRequested) return;
+                    if (HandleTcpPacket(frame) is not long sequence) continue;
+                    using var pong = ProtocolV3.CreateHeartbeatPong(sequence);
+                    await SendTcpFrameAsync(pong, ClientPackets.heartbeatPong, token).ConfigureAwait(false);
+                }
+                received.Clear();
             }
         }
         catch (Exception ex)
@@ -248,7 +331,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         }
     }
 
-    private void HandleTcpPacket(byte[] data)
+    private long? HandleTcpPacket(byte[] data)
     {
         using var packet = new Packet(data);
         packet.DecryptPayload();
@@ -260,35 +343,38 @@ internal sealed class SimulatedClient : IAsyncDisposable
         {
             case ServerPackets.serverHello:
                 AcceptServerHello(ProtocolV2.ReadServerHello(packet));
-                return;
+                return null;
             case ServerPackets.sessionGranted:
                 byte[] granted = ProtocolV2.ReadSessionGranted(packet);
                 lock (stateLock)
                 {
-                    if (!connected || lifetime.IsCancellationRequested) return;
+                    if (!connected || lifetime.IsCancellationRequested) return null;
                     if (!clientHelloSent || sessionToken != null)
                         throw new InvalidDataException("SessionGranted đến sai giai đoạn.");
-                    if (HandshakeHasExpired()) return;
+                    if (HandshakeHasExpired()) return null;
                     sessionToken = granted;
                     sessionGranted.TrySetResult(granted);
                 }
-                return;
+                return null;
             case ServerPackets.lobbyReady:
                 ProtocolV2.ReadLobbyReady(packet);
                 FinishHandshake();
-                return;
+                return null;
+            case ServerPackets.heartbeatPing:
+                return HandleHeartbeatPing(ProtocolV3.ReadHeartbeatPing(packet));
             case ServerPackets.welcome when !serverHello.Task.IsCompleted:
                 packet.ReadInt();
                 packet.ReadString();
                 if (packet.UnreadLength() != sizeof(int) || packet.ReadInt() <= 0)
                     throw new InvalidDataException("Welcome v1 không hợp lệ.");
                 RejectProtocolVersion(1);
-                return;
+                return null;
         }
 
         packet.ReadInt();
         lock (stateLock)
         {
+            if (ended || lifetime.IsCancellationRequested) return null;
             if (!ready) throw new InvalidDataException("TCP packet đến sai giai đoạn bắt tay.");
 
             switch (type)
@@ -340,6 +426,22 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     throw new InvalidDataException($"Packet server không được nhận diện: {type}.");
             }
         }
+        return null;
+    }
+
+    private long? HandleHeartbeatPing(long sequence)
+    {
+        lock (stateLock)
+        {
+            if (ended || lifetime.IsCancellationRequested) return null;
+            if (!ready) throw new InvalidDataException("Heartbeat đến trước lobbyReady.");
+
+            long now = Stopwatch.GetTimestamp();
+            if (!heartbeat.HasExpired(now)) return heartbeat.ShouldReply(sequence, now) ? sequence : null;
+        }
+
+        Fail(ErrorKind.Timeout, "Máy chủ không phản hồi heartbeat.");
+        return null;
     }
 
     private void AcceptServerHello((int Version, int SlotId) hello)
@@ -347,7 +449,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         if (hello.SlotId <= 0 || serverHello.Task.IsCompleted)
             throw new InvalidDataException("ServerHello không hợp lệ.");
         if (HandshakeHasExpired()) return;
-        if (hello.Version != ProtocolV2.Version)
+        if (hello.Version != ProtocolV3.Version)
         {
             RejectProtocolVersion(hello.Version);
             return;
@@ -363,13 +465,13 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     private void RejectProtocolVersion(int version)
     {
-        Fail(ErrorKind.Connection, $"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV2.Version}.");
-        tcp?.Dispose();
+        Fail(ErrorKind.Connection, $"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV3.Version}.");
     }
 
     private void HandleUdpPacket(byte[] data)
     {
-        using Packet packet = ProtocolV2.OpenServerDatagram(data);
+        using Packet packet = ProtocolV3.OpenServerDatagram(data);
+        if (packet.UnreadLength() < sizeof(int)) return;
         switch ((ServerPackets)packet.ReadInt(false))
         {
             case ServerPackets.udpProbeV2:
@@ -392,6 +494,15 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     var position = new Position(update.X, update.Y);
                     if (!position.IsFinite) throw new InvalidDataException("Tọa độ server không hữu hạn.");
                     ApplyPlayerPosition(update.PlayerId, position, isTcp: false);
+                }
+                break;
+            case ServerPackets.udpHealthEcho:
+                var echo = ProtocolV3.ReadUdpHealthEcho(packet);
+                lock (stateLock)
+                {
+                    if (ready && !ended && sessionToken is byte[] token && echo.Token.AsSpan().SequenceEqual(token) &&
+                        echo.Sequence == udpHealthSequence && Stopwatch.GetTimestamp() < udpHealthDeadline)
+                        udpHealthEcho?.TrySetResult();
                 }
                 break;
         }
@@ -580,55 +691,97 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     private void FinishHandshake()
     {
+        bool expired;
         lock (stateLock)
         {
-            if (!connected || ready || handshakeTimedOut || lifetime.IsCancellationRequested) return;
+            if (!connected || ready || ended || lifetime.IsCancellationRequested) return;
             if (!udpConfirmSent)
                 throw new InvalidDataException("lobbyReady đến trước khi xác nhận UDP.");
 
-            if (!HandshakeHasExpired())
+            long now = Stopwatch.GetTimestamp();
+            expired = now >= handshakeDeadline!.Value;
+            if (!expired)
             {
                 ready = true;
-                lobbyReady.TrySetResult();
-                return;
+                heartbeat.Start(now);
             }
         }
 
-        ExpireHandshake("Handshake TCP/UDP quá hạn.");
+        if (!expired)
+        {
+            heartbeatMonitor = WatchHeartbeatAsync(lifetime.Token);
+            lobbyReady.TrySetResult();
+        }
+        else ExpireHandshake("Handshake TCP/UDP quá hạn.");
+    }
+
+    private async Task WatchHeartbeatAsync(CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                long deadline;
+                lock (stateLock)
+                {
+                    if (ended) return;
+                    deadline = heartbeat.Deadline!.Value;
+                }
+                await DelayUntilAsync(deadline, token).ConfigureAwait(false);
+                lock (stateLock)
+                {
+                    if (!heartbeat.HasExpired(Stopwatch.GetTimestamp())) continue;
+                }
+                Fail(ErrorKind.Timeout, "Máy chủ không phản hồi heartbeat.");
+                return;
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
 
     private void ExpireHandshake(string message)
     {
         lock (stateLock)
         {
-            if (ready || handshakeTimedOut || lifetime.IsCancellationRequested) return;
-            handshakeTimedOut = true;
+            if (ready || ended || lifetime.IsCancellationRequested) return;
+            ended = true;
             connected = false;
             errors.Add(ErrorKind.Timeout, $"Client {index}: {message}");
         }
 
-        lifetime.Cancel();
-        tcp?.Dispose();
-        udp?.Dispose();
+        CloseTransport();
     }
 
     private void Fail(ErrorKind kind, string message)
     {
         lock (stateLock)
         {
-            if (handshakeTimedOut) return;
-            errors.Add(kind, $"Client {index}: {message}");
+            if (ended) return;
+            ended = true;
+            if (!lifetime.IsCancellationRequested) errors.Add(kind, $"Client {index}: {message}");
             connected = ready = false;
         }
-        lifetime.Cancel();
+        CloseTransport();
     }
 
-    public async ValueTask DisposeAsync()
+    private void CloseTransport()
     {
         lifetime.Cancel();
         tcp?.Dispose();
         udp?.Dispose();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        lock (stateLock)
+        {
+            ended = true;
+            connected = ready = false;
+        }
+        CloseTransport();
         await Task.WhenAll(receiveTcp, receiveUdp).ConfigureAwait(false);
+        await heartbeatMonitor.ConfigureAwait(false);
+        tcpWriteGate.Dispose();
         lifetime.Dispose();
     }
 }

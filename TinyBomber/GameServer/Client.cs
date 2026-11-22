@@ -27,17 +27,25 @@ namespace GameServer
         public class TCP
         {
             private const int HandshakeTimeoutSeconds = 20;
+            private static readonly long HeartbeatInterval = 5 * Stopwatch.Frequency;
+            private static readonly long HeartbeatTimeout = 20 * Stopwatch.Frequency;
             public TcpClient socket = null!;
             private readonly int id;
             private long? handshakeDeadline;
             private NetworkStream stream = null!;
             private byte[] receiveBuffer = null!;
             private TcpFrameReader frameReader = null!;
-            private readonly Queue<byte[]> pendingWrites = new();
+            private readonly Queue<(byte[] Frame, bool Heartbeat)> pendingWrites = new();
             private bool writing;
+            private bool heartbeatWritePending;
+            private bool writeFailed;
             private volatile bool closed;
             // Read and written by the server update thread.
             internal byte[]? SessionToken { get; set; }
+            private long? lastHeartbeatProof;
+            private long heartbeatSequence;
+            private long? pendingChallenge;
+            private long heartbeatAttempt;
 
             public TCP(int _id)
             {
@@ -52,10 +60,14 @@ namespace GameServer
             internal bool HandshakeHasExpired(long now) =>
                 handshakeDeadline is long deadline && now >= deadline;
 
-            public void Connect(TcpClient _socket)
+            internal void Attach(TcpClient clientSocket)
             {
-                socket = _socket;
                 StartHandshake(Stopwatch.GetTimestamp());
+                socket = clientSocket;
+            }
+
+            internal void StartReceiving()
+            {
                 socket.ReceiveBufferSize = Constants.DATA_BUFFER_SIZE;
                 socket.SendBufferSize = Constants.DATA_BUFFER_SIZE;
 
@@ -70,22 +82,61 @@ namespace GameServer
 
             internal void Close()
             {
-                closed = true;
+                lock (pendingWrites)
+                {
+                    closed = true;
+                    pendingWrites.Clear();
+                    heartbeatWritePending = false;
+                }
                 socket?.Close();
             }
 
-            public void SendData(Packet packet)
-            {
-                if (socket == null) return;
+            internal void StartHeartbeat(long now) => lastHeartbeatProof ??= now;
 
+            internal bool HeartbeatHasExpired(long now) =>
+                lastHeartbeatProof is long proof && now - proof >= HeartbeatTimeout;
+
+            internal bool HeartbeatIsDue(long now) =>
+                lastHeartbeatProof is long proof && (now - proof) / HeartbeatInterval > heartbeatAttempt;
+
+            internal void SendHeartbeatIfDue(long now, Func<long, bool>? queuePing = null)
+            {
+                if (!HeartbeatIsDue(now) || HeartbeatHasExpired(now)) return;
+
+                // Consume elapsed send windows without enqueuing a burst after an update-thread stall.
+                heartbeatAttempt = (now - lastHeartbeatProof!.Value) / HeartbeatInterval;
+                long sequence = pendingChallenge ?? checked(heartbeatSequence + 1);
+                if (!(queuePing?.Invoke(sequence) ?? ServerSend.HeartbeatPing(this, sequence))) return;
+
+                heartbeatSequence = sequence;
+                pendingChallenge = sequence;
+            }
+
+            internal void AcceptHeartbeatPong(long sequence, long now)
+            {
+                if (pendingChallenge != sequence || HeartbeatHasExpired(now)) return;
+                pendingChallenge = null;
+                lastHeartbeatProof = now;
+                heartbeatAttempt = 0;
+            }
+
+            public void SendData(Packet packet) => QueueWrite(packet, heartbeat: false);
+
+            internal bool SendHeartbeat(Packet packet) => QueueWrite(packet, heartbeat: true);
+
+            private bool QueueWrite(Packet packet, bool heartbeat)
+            {
                 lock (pendingWrites)
                 {
-                    pendingWrites.Enqueue(packet.ToArray());
-                    if (writing) return;
+                    if (socket == null || closed || writeFailed || (heartbeat && heartbeatWritePending)) return false;
+                    pendingWrites.Enqueue((packet.ToArray(), heartbeat));
+                    if (heartbeat) heartbeatWritePending = true;
+                    if (writing) return true;
                     writing = true;
                 }
 
                 _ = WritePending();
+                return true;
             }
 
             private async Task WritePending()
@@ -94,10 +145,10 @@ namespace GameServer
                 {
                     while (true)
                     {
-                        byte[] frame;
+                        (byte[] Frame, bool Heartbeat) write;
                         lock (pendingWrites)
                         {
-                            if (!pendingWrites.TryDequeue(out frame!))
+                            if (closed || !pendingWrites.TryDequeue(out write))
                             {
                                 writing = false;
                                 return;
@@ -106,18 +157,29 @@ namespace GameServer
 
                         try
                         {
-                            await stream.WriteAsync(frame.AsMemory()).ConfigureAwait(false);
+                            await stream.WriteAsync(write.Frame.AsMemory()).ConfigureAwait(false);
                         }
                         catch
                         {
                             Server.Network.RecordTcpSendError();
                             throw;
                         }
-                        Server.Network.RecordTcpWrite(frame.Length);
+                        Server.Network.RecordTcpWrite(write.Frame.Length);
+                        if (write.Heartbeat)
+                        {
+                            lock (pendingWrites) heartbeatWritePending = false;
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
+                    lock (pendingWrites)
+                    {
+                        writeFailed = true;
+                        writing = false;
+                        heartbeatWritePending = false;
+                        pendingWrites.Clear();
+                    }
                     if (closed) return;
                     Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {ex.Message}");
                     ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
@@ -145,8 +207,14 @@ namespace GameServer
                         EnqueueCurrent(slot => ServerHandle.ConfirmUdp(slot, this, confirm.Token, confirm.Nonce));
                         return;
                     }
+                    if (packetId == (int)ClientPackets.heartbeatPong)
+                    {
+                        long sequence = ProtocolV3.ReadHeartbeatPong(_packet);
+                        EnqueueCurrent(slot => ServerHandle.HeartbeatPong(slot, this, sequence));
+                        return;
+                    }
                     if (packetId is (int)ClientPackets.welcomeReceived or (int)ClientPackets.udpReady)
-                        throw new InvalidDataException("Legacy v1 handshake packet on a v2 connection.");
+                        throw new InvalidDataException("Legacy v1 handshake packet on a v3 connection.");
 
                     _packet.ReadInt();
                     if (packetId == (int)ClientPackets.placeBomb)
@@ -191,7 +259,7 @@ namespace GameServer
                 ThreadManager.EnqueueAction(() =>
                 {
                     Client slot = Server.clients[id];
-                    if (slot.tcp == this) action(slot);
+                    if (!closed && slot.tcp == this) action(slot);
                 });
             }
 
@@ -201,6 +269,7 @@ namespace GameServer
                 {
                     int _byteLength = stream.EndRead(_result);
                     if (_byteLength > 0) Server.Network.RecordTcpReceive(_byteLength);
+                    if (closed) return;
                     if (_byteLength <= 0)
                     {
                         ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
@@ -209,7 +278,7 @@ namespace GameServer
 
                     frameReader.Feed(receiveBuffer.AsSpan(0, _byteLength), HandleFrame);
 
-                    stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
+                    if (!closed) stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
                 }
                 catch (Exception _ex)
                 {

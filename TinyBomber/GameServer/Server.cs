@@ -138,6 +138,7 @@ namespace GameServer
             try
             {
                 using Packet packet = ProtocolV2.OpenClientDatagram(data, out _);
+                if (packet.UnreadLength() < sizeof(int)) return;
                 switch ((ClientPackets)packet.ReadInt(false))
                 {
                     case ClientPackets.udpRegistration:
@@ -153,6 +154,11 @@ namespace GameServer
                         var move = ProtocolV2.ReadUdpPlayerMovement(packet);
                         ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
                             endpoint, move.Token, move.RoomId, move.RoundId, move.X, move.Y));
+                        break;
+                    case ClientPackets.udpHealthProbe:
+                        var probe = ProtocolV3.ReadUdpHealthProbe(packet);
+                        ThreadManager.EnqueueAction(() => ServerHandle.UdpHealthProbe(clients[slotId], connection, udp,
+                            endpoint, probe.Token, probe.Sequence));
                         break;
                 }
             }
@@ -225,12 +231,12 @@ namespace GameServer
 
         private static void UpdateLoop()
         {
-            var expiredHandshakes = new List<(int Id, Client.TCP Connection)>();
+            var dueConnections = new List<(int Id, Client.TCP Connection)>();
             while (isRunning)
             {
                 long now = Stopwatch.GetTimestamp();
                 metrics.BeginTick(now);
-                ExpirePendingHandshakes(now, expiredHandshakes);
+                UpdateConnections(now, dueConnections);
                 ThreadManager.UpdateMain();
                 long roomStarted = Stopwatch.GetTimestamp();
                 foreach (var room in rooms.Values) room.UpdateRound(roomStarted);
@@ -241,21 +247,37 @@ namespace GameServer
             }
         }
 
-        private static void ExpirePendingHandshakes(long now, List<(int Id, Client.TCP Connection)> expired)
+        private static void UpdateConnections(long now, List<(int Id, Client.TCP Connection)> due)
         {
             lock (slotLock)
             {
                 foreach (var slot in clients.Values)
                 {
                     Client.TCP connection = slot.tcp;
-                    if (connection.socket != null && !slot.IsReady && connection.HandshakeHasExpired(now))
-                        expired.Add((slot.id, connection));
+                    if (connection.socket != null && (slot.IsReady
+                        ? connection.HeartbeatIsDue(now)
+                        : connection.HandshakeHasExpired(now)))
+                        due.Add((slot.id, connection));
                 }
             }
 
-            foreach (var (id, connection) in expired)
+            foreach (var (id, connection) in due)
+                UpdateConnection(id, connection, Stopwatch.GetTimestamp());
+            due.Clear();
+        }
+
+        internal static void UpdateConnection(int id, Client.TCP connection, long now)
+        {
+            Client slot = clients[id];
+            if (slot.tcp != connection || connection.socket == null) return;
+            if (!slot.IsReady)
+            {
                 ExpireHandshake(id, connection, now);
-            expired.Clear();
+                return;
+            }
+
+            if (connection.HeartbeatHasExpired(now)) Disconnect(id, connection);
+            else connection.SendHeartbeatIfDue(now);
         }
 
         // Runs on the update thread. Ignore a timeout for a TCP wrapper that has already been removed.
@@ -304,10 +326,10 @@ namespace GameServer
 
             tcpListener?.Stop();
             udpSocket?.Close();
+            Client.TCP[] connections;
             lock (slotLock)
-            {
-                foreach (var slot in clients.Values) slot.tcp.socket?.Close();
-            }
+                connections = clients.Values.Select(slot => slot.tcp).ToArray();
+            foreach (var connection in connections) connection.Close();
             if (exporter != null)
             {
                 LastExporterStopResult = exporter.StopAsync().GetAwaiter().GetResult();
@@ -339,31 +361,36 @@ namespace GameServer
             }
             Console.WriteLine($"[KẾT NỐI MỚI] Co nguoi vua truy cap tu IP: {_client.Client.RemoteEndPoint}");
 
+            Client.TCP? connection = null;
+            int slotId = 0;
             lock (slotLock)
             {
-                if (stopping)
-                {
-                    _client.Close();
-                    return;
-                }
-                for (int i = 1; i <= MaxConnections; i++)
+                for (int i = 1; !stopping && i <= MaxConnections; i++)
                 {
                     if (clients[i].tcp.socket == null)
                     {
-                        try { clients[i].tcp.Connect(_client); }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"TCP setup failed for slot {i}: {ex.Message}");
-                            var failed = clients[i].tcp;
-                            int failedId = i;
-                            ThreadManager.EnqueueAction(() => Disconnect(failedId, failed));
-                        }
-                        return;
+                        connection = clients[i].tcp;
+                        connection.Attach(_client);
+                        slotId = i;
+                        break;
                     }
                 }
             }
-            Console.WriteLine($"[TỪ CHỐI] Server da day, khong the nhan them {_client.Client.RemoteEndPoint}");
-            _client.Close();
+            if (connection == null)
+            {
+                if (!stopping)
+                    Console.WriteLine($"[TỪ CHỐI] Server da day, khong the nhan them {_client.Client.RemoteEndPoint}");
+                _client.Close();
+                return;
+            }
+
+            try { connection.StartReceiving(); }
+            catch (Exception ex)
+            {
+                if (stopping) return;
+                Console.WriteLine($"TCP setup failed for slot {slotId}: {ex.Message}");
+                ThreadManager.EnqueueAction(() => Disconnect(slotId, connection));
+            }
         }
 
         public static void Disconnect(int id, Client.TCP connection)
@@ -372,12 +399,12 @@ namespace GameServer
             lock (slotLock)
             {
                 if (slot.tcp != connection) return;
-                connection.Close();
                 slot.Username = null;
                 slot.UdpConfirmed = false;
                 slot.tcp = new Client.TCP(id);
                 slot.udp = new Client.UDP(id);
             }
+            connection.Close();
             RemoveFromRoom(slot);
         }
 

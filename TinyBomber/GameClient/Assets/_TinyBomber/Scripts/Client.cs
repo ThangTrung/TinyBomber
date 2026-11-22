@@ -36,8 +36,14 @@ public class Client : MonoBehaviour
 
     private void Update()
     {
-        if (!IsConnecting || CheckHandshakeDeadline()) return;
-        udp?.RetryRegistration();
+            if (IsConnecting)
+            {
+                if (!CheckHandshakeDeadline()) udp?.RetryRegistration();
+            }
+            else if (tcp != null && tcp.Heartbeat.HasExpired(Stopwatch.GetTimestamp()))
+            {
+                Disconnect("Máy chủ không phản hồi heartbeat.");
+            }
     }
 
     private bool CheckHandshakeDeadline()
@@ -81,9 +87,9 @@ public class Client : MonoBehaviour
         if (!IsConnecting || myId != 0 || slotId <= 0)
             throw new InvalidDataException("ServerHello không hợp lệ.");
         if (CheckHandshakeDeadline()) return;
-        if (version != ProtocolV2.Version)
+        if (version != ProtocolV3.Version)
         {
-            Disconnect($"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV2.Version}.");
+            Disconnect($"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV3.Version}.");
             return;
         }
 
@@ -105,7 +111,7 @@ public class Client : MonoBehaviour
         {
             // Use the actual IPv4 peer selected by TCP, including when connecting by hostname.
             var server = (IPEndPoint)tcp.socket.Client.RemoteEndPoint;
-            udp = new UDP(server.Address);
+            udp = new UDP(server.Address, tcp);
             udp.Connect();
         }
         catch (SocketException ex)
@@ -123,6 +129,7 @@ public class Client : MonoBehaviour
         if (CheckHandshakeDeadline()) return;
 
         IsConnecting = false;
+        tcp.Heartbeat.Start(Stopwatch.GetTimestamp());
         GameManager.instance.ConfirmLobbyReady();
     }
 
@@ -168,6 +175,7 @@ public class Client : MonoBehaviour
         private bool sendFailed;
         internal byte[] SessionToken { get; set; }
         internal bool UdpConfirmSent { get; set; }
+        internal HeartbeatWatchdog Heartbeat { get; } = new HeartbeatWatchdog();
 
         internal bool HandshakeHasExpired(long now) => now >= handshakeDeadline;
 
@@ -329,6 +337,25 @@ public class Client : MonoBehaviour
                     instance.FinishHandshake();
                     return;
                 }
+                if (_packetId == (int)ServerPackets.heartbeatPing)
+                {
+                    long sequence = ProtocolV3.ReadHeartbeatPing(_packet);
+                    if (instance.IsConnecting)
+                        throw new InvalidDataException("Heartbeat đến trước lobbyReady.");
+
+                    long now = Stopwatch.GetTimestamp();
+                    if (Heartbeat.HasExpired(now))
+                    {
+                        instance.Disconnect("Máy chủ không phản hồi heartbeat.");
+                        return;
+                    }
+                    if (Heartbeat.ShouldReply(sequence, now))
+                    {
+                        using var pong = ProtocolV3.CreateHeartbeatPong(sequence);
+                        SendData(pong);
+                    }
+                    return;
+                }
 
                 _packet.ReadInt();
                 if (_packetId == (int)ServerPackets.welcome && instance.IsConnecting && instance.myId == 0)
@@ -336,7 +363,7 @@ public class Client : MonoBehaviour
                     _packet.ReadString();
                     if (_packet.UnreadLength() != sizeof(int) || _packet.ReadInt() <= 0)
                         throw new InvalidDataException("Welcome v1 không hợp lệ.");
-                    instance.Disconnect($"Máy chủ dùng protocol v1. Client yêu cầu v{ProtocolV2.Version}.");
+                    instance.Disconnect($"Máy chủ dùng protocol v1. Client yêu cầu v{ProtocolV3.Version}.");
                     return;
                 }
                 if (instance.IsConnecting)
@@ -398,6 +425,7 @@ public class Client : MonoBehaviour
             try
             {
                 int _byteLength = stream.EndRead(_result);
+                if (closed) return;
                 if (_byteLength <= 0)
                 {
                     RequestDisconnect("Máy chủ đã đóng kết nối.");
@@ -406,7 +434,7 @@ public class Client : MonoBehaviour
 
                 frameReader.Feed(receiveBuffer.AsSpan(0, _byteLength), HandleFrame);
 
-                stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
+                if (!closed) stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
             }
             catch (Exception _ex)
             {
@@ -420,8 +448,12 @@ public class Client : MonoBehaviour
     {
         public UdpClient socket;
         private readonly IPEndPoint serverEndPoint;
+        private readonly TCP connection;
         private volatile bool closed;
         private float nextRegistrationAt;
+        private long healthSequence;
+        private long? healthDeadline;
+        internal long LastConfirmedHealthSequence { get; private set; }
 
         public void Close()
         {
@@ -429,9 +461,10 @@ public class Client : MonoBehaviour
             socket?.Close();
         }
 
-        public UDP(IPAddress address)
+        public UDP(IPAddress address, TCP connection)
         {
             serverEndPoint = new IPEndPoint(address, Constants.UDP_PORT);
+            this.connection = connection;
         }
 
         public void Connect()
@@ -450,6 +483,21 @@ public class Client : MonoBehaviour
             nextRegistrationAt = Time.unscaledTime + 1f;
             using var packet = ProtocolV2.CreateUdpRegistration(instance.myId, instance.tcp.SessionToken);
             SendData(packet);
+        }
+
+        // Explicit request from the main thread. Periodic health checks are owned by a later change.
+        internal bool TrySendHealthProbe()
+        {
+            if (closed || socket == null || instance == null || instance.udp != this || instance.tcp != connection ||
+                instance.IsConnecting || connection.SessionToken is not byte[] token) return false;
+
+            long now = Stopwatch.GetTimestamp();
+            if (healthDeadline is long deadline && now < deadline) return false;
+            healthSequence = checked(healthSequence + 1);
+            healthDeadline = now + 5 * Stopwatch.Frequency;
+            using var probe = ProtocolV3.CreateUdpHealthProbe(instance.myId, token, healthSequence);
+            SendData(probe);
+            return true;
         }
 
         public void SendData(Packet _packet)
@@ -474,13 +522,14 @@ public class Client : MonoBehaviour
             {
                 IPEndPoint sender = null;
                 byte[] _data = socket.EndReceive(_result, ref sender);
+                if (closed) return;
                 socket.BeginReceive(ReceiveCallback, null);
 
                 if (_data.Length < 4) return;
 
                 ThreadManager.ExecuteOnMainThread(() =>
                 {
-                    if (closed || instance == null || instance.udp != this) return;
+                    if (closed || instance == null || instance.udp != this || instance.tcp != connection) return;
                     HandleData(_data);
                 });
             }
@@ -494,8 +543,8 @@ public class Client : MonoBehaviour
         {
             try
             {
-                using Packet packet = ProtocolV2.OpenServerDatagram(data);
-                TCP connection = instance.tcp;
+                using Packet packet = ProtocolV3.OpenServerDatagram(data);
+                if (packet.UnreadLength() < sizeof(int)) return;
                 byte[] token = connection.SessionToken;
                 switch ((ServerPackets)packet.ReadInt(false))
                 {
@@ -508,9 +557,20 @@ public class Client : MonoBehaviour
                         break;
                     case ServerPackets.udpPlayerPosition:
                         var position = ProtocolV2.ReadUdpPlayerPosition(packet);
-                        if (instance.IsConnecting || !position.Token.AsSpan().SequenceEqual(token)) return;
+                        if (instance.IsConnecting || !position.Token.AsSpan().SequenceEqual(token) ||
+                            float.IsNaN(position.X) || float.IsInfinity(position.X) ||
+                            float.IsNaN(position.Y) || float.IsInfinity(position.Y)) return;
                         ClientHandle.ApplyPlayerPosition(position.RoomId, position.RoundId, position.PlayerId,
                             position.X, position.Y);
+                        break;
+                    case ServerPackets.udpHealthEcho:
+                        var echo = ProtocolV3.ReadUdpHealthEcho(packet);
+                        if (!instance.IsConnecting && echo.Token.AsSpan().SequenceEqual(token) &&
+                            healthDeadline is long deadline && Stopwatch.GetTimestamp() < deadline && echo.Sequence == healthSequence)
+                        {
+                            healthDeadline = null;
+                            LastConfirmedHealthSequence = echo.Sequence;
+                        }
                         break;
                 }
             }
@@ -521,8 +581,6 @@ public class Client : MonoBehaviour
             catch (Exception ex)
             {
                 Debug.LogException(ex);
-                if (!closed && instance != null && instance.udp == this)
-                    instance.Disconnect("Không áp dụng được dữ liệu UDP từ máy chủ.");
             }
         }
     }

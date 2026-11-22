@@ -18,7 +18,7 @@ namespace GameServer
 
         internal static void ServerHello(Client.TCP connection, int slotId)
         {
-            using var packet = ProtocolV2.CreateServerHello(slotId);
+            using var packet = ProtocolV3.CreateServerHello(slotId);
             connection.SendData(packet);
         }
 
@@ -38,6 +38,18 @@ namespace GameServer
         {
             using var packet = ProtocolV2.CreateLobbyReady();
             slot.tcp.SendData(packet);
+        }
+
+        internal static bool HeartbeatPing(Client.TCP connection, long sequence)
+        {
+            using var packet = ProtocolV3.CreateHeartbeatPing(sequence);
+            return connection.SendHeartbeat(packet);
+        }
+
+        internal static void UdpHealthEcho(Client.UDP udp, byte[] token, long sequence)
+        {
+            using var packet = ProtocolV3.CreateUdpHealthEcho(token, sequence);
+            udp.SendData(packet);
         }
 
         internal static void RoomChanged(Client slot, int roomId)

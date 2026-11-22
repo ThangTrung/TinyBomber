@@ -13,10 +13,10 @@ namespace GameServer
         {
             if (slot.tcp != connection || connection.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp())) return;
 
-            if (version != ProtocolV2.Version || slotId != slot.id)
+            if (version != ProtocolV3.Version || slotId != slot.id)
             {
-                Console.WriteLine(version != ProtocolV2.Version
-                    ? $"Client protocol version {version} does not match {ProtocolV2.Version}."
+                Console.WriteLine(version != ProtocolV3.Version
+                    ? $"Client protocol version {version} does not match {ProtocolV3.Version}."
                     : $"ClientHello slot does not match connection {slot.id}.");
                 Server.Disconnect(slot.id, connection);
                 return;
@@ -42,13 +42,21 @@ namespace GameServer
 
         internal static void ConfirmUdp(Client slot, Client.TCP connection, byte[] token, byte[] nonce, long? now = null)
         {
+            long appliedAt = now ?? Stopwatch.GetTimestamp();
             if (slot.tcp != connection || slot.Username == null || slot.UdpConfirmed || slot.udp.endPoint == null ||
                 slot.udp.ProbeNonce is not byte[] probeNonce || !HasToken(connection, token) ||
                 !CryptographicOperations.FixedTimeEquals(probeNonce, nonce) ||
-                connection.HandshakeHasExpired(now ?? Stopwatch.GetTimestamp())) return;
+                connection.HandshakeHasExpired(appliedAt)) return;
 
             slot.UdpConfirmed = true;
+            connection.StartHeartbeat(appliedAt);
             ServerSend.LobbyReady(slot);
+        }
+
+        internal static void HeartbeatPong(Client slot, Client.TCP connection, long sequence, long? now = null)
+        {
+            if (slot.tcp != connection || !slot.IsReady) return;
+            connection.AcceptHeartbeatPong(sequence, now ?? Stopwatch.GetTimestamp());
         }
 
         internal static void UdpMovement(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
@@ -58,6 +66,15 @@ namespace GameServer
                 !endpoint.Equals(udp.endPoint) || !HasToken(connection, token)) return;
 
             PlayerMovement(slot, roomId, roundId, x, y);
+        }
+
+        internal static void UdpHealthProbe(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
+            byte[] token, long sequence)
+        {
+            if (slot.tcp != connection || slot.udp != udp || !slot.IsReady ||
+                !endpoint.Equals(udp.endPoint) || !HasToken(connection, token)) return;
+
+            ServerSend.UdpHealthEcho(udp, token, sequence);
         }
 
         private static bool HasToken(Client.TCP connection, byte[] token) =>
