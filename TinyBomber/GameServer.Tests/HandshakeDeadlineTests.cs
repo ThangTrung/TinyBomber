@@ -197,7 +197,7 @@ public sealed class HandshakeDeadlineTests
                 secondRoom.X + 0.125f, secondRoom.Y, token);
             await AssertUdpQuietAsync(replacement.Udp, token);
 
-            await AssertSameEndpointReconnectAsync(ready, tcpPort, token);
+            await AssertSameEndpointReconnectAsync(ready, firstRoom, tcpPort, udpPort, token);
             replacement.Dispose();
             otherHost.Dispose();
             otherMember.Dispose();
@@ -303,8 +303,11 @@ public sealed class HandshakeDeadlineTests
             (position.RoomId, position.RoundId, position.PlayerId, position.X, position.Y));
     }
 
-    private static async Task AssertSameEndpointReconnectAsync(Peer original, int tcpPort, CancellationToken token)
+    private static async Task AssertSameEndpointReconnectAsync(Peer original,
+        (int Id, int Round, float X, float Y) oldRoom, int tcpPort, int udpPort, CancellationToken token)
     {
+        using var oldMovement = ProtocolV2.CreateUdpPlayerMovement(original.SlotId, original.SessionToken,
+            oldRoom.Id, oldRoom.Round, oldRoom.X + 0.0625f, oldRoom.Y);
         original.CloseTcp();
         while (Server.LatestMetrics?.ConnectedClients != 3)
             await Task.Delay(50, token);
@@ -317,7 +320,30 @@ public sealed class HandshakeDeadlineTests
         using var stale = ProtocolV2.CreateUdpRegistration(original.SlotId, original.SessionToken);
         await original.Udp.SendAsync(stale.ToArray(), token);
         await AssertUdpQuietAsync(original.Udp, token);
-        await replacement.ConfirmAsync(await replacement.RegisterUdpAsync(token), token);
+        byte[] nonce = await replacement.RegisterUdpAsync(token);
+        await replacement.ConfirmAsync(nonce, token);
+        await replacement.SendConfirmAsync(nonce, token);
+
+        using var recipient = await Peer.OpenAsync(tcpPort, token);
+        await recipient.CompleteHandshakeAsync(udpPort, token);
+        // Also verifies that the repeated confirm did not produce another lobbyReady before roomChanged.
+        var room = await StartRoomAsync(replacement, recipient, token);
+        Assert.NotEqual(oldRoom.Id, room.Id);
+
+        await original.Udp.SendAsync(oldMovement.ToArray(), token);
+        await replacement.SendMovementAsync(room.Id, room.Round, room.X + 0.0625f, room.Y,
+            original.SessionToken, original.Udp, token);
+        await AssertUdpQuietAsync(recipient.Udp, token);
+        await replacement.SendMovementAsync(room.Id, room.Round, 999f, 999f, replacement.SessionToken,
+            replacement.Udp, token);
+        using Packet correction = await replacement.ReadAsync(ServerPackets.playerPosition, token);
+        Assert.Equal((room.Id, room.Round, replacement.SlotId, room.X, room.Y),
+            (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(), correction.ReadFloat(), correction.ReadFloat()));
+
+        float x = room.X + 0.125f;
+        await replacement.SendMovementAsync(room.Id, room.Round, x, room.Y, replacement.SessionToken,
+            replacement.Udp, token);
+        await AssertUdpPositionAsync(recipient, replacement, room.Id, room.Round, x, room.Y, token);
     }
 
     private static async Task AssertUdpQuietAsync(UdpClient udp, CancellationToken token)
@@ -455,11 +481,16 @@ public sealed class HandshakeDeadlineTests
 
         internal async Task ConfirmAsync(byte[] nonce, CancellationToken token)
         {
-            using var confirm = ProtocolV2.CreateUdpConfirm(SessionToken, nonce);
-            await Stream.WriteAsync(confirm.ToArray(), token);
+            await SendConfirmAsync(nonce, token);
             using Packet ready = await ReadAsync(ServerPackets.lobbyReady, token, leaveId: true);
             ProtocolV2.ReadLobbyReady(ready);
             Assert.Equal(0, ready.UnreadLength());
+        }
+
+        internal async Task SendConfirmAsync(byte[] nonce, CancellationToken token)
+        {
+            using var confirm = ProtocolV2.CreateUdpConfirm(SessionToken, nonce);
+            await Stream.WriteAsync(confirm.ToArray(), token);
         }
 
         internal async Task<Packet> ReadAsync(ServerPackets expected, CancellationToken token,
