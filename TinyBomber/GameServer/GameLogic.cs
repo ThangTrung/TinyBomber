@@ -44,7 +44,7 @@ namespace GameServer
             slot.Room == this && roomId == Id && Phase == MatchPhase.Playing && roundId == RoundId &&
             slot.player is { isAlive: true };
 
-        internal void StartRound(Client requester, int roomId, int expectedRoundId)
+        internal void StartRound(Client requester, int roomId, int expectedRoundId, long? now = null)
         {
             if (requester.Room != this || roomId != Id || Phase == MatchPhase.Playing ||
                 expectedRoundId != RoundId || !requester.IsReady)
@@ -56,11 +56,12 @@ namespace GameServer
             RoundId++;
             WinnerId = 0;
             InitializeMap();
+            long spawnedAt = now ?? Stopwatch.GetTimestamp();
             foreach (var slot in members) slot.player = null;
             for (int i = 0; i < participants.Length; i++)
             {
                 Client slot = participants[i];
-                slot.player = new Player(slot.id, slot.Username!, i);
+                slot.player = new Player(slot.id, slot.Username!, i, spawnedAt);
             }
             Phase = MatchPhase.Playing;
 

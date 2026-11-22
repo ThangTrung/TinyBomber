@@ -68,7 +68,7 @@ public sealed class RoomLobbyTests
             ServerHandle.LeaveRoom(mover, oldRoom.Id);
             ServerHandle.JoinRoom(newGuest, newRoom.Id);
             ServerHandle.JoinRoom(mover, newRoom.Id);
-            newRoom.StartRound(newHost, newRoom.Id, 0);
+            newRoom.StartRound(newHost, newRoom.Id, 0, now: 0);
 
             Assert.Equal(MatchPhase.Playing, oldRoom.Phase);
             oldRoom.UpdateRound(long.MaxValue);
@@ -76,14 +76,14 @@ public sealed class RoomLobbyTests
             Assert.Equal(oldRoundId, newRoom.RoundId);
             Player player = mover.player!;
             var initial = (player.x, player.y);
-            var (x, y) = GameLogic.GridToWorld(2, 13);
-            ServerHandle.PlayerMovement(mover, oldRoom.Id, oldRoundId, x, y);
+            var (x, y) = (player.x + 0.0625f, player.y);
+            ServerHandle.PlayerMovement(mover, oldRoom.Id, oldRoundId, x, y, now: 0);
             newRoom.PlaceBomb(mover, oldRoom.Id, oldRoundId);
             Assert.Equal(initial, (player.x, player.y));
             newRoom.UpdateRound(long.MaxValue);
             Assert.True(player.isAlive);
 
-            ServerHandle.PlayerMovement(mover, newRoom.Id, newRoom.RoundId, x, y);
+            ServerHandle.PlayerMovement(mover, newRoom.Id, newRoom.RoundId, x, y, now: 0);
             Assert.Equal((x, y), (player.x, player.y));
         }
         finally

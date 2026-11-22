@@ -60,12 +60,12 @@ namespace GameServer
         }
 
         internal static void UdpMovement(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
-            byte[] token, int roomId, int roundId, float x, float y)
+            byte[] token, int roomId, int roundId, float x, float y, long? now = null)
         {
             if (slot.tcp != connection || slot.udp != udp || !slot.IsReady ||
                 !endpoint.Equals(udp.endPoint) || !HasToken(connection, token)) return;
 
-            PlayerMovement(slot, roomId, roundId, x, y);
+            PlayerMovement(slot, roomId, roundId, x, y, now);
         }
 
         internal static void UdpHealthProbe(Client slot, Client.TCP connection, Client.UDP udp, IPEndPoint endpoint,
@@ -138,12 +138,13 @@ namespace GameServer
             ServerSend.MatchState(room);
         }
 
-        public static void PlayerMovement(Client slot, int roomId, int roundId, float _x, float _y)
+        public static void PlayerMovement(Client slot, int roomId, int roundId, float _x, float _y, long? now = null)
         {
             if (slot.Room is not GameLogic room || !room.AcceptsInput(slot, roomId, roundId)) return;
 
             Player player = slot.player!;
-            if (room.CanMove(player, _x, _y))
+            long appliedAt = now ?? Stopwatch.GetTimestamp();
+            if (room.CanMove(player, _x, _y) && player.TrySpendMovementCredit(_x, _y, appliedAt))
             {
                 player.x = _x;
                 player.y = _y;

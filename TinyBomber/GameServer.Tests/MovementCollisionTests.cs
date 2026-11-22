@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using GameShared;
 
 namespace GameServer.Tests;
@@ -7,12 +8,13 @@ public sealed class MovementCollisionTests
     private readonly GameLogic room = new(1);
     private readonly Client mover = new(1) { Username = "Mover", UdpConfirmed = true };
     private readonly Client peer = new(2) { Username = "Peer", UdpConfirmed = true };
+    private long now;
 
     public MovementCollisionTests()
     {
         Assert.True(room.TryAddMember(mover));
         Assert.True(room.TryAddMember(peer));
-        room.StartRound(mover, room.Id, 0);
+        room.StartRound(mover, room.Id, 0, now);
         Assert.Equal(MatchPhase.Playing, room.Phase);
         Array.Clear(room.mapData);
     }
@@ -29,6 +31,7 @@ public sealed class MovementCollisionTests
 
         Assert.True(TerrainCollision.CanStandAt(room.mapData, start.X, start.Y));
         Assert.True(TerrainCollision.CanStandAt(room.mapData, target.X, target.Y));
+        Assert.False(room.CanMove(mover.player, target.X, target.Y));
         MoveAndExpect(mover, target, start);
     }
 
@@ -39,17 +42,19 @@ public sealed class MovementCollisionTests
         var start = (X: -0.5f, Y: 0.5f);
         var target = (X: 1.5f, Y: 0.5f);
         (mover.player!.x, mover.player.y) = start;
+        Assert.False(room.CanMove(mover.player, target.X, target.Y));
         MoveAndExpect(mover, target, start);
 
         // Place the bomb above the soft block and move the owner beyond its blast.
         (peer.player!.x, peer.player.y) = (0.5f, 1.5f);
         room.PlaceBomb(peer, room.Id, room.RoundId);
-        MoveAndExpect(peer, (2.5f, 1.5f), (2.5f, 1.5f));
+        MoveAcrossOpenRow(peer, 2.5f);
         room.UpdateRound(long.MaxValue);
 
         Assert.Equal(0, room.mapData[9, 8]);
         Assert.Equal(MatchPhase.Playing, room.Phase);
-        MoveAndExpect(mover, target, target);
+        Assert.True(room.CanMove(mover.player, target.X, target.Y));
+        MoveAcrossOpenRow(mover, target.X);
     }
 
     [Theory]
@@ -93,10 +98,13 @@ public sealed class MovementCollisionTests
         (peer.player!.x, peer.player.y) = left;
         room.PlaceBomb(mover, room.Id, room.RoundId);
 
-        MoveAndExpect(peer, bomb, left);
-        MoveAndExpect(peer, right, left);
-        MoveAndExpect(mover, right, right);
-        MoveAndExpect(mover, bomb, right);
+        Assert.False(room.CanMove(peer.player, bomb.X, bomb.Y));
+        Assert.False(room.CanMove(peer.player, right.X, right.Y));
+        MoveAndExpect(peer, (-0.25f, bomb.Y), left);
+        Assert.True(room.CanMove(mover.player, right.X, right.Y));
+        MoveAcrossOpenRow(mover, right.X);
+        Assert.False(room.CanMove(mover.player, bomb.X, bomb.Y));
+        MoveAndExpect(mover, (1.25f, bomb.Y), right);
     }
 
     [Theory]
@@ -115,8 +123,19 @@ public sealed class MovementCollisionTests
 
     private void MoveAndExpect(Client slot, (float X, float Y) target, (float X, float Y) expected)
     {
-        ServerHandle.PlayerMovement(slot, room.Id, room.RoundId, target.X, target.Y);
+        now += Stopwatch.Frequency / 10;
+        ServerHandle.PlayerMovement(slot, room.Id, room.RoundId, target.X, target.Y, now);
 
         Assert.Equal(expected, (slot.player!.x, slot.player.y));
+    }
+
+    // Advance by an affordable step each time so the handler still checks the actual path.
+    private void MoveAcrossOpenRow(Client slot, float destinationX)
+    {
+        var player = slot.player!;
+        for (float x = player.x + 0.25f; x <= destinationX; x += 0.25f)
+            MoveAndExpect(slot, (x, player.y), (x, player.y));
+
+        Assert.Equal(destinationX, player.x);
     }
 }

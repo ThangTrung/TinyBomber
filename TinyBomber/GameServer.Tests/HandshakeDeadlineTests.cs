@@ -201,6 +201,7 @@ public sealed class HandshakeDeadlineTests
             Assert.NotEqual(firstRoom.Id, secondRoom.Id);
             await AssertMovementAsync(ready, replacement, otherMember, udpPort, firstRoom, token);
             await AssertCornerSweepAsync(ready, replacement, firstRoom, token);
+            await AssertSpeedRejectAndRecoveryAsync(ready, replacement, firstRoom, token);
             await otherHost.SendMovementAsync(secondRoom.Id, secondRoom.Round, secondRoom.X + 0.125f,
                 secondRoom.Y, otherHost.SessionToken, otherHost.Udp, token);
             await AssertUdpPositionAsync(otherMember, otherHost, secondRoom.Id, secondRoom.Round,
@@ -230,6 +231,9 @@ public sealed class HandshakeDeadlineTests
         await mover.SendMovementAsync(room.Id, room.Round, ax, ay, mover.SessionToken, mover.Udp, token);
         await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, ax, ay, token);
 
+        // Refill after the approach to A so the corner rejection can only be due to terrain.
+        await AssertUdpQuietAsync(recipient.Udp, token);
+
         // Omit B. C is clear but the segment from A to C cuts the corner.
         await mover.SendMovementAsync(room.Id, room.Round, cx, by, mover.SessionToken, mover.Udp, token);
         await AssertCorrectionAsync();
@@ -254,6 +258,41 @@ public sealed class HandshakeDeadlineTests
         {
             using Packet correction = await mover.ReadAsync(ServerPackets.playerPosition, token);
             Assert.Equal((room.Id, room.Round, mover.SlotId, ax, ay),
+                (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(),
+                    correction.ReadFloat(), correction.ReadFloat()));
+            Assert.Equal(0, correction.UnreadLength());
+        }
+    }
+
+    private static async Task AssertSpeedRejectAndRecoveryAsync(Peer mover, Peer recipient,
+        (int Id, int Round, float X, float Y) room, CancellationToken token)
+    {
+        // The preceding corner fixture ends at this position in the clear spawn lane.
+        const float lastX = -7.22f, y = 5.32f;
+        const float rejectedX = -7.625f; // Clear sweep, but the distance exceeds even a full budget.
+
+        await mover.SendMovementAsync(room.Id, room.Round, rejectedX, y, mover.SessionToken, mover.Udp, token);
+        await AssertCorrectionAsync();
+        await AssertUdpQuietAsync(recipient.Udp, token);
+
+        await mover.SendAsync(ClientPackets.playerMovement, token, packet =>
+        {
+            packet.Write(room.Id);
+            packet.Write(room.Round);
+            packet.Write(rejectedX);
+            packet.Write(y);
+        });
+        await AssertCorrectionAsync();
+        await AssertUdpQuietAsync(recipient.Udp, token);
+
+        const float recoveredX = -7.25f;
+        await mover.SendMovementAsync(room.Id, room.Round, recoveredX, y, mover.SessionToken, mover.Udp, token);
+        await AssertUdpPositionAsync(recipient, mover, room.Id, room.Round, recoveredX, y, token);
+
+        async Task AssertCorrectionAsync()
+        {
+            using Packet correction = await mover.ReadAsync(ServerPackets.playerPosition, token);
+            Assert.Equal((room.Id, room.Round, mover.SlotId, lastX, y),
                 (correction.ReadInt(), correction.ReadInt(), correction.ReadInt(),
                     correction.ReadFloat(), correction.ReadFloat()));
             Assert.Equal(0, correction.UnreadLength());
