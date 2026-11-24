@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Threading;
 using System.Diagnostics;
@@ -118,6 +118,14 @@ namespace GameServer.Tests
             ThreadManager.UpdateMain();
             Assert.Equal(2, executedAfterException);
             Assert.Equal(0, ThreadManager.GetWaitingActionCount());
+        }
+
+        [Fact]
+        public void AbsoluteDeadlinesSkipMissedPeriodsWithoutCatchUpBurst()
+        {
+            long period = TickPacer.Period;
+            Assert.Equal(11 * period, TickPacer.Next(10 * period, 10 * period + 1));
+            Assert.Equal(14 * period, TickPacer.Next(10 * period, 13 * period + 1));
         }
 
         [Fact]
