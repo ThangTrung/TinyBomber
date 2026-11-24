@@ -558,10 +558,10 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     }
                     break;
                 case ServerPackets.bombPlaced:
-                    if (IsCurrentRound(packet)) bombs.Add(ReadCell(packet));
+                    if (phase == MatchPhase.Playing && IsCurrentRound(packet)) bombs.Add(ReadCell(packet));
                     break;
                 case ServerPackets.bombExploded:
-                    if (IsCurrentRound(packet)) ReadExplosion(packet);
+                    if (phase == MatchPhase.Playing && IsCurrentRound(packet)) ReadExplosion(packet);
                     break;
                 default:
                     throw new InvalidDataException($"Packet server không được nhận diện: {type}.");
@@ -705,6 +705,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         packet.ReadInt(); // Winner id.
         if (phase == MatchPhase.Finished)
         {
+            bombs.Clear();
             bombUps.Clear();
             ResetMovementOrdering();
         }
