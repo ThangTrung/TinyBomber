@@ -140,6 +140,86 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
         output.WriteLine($"TCP send errors observed during the closing batch: {Server.Network.ReadTotals().TcpSendErrors - errorsBefore}");
     }
 
+    [Fact]
+    public async Task BombUpEventsReachEveryParticipantIncludingEliminatedPeer()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var token = timeout.Token;
+        using var fixture = new SocketFixture();
+        var (room, peers) = await fixture.StartRoomAsync(3, token, new GameLogic(987, itemRandom: new BombUpTests.Roll(0)));
+        var owner = peers[0].Slot.player!;
+        var (col, row) = GameLogic.WorldToGrid(owner.x, owner.y);
+        room.mapData[col + 1, row] = 2;
+        room.PlaceBomb(peers[0].Slot, room.Id, 1);
+        room.UpdateRound(long.MaxValue);
+        Assert.False(owner.isAlive);
+        Assert.Contains((col + 1, row), room.BombUps);
+        var winner = peers[1].Slot.player!;
+        (winner.x, winner.y) = GameLogic.GridToWorld(col + 1, row);
+        room.UpdateRound(long.MaxValue);
+        Assert.Empty(room.BombUps);
+        Assert.Equal(2, winner.maxActiveBombs);
+        foreach (var peer in peers)
+        {
+            await peer.ExpectAsync(ServerPackets.bombPlaced, token, room.Id, 1, col, row);
+            using var explosion = await peer.ReadAsync(token);
+            Assert.Equal((int)ServerPackets.bombExploded, explosion.ReadInt());
+            await peer.ExpectAsync(ServerPackets.playerEliminated, token, room.Id, 1, owner.id);
+            await peer.ExpectAsync(ServerPackets.bombUpSpawned, token, room.Id, 1, col + 1, row);
+            await peer.ExpectAsync(ServerPackets.bombUpCollected, token, room.Id, 1, col + 1, row, winner.id, 2);
+        }
+    }
+
+    [Fact]
+    public async Task BothPeersRemoveItemsCollectedAtMaximumCapacity()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var token = timeout.Token;
+        using var fixture = new SocketFixture();
+        var (room, peers) = await fixture.StartRoomAsync(2, token);
+        var replicas = peers.Select(_ => new BombUpRoundState()).ToArray();
+        foreach (var replica in replicas)
+            foreach (var peer in peers)
+                replica.SpawnPlayer(peer.Slot.id);
+
+        var winner = peers[0].Slot.player!;
+        var other = peers[1].Slot.player!;
+        const int row = 5;
+        int expectedCapacity = ProtocolV5.InitialCapacity;
+        for (int col = 5; col <= 8; col++)
+        {
+            (winner.x, winner.y) = (other.x, other.y) = GameLogic.GridToWorld(col, row);
+            room.mapData[col, row] = 0;
+            Assert.True(room.BombUps.Add((col, row)));
+            ServerSend.BombUp(room, col, row);
+            room.UpdateRound(0);
+
+            expectedCapacity = Math.Min(expectedCapacity + 1, ProtocolV5.MaximumCapacity);
+            Assert.Empty(room.BombUps);
+            Assert.Equal(expectedCapacity, winner.maxActiveBombs);
+            Assert.Equal(1, other.maxActiveBombs);
+            for (int i = 0; i < peers.Length; i++)
+            {
+                using var spawn = await peers[i].ReadAsync(token);
+                var spawnType = (ServerPackets)spawn.ReadInt();
+                Assert.Equal(ServerPackets.bombUpSpawned, spawnType);
+                var spawned = ProtocolV5.ReadBombUp(spawn, spawnType);
+                Assert.Equal((room.Id, room.RoundId, col, row, 0, 0), spawned);
+                Assert.True(replicas[i].Spawn(spawned.Col, spawned.Row));
+
+                using var collect = await peers[i].ReadAsync(token);
+                var collectType = (ServerPackets)collect.ReadInt();
+                Assert.Equal(ServerPackets.bombUpCollected, collectType);
+                var collected = ProtocolV5.ReadBombUp(collect, collectType);
+                Assert.Equal((room.Id, room.RoundId, col, row, winner.id, expectedCapacity), collected);
+                Assert.True(replicas[i].Collect(collected.Col, collected.Row, collected.Actor, collected.Capacity));
+                Assert.False(replicas[i].HasItem(col, row));
+                Assert.True(replicas[i].TryGetCapacity(winner.id, out int observed));
+                Assert.Equal(expectedCapacity, observed);
+            }
+        }
+    }
+
     private static async Task DrainAsync(int minimumActions, CancellationToken token)
     {
         // The queue count, not elapsed time, controls when the update thread may apply the batch.
@@ -162,7 +242,7 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
             listener.Start();
         }
 
-        public async Task<(GameLogic Room, Peer[] Peers)> StartRoomAsync(int count, CancellationToken token)
+        public async Task<(GameLogic Room, Peer[] Peers)> StartRoomAsync(int count, CancellationToken token, GameLogic? controlledRoom = null)
         {
             var group = new Peer[count];
             for (int i = 0; i < count; i++)
@@ -173,7 +253,7 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
                 group[i] = await OpenAsync(slot, token);
             }
 
-            var room = Server.CreateRoom();
+            var room = controlledRoom ?? Server.CreateRoom();
             foreach (var peer in group) Assert.True(room.TryAddMember(peer.Slot));
             room.StartRound(group[0].Slot, room.Id, 0);
             Assert.Equal(MatchPhase.Playing, room.Phase);
@@ -201,10 +281,10 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
             await peer.Tcp.ConnectAsync((IPEndPoint)listener.LocalEndpoint, token);
             peer.Accept(await listener.AcceptTcpClientAsync(token));
             using (var hello = await peer.ReadAsync(token))
-                Assert.Equal((ProtocolV4.Version, slot.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, slot.id), ProtocolV2.ReadServerHello(hello));
 
             // Drive the v2 state transitions in the fixture. The M3 integration test covers the UDP socket handshake.
-            ServerHandle.ClientHello(slot, peer.Connection, ProtocolV4.Version, slot.id, $"Peer{slot.id}");
+            ServerHandle.ClientHello(slot, peer.Connection, ProtocolV5.Version, slot.id, $"Peer{slot.id}");
             using var grant = await peer.ReadAsync(token);
             byte[] session = ProtocolV2.ReadSessionGranted(grant);
             Assert.True(ServerHandle.RegisterUdp(slot, peer.Connection, peer.Udp,

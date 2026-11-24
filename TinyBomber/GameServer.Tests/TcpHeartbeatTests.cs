@@ -165,7 +165,7 @@ public sealed class TcpHeartbeatTests
     {
         var connection = slot.tcp;
         connection.StartHandshake(now);
-        ServerHandle.ClientHello(slot, connection, ProtocolV4.Version, slot.id, "Player", now);
+        ServerHandle.ClientHello(slot, connection, ProtocolV5.Version, slot.id, "Player", now);
         byte[] token = connection.SessionToken!;
         Assert.True(ServerHandle.RegisterUdp(slot, connection, slot.udp,
             new IPEndPoint(IPAddress.Loopback, 12345), token, now));

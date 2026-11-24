@@ -13,11 +13,15 @@ namespace GameServer
         internal readonly int[,] mapData = new int[Constants.MAP_WIDTH, Constants.MAP_HEIGHT];
         private sealed record Bomb(Player Owner, int Col, int Row, int Range, long Deadline);
         private readonly List<Bomb> bombs = new();
+        private const int BombUpDropPercent = 25;
+        private readonly Random itemRandom;
+        internal readonly HashSet<(int Col, int Row)> BombUps = new();
         private static readonly (int dx, int dy)[] directions = { (1, 0), (-1, 0), (0, 1), (0, -1) };
 
-        internal GameLogic(int id, int finalPositionIdleMs = DefaultFinalPositionIdleMs)
+        internal GameLogic(int id, int finalPositionIdleMs = DefaultFinalPositionIdleMs, Random? itemRandom = null)
         {
             Id = id;
+            this.itemRandom = itemRandom ?? Random.Shared;
             finalPositionIdleDelay = TimeSpan.FromMilliseconds(finalPositionIdleMs);
         }
 
@@ -84,7 +88,9 @@ namespace GameServer
             ServerSend.MatchState(this);
         }
 
-        internal void PlaceBomb(Client slot, int roomId, int roundId)
+        internal int ActiveBombCount(Player player) => bombs.Count(b => b.Owner == player);
+
+        internal void PlaceBomb(Client slot, int roomId, int roundId, long? placedAt = null)
         {
             if (!AcceptsInput(slot, roomId, roundId)) return;
 
@@ -92,10 +98,10 @@ namespace GameServer
             var (col, row) = WorldToGrid(player.x, player.y);
             if (!InBounds(col, row) || mapData[col, row] != 0) return;
             if (bombs.Any(b => b.Col == col && b.Row == row) ||
-                bombs.Count(b => b.Owner == player) >= player.maxActiveBombs) return;
+                ActiveBombCount(player) >= player.maxActiveBombs) return;
 
             bombs.Add(new Bomb(player, col, row, player.blastRange,
-                Stopwatch.GetTimestamp() + 2 * Stopwatch.Frequency));
+                (placedAt ?? Stopwatch.GetTimestamp()) + 2 * Stopwatch.Frequency));
             ServerSend.BombPlaced(this, col, row);
         }
 
@@ -105,6 +111,7 @@ namespace GameServer
 
             var alive = members.Select(slot => slot.player)
                 .OfType<Player>().Where(player => player.isAlive).ToList();
+            List<(int Col, int Row)>? broken = null;
             var hit = new HashSet<Player>();
             // With a fixed fuse, insertion order is deadline order.
             while (bombs.Count > 0 && bombs[0].Deadline <= now)
@@ -124,6 +131,7 @@ namespace GameServer
                         {
                             mapData[col, row] = 0;
                             destroyed.Add((col, row));
+                            (broken ??= new()).Add((col, row));
                             break;
                         }
                     }
@@ -146,6 +154,20 @@ namespace GameServer
             alive.RemoveAll(hit.Contains);
             if (alive.Count > 1)
             {
+                if (broken != null)
+                    foreach (var cell in broken)
+                        if (itemRandom.Next(100) < BombUpDropPercent && BombUps.Add(cell))
+                            ServerSend.BombUp(this, cell.Col, cell.Row);
+
+                if (BombUps.Count > 0)
+                    foreach (var player in alive.OrderBy(p => p.id))
+                    {
+                        var cell = WorldToGrid(player.x, player.y);
+                        if (!BombUps.Remove(cell)) continue;
+                        player.maxActiveBombs = Math.Min(player.maxActiveBombs + 1, ProtocolV5.MaximumCapacity);
+                        ServerSend.BombUp(this, cell.col, cell.row, player);
+                    }
+
                 foreach (var player in alive)
                     if (player.TryTakeFinalPositionRefresh(now, finalPositionIdleDelay))
                         ServerSend.RefreshFinalPeerPosition(this, player);
@@ -155,6 +177,7 @@ namespace GameServer
             WinnerId = alive.Count == 1 ? alive[0].id : 0;
             Phase = MatchPhase.Finished;
             bombs.Clear();
+            BombUps.Clear();
             ServerSend.MatchState(this);
         }
 
@@ -192,6 +215,7 @@ namespace GameServer
         {
             Random rand = new Random();
             bombs.Clear();
+            BombUps.Clear();
 
             for (int col = 0; col < Constants.MAP_WIDTH; col++)
             {

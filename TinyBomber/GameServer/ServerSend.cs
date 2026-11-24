@@ -18,7 +18,7 @@ namespace GameServer
 
         internal static void ServerHello(Client.TCP connection, int slotId)
         {
-            using var packet = ProtocolV4.CreateServerHello(slotId);
+            using var packet = ProtocolV5.CreateServerHello(slotId);
             connection.SendData(packet);
         }
 
@@ -148,6 +148,20 @@ namespace GameServer
             {
                 tcpPosition?.Dispose();
             }
+        }
+
+        internal static void BombUp(GameLogic room, int col, int row, Player? winner = null)
+        {
+            using var packet = new Packet((int)(winner == null ? ServerPackets.bombUpSpawned : ServerPackets.bombUpCollected));
+            WriteRound(packet, room);
+            packet.Write(col);
+            packet.Write(row);
+            if (winner != null)
+            {
+                packet.Write(winner.id);
+                packet.Write(winner.maxActiveBombs);
+            }
+            BroadcastTCP(room, packet);
         }
 
         internal static void BombPlaced(GameLogic room, int col, int row)
