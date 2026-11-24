@@ -2,11 +2,13 @@ using System.Diagnostics;
 
 namespace GameServer;
 
-internal readonly record struct ProcessReading(TimeSpan CpuTime, long WorkingSetBytes);
+internal readonly record struct ProcessReading(TimeSpan CpuTime, long WorkingSetBytes, ProcessResources? Resources = null);
+
+internal sealed record ProcessResources(long PrivateBytes, long ManagedBytes, int Gen0, int Gen1, int Gen2, int Threads, int? Handles);
 
 internal sealed record ProcessMetricsSample(
     long Timestamp, DateTimeOffset TimestampUtc, double? CpuPercent,
-    long? WorkingSetBytes, int LogicalProcessors, double QueryMs, string? Error);
+    long? WorkingSetBytes, int LogicalProcessors, double QueryMs, string? Error, ProcessResources? Resources = null);
 
 internal sealed class ProcessMetricsSampler : IDisposable
 {
@@ -66,7 +68,7 @@ internal sealed class ProcessMetricsSampler : IDisposable
                 : null;
             sample = new ProcessMetricsSample(now, DateTimeOffset.UtcNow, cpu,
                 current.WorkingSetBytes, logicalProcessors,
-                Stopwatch.GetElapsedTime(started, now).TotalMilliseconds, null);
+                Stopwatch.GetElapsedTime(started, now).TotalMilliseconds, null, current.Resources);
             previous = current;
             previousTimestamp = now;
         }
@@ -92,7 +94,10 @@ internal sealed class ProcessMetricsSampler : IDisposable
     {
         using var process = Process.GetCurrentProcess();
         process.Refresh();
-        return new ProcessReading(process.TotalProcessorTime, process.WorkingSet64);
+        var resources = new ProcessResources(process.PrivateMemorySize64, GC.GetTotalMemory(false),
+            GC.CollectionCount(0), GC.CollectionCount(1), GC.CollectionCount(2), process.Threads.Count,
+            OperatingSystem.IsWindows() ? process.HandleCount : null);
+        return new ProcessReading(process.TotalProcessorTime, process.WorkingSet64, resources);
     }
 
     public void Dispose()

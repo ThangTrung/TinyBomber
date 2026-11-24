@@ -12,8 +12,58 @@ namespace GameServer.Tests;
 public sealed class NetworkMetricsCollection { }
 
 [Collection("Network metrics server state")]
-public sealed class NetworkMetricsTests
+public sealed class NetworkMetricsTests(Xunit.Abstractions.ITestOutputHelper output)
 {
+    [Fact]
+    public async Task PausedLoopbackReaderDrainsReliableFramesInOrder()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        using var peer = new TcpClient { ReceiveBufferSize = 8192 };
+        await peer.ConnectAsync((IPEndPoint)listener.LocalEndpoint, timeout.Token);
+        using var sender = await listener.AcceptTcpClientAsync(timeout.Token);
+        var tcp = new Client.TCP(1);
+        tcp.Attach(sender);
+        tcp.StartReceiving();
+        try
+        {
+            var stream = peer.GetStream();
+            async Task<Packet> Read()
+            {
+                byte[] header = new byte[4];
+                await stream.ReadExactlyAsync(header, timeout.Token);
+                int length = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(header);
+                Assert.InRange(length, 64, 16384);
+                byte[] data = new byte[4 + length];
+                header.CopyTo(data, 0);
+                await stream.ReadExactlyAsync(data.AsMemory(4), timeout.Token);
+                var packet = new Packet(data);
+                packet.DecryptPayload();
+                packet.ReadInt();
+                return packet;
+            }
+            using (var hello = await Read()) Assert.Equal(5, ProtocolV2.ReadServerHello(hello).Version);
+            const int frames = 2048;
+            for (int i = 1; i <= frames; i++)
+            {
+                using var ack = ProtocolV4.CreateTcpPlayerPosition(1, 1, 1, i, 0, 0);
+                tcp.SendData(ack);
+            }
+            await Task.Delay(150, timeout.Token);
+            var paused = tcp.ReadTransport();
+            for (int i = 1; i <= frames; i++)
+            {
+                using var frame = await Read();
+                Assert.Equal((long)i, ProtocolV4.ReadTcpPlayerPosition(frame).AcceptedMoveSeq);
+            }
+            while (tcp.ReadTransport().InFlight != 0) await Task.Delay(1, timeout.Token);
+            Assert.Equal(0, tcp.ReadTransport().Pending);
+            output.WriteLine($"frames={frames} paused_pending={paused.Pending} in_flight={paused.InFlight} enqueue_peak={paused.HighWater} drained=1");
+        }
+        finally { tcp.Close(); }
+    }
+
     private static long At(double seconds) => (long)(seconds * Stopwatch.Frequency);
     private static readonly FieldInfo UdpSocket = typeof(Server).GetField(
         "udpSocket", BindingFlags.Static | BindingFlags.NonPublic)!;

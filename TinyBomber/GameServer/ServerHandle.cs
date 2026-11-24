@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Net;
 using System.Security.Cryptography;
@@ -143,22 +143,32 @@ namespace GameServer
             long? now = null, long? moveSeq = null)
         {
             if (slot.tcp.UsesMovementOrdering != moveSeq.HasValue) return;
-            if (slot.Room is not GameLogic room || !room.AcceptsInput(slot, roomId, roundId)) return;
+            if (slot.Room is not GameLogic room || !room.AcceptsInput(slot, roomId, roundId))
+            {
+                EventMetrics.Record(ServerEvent.MoveScopeRejected);
+                return;
+            }
 
             Player player = slot.player!;
             if (moveSeq is long sequence &&
                 (!slot.IsReady || slot.tcp.SessionToken == null || !player.TryMarkMovementProcessed(sequence)))
+            {
+                EventMetrics.Record(slot.IsReady && slot.tcp.SessionToken != null ? ServerEvent.MoveStale : ServerEvent.MoveScopeRejected);
                 return;
+            }
 
             long appliedAt = now ?? Stopwatch.GetTimestamp();
-            if (room.CanMove(player, x, y) && player.TrySpendMovementCredit(x, y, appliedAt))
+            bool canMove = room.CanMove(player, x, y);
+            if (canMove && player.TrySpendMovementCredit(x, y, appliedAt))
             {
+                EventMetrics.Record(ServerEvent.MoveAccepted);
                 player.AcceptMovement(x, y, moveSeq, appliedAt);
                 if (moveSeq.HasValue) ServerSend.AcknowledgeMovement(room, slot, player);
                 ServerSend.BroadcastPlayerPosition(room, player);
             }
             else
             {
+                EventMetrics.Record(canMove ? ServerEvent.MoveCreditRejected : ServerEvent.MoveCollisionRejected);
                 ServerSend.SnapPlayerPosition(room, slot, player);
             }
         }

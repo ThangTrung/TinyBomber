@@ -210,9 +210,9 @@ internal sealed class MetricsExporter
     }
 
     internal const string RoomCsvHeader =
-        "sample_id,timestamp_utc,room_id,phase,members,ready_clients,round_participants,active_players,alive_players";
+        "sample_id,timestamp_utc,room_id,phase,members,ready_clients,round_participants,active_players,alive_players,round_id";
 
-    internal const string ServerCsvHeader =
+    internal static readonly string ServerCsvHeader =
         "sample_id,timestamp_utc,window_seconds,connections,ready_clients,rooms,waiting_rooms,playing_rooms,finished_rooms," +
         "room_members,round_participants,active_players,alive_players,waiting_actions,largest_action_batch,successful_actions,failed_actions," +
         "action_samples,action_avg_ms,action_max_ms,room_update_samples,room_update_avg_ms,room_update_max_ms," +
@@ -222,7 +222,11 @@ internal sealed class MetricsExporter
         "working_set_bytes,process_query_ms,process_sample_age_ms,process_error," +
         "tcp_received_bytes,tcp_completed_write_bytes,tcp_send_errors,udp_received_bytes,udp_completed_send_bytes,udp_send_errors," +
         "network_interval_seconds,tcp_received_bytes_per_second,tcp_completed_write_bytes_per_second," +
-        "udp_received_bytes_per_second,udp_completed_send_bytes_per_second,dropped_snapshots,console_error,csv_error";
+        "udp_received_bytes_per_second,udp_completed_send_bytes_per_second,dropped_snapshots,console_error,csv_error," +
+        "tcp_queue_depth,tcp_queue_high_water,tcp_in_flight,heartbeat_rtt_samples,heartbeat_rtt_total_ms," +
+        "private_bytes,managed_bytes,gc_gen0,gc_gen1,gc_gen2,threads,handles,requested_sleep_avg_ms," +
+        "sleep_overshoot_avg_ms,deadline_lateness_avg_ms,work_overruns,interval_overruns,tick_intervals_ms," +
+        string.Join(",", EventMetrics.Names);
 
     internal static string FormatServerCsv(ServerMetricsSnapshot s, long dropped,
         string? consoleError = null, string? csvError = null)
@@ -244,12 +248,18 @@ internal sealed class MetricsExporter
             n?.TcpReceivedBytes, n?.TcpCompletedWriteBytes, n?.TcpSendErrors,
             n?.UdpReceivedBytes, n?.UdpCompletedSendBytes, n?.UdpSendErrors,
             s.Network?.IntervalSeconds, r?.TcpReceivedBytesPerSecond, r?.TcpCompletedWriteBytesPerSecond,
-            r?.UdpReceivedBytesPerSecond, r?.UdpCompletedSendBytesPerSecond, dropped, consoleError, csvError);
+            r?.UdpReceivedBytesPerSecond, r?.UdpCompletedSendBytesPerSecond, dropped, consoleError, csvError,
+            s.Transport?.Pending, s.Transport?.HighWater, s.Transport?.InFlight, s.Transport?.HeartbeatSamples, s.Transport?.HeartbeatTotalMs,
+            p?.Resources?.PrivateBytes, p?.Resources?.ManagedBytes, p?.Resources?.Gen0, p?.Resources?.Gen1, p?.Resources?.Gen2,
+            p?.Resources?.Threads, p?.Resources?.Handles, s.Timing?.RequestedSleepAvgMs, s.Timing?.SleepOvershootAvgMs,
+            s.Timing?.DeadlineLatenessAvgMs, s.Timing?.WorkOverruns, s.Timing?.IntervalOverruns,
+            s.Timing == null ? null : string.Join("|", s.Timing.IntervalsMs.Select(ms => ms.ToString("F4", CultureInfo.InvariantCulture)))) +
+            "," + string.Join(",", EventMetrics.Names.Select(name => s.Events?.GetValueOrDefault(name.ToString()).ToString(CultureInfo.InvariantCulture)));
     }
 
     internal static string FormatRoomCsv(ServerMetricsSnapshot s, RoomMetrics room) =>
         CsvRow(s.SampleId, s.TimestampUtc, room.Id, room.Phase, room.Members, room.ReadyClients,
-            room.RoundParticipants, room.ActivePlayers, room.AlivePlayers);
+            room.RoundParticipants, room.ActivePlayers, room.AlivePlayers, room.RoundId);
 
     private static string CsvRow(params object?[] values) => string.Join(",", values.Select(value =>
     {

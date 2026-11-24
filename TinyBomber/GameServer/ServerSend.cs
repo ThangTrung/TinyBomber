@@ -152,6 +152,7 @@ namespace GameServer
 
         internal static void BombUp(GameLogic room, int col, int row, Player? winner = null)
         {
+            EventMetrics.Record(winner == null ? ServerEvent.ItemSpawn : ServerEvent.ItemCollect);
             using var packet = new Packet((int)(winner == null ? ServerPackets.bombUpSpawned : ServerPackets.bombUpCollected));
             WriteRound(packet, room);
             packet.Write(col);
@@ -218,6 +219,7 @@ namespace GameServer
         {
             using var packet = ProtocolV4.CreateTcpPlayerPosition(room.Id, room.RoundId, player.id,
                 player.LastAcceptedMoveSeq, player.x, player.y);
+            EventMetrics.Record(ServerEvent.OwnerAck);
             owner.tcp.SendData(packet);
         }
 
@@ -235,6 +237,7 @@ namespace GameServer
 
                     position ??= ProtocolV4.CreateTcpPlayerPosition(room.Id, room.RoundId, player.id,
                         player.LastAcceptedMoveSeq, player.x, player.y);
+                    EventMetrics.Record(ServerEvent.FinalRefresh);
                     slot.tcp.SendData(position);
                 }
             }
@@ -246,6 +249,7 @@ namespace GameServer
 
         internal static void SnapPlayerPosition(GameLogic room, Client recipient, Player player)
         {
+            EventMetrics.Record(ServerEvent.Correction);
             using var packet = recipient.tcp.UsesMovementOrdering
                 ? ProtocolV4.CreateTcpPlayerCorrection(room.Id, room.RoundId, player.id,
                     player.LastProcessedMoveSeq, player.LastAcceptedMoveSeq, player.x, player.y)

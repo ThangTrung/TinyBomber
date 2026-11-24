@@ -495,6 +495,9 @@ public class Client : MonoBehaviour
         private float nextRegistrationAt;
         private long? receiveRetryAt;
         private long nextSendErrorLogAt;
+        private long completedSends, failedCompletions;
+        private readonly AsyncCallback sendCompleted;
+        private readonly Func<UdpClient, IAsyncResult, int> endSend;
         private readonly UdpHealthMonitor health = new UdpHealthMonitor();
 
         public void Close()
@@ -503,10 +506,14 @@ public class Client : MonoBehaviour
             socket?.Close();
         }
 
-        public UDP(IPAddress address, TCP connection)
+        public UDP(IPAddress address, TCP connection) : this(address, connection, (sender, result) => sender.EndSend(result)) { }
+
+        internal UDP(IPAddress address, TCP connection, Func<UdpClient, IAsyncResult, int> endSend)
         {
+            this.endSend = endSend;
             serverEndPoint = new IPEndPoint(address, Constants.UDP_PORT);
             this.connection = connection;
+            sendCompleted = CompleteSend;
         }
 
         public void Connect()
@@ -561,7 +568,8 @@ public class Client : MonoBehaviour
             try
             {
                 byte[] frame = packet.ToArray();
-                socket.BeginSend(frame, frame.Length, null, null);
+                var sender = socket;
+                sender.BeginSend(frame, frame.Length, sendCompleted, sender);
                 return true;
             }
             catch (ObjectDisposedException) { MarkSocketUnavailable(); }
@@ -576,6 +584,21 @@ public class Client : MonoBehaviour
                 }
             }
             return false;
+        }
+
+        // AsyncState owns this operation even after the wrapper is retired. No Unity API or retry on completion.
+        private void CompleteSend(IAsyncResult result)
+        {
+            var sender = (UdpClient)result.AsyncState;
+            try
+            {
+                endSend(sender, result);
+                System.Threading.Interlocked.Increment(ref completedSends);
+            }
+            catch (Exception)
+            {
+                System.Threading.Interlocked.Increment(ref failedCompletions);
+            }
         }
 
         private void ReceiveCallback(IAsyncResult _result)

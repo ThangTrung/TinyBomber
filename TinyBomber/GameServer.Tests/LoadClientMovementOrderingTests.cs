@@ -299,7 +299,7 @@ public sealed class LoadClientMovementOrderingTests
     private static void PrepareObservation(object trace, float x)
     {
         object target = Position(x);
-        Call(trace, "Prepare", Position(0), target, true);
+        Call(trace, "Prepare", Position(0), target, true, 0L, 0L);
         Call(trace, "MarkSent", target, 0d);
     }
 

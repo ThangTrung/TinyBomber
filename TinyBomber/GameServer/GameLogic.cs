@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using GameShared;
 using System.Diagnostics;
 
@@ -73,6 +73,7 @@ namespace GameServer
                 Client slot = participants[i];
                 slot.player = new Player(slot.id, slot.Username!, i, spawnedAt);
             }
+            EventMetrics.Record(ServerEvent.RoundStart);
             Phase = MatchPhase.Playing;
 
             foreach (var slot in participants)
@@ -92,6 +93,7 @@ namespace GameServer
 
         internal void PlaceBomb(Client slot, int roomId, int roundId, long? placedAt = null)
         {
+            EventMetrics.Record(ServerEvent.BombRequest);
             if (!AcceptsInput(slot, roomId, roundId)) return;
 
             Player player = slot.player!;
@@ -102,6 +104,7 @@ namespace GameServer
 
             bombs.Add(new Bomb(player, col, row, player.blastRange,
                 (placedAt ?? Stopwatch.GetTimestamp()) + 2 * Stopwatch.Frequency));
+            EventMetrics.Record(ServerEvent.BombPlaced);
             ServerSend.BombPlaced(this, col, row);
         }
 
@@ -141,6 +144,8 @@ namespace GameServer
                     if (affected.Contains(WorldToGrid(player.x, player.y))) hit.Add(player);
                 }
 
+                EventMetrics.Record(ServerEvent.Explosion);
+                EventMetrics.Record(ServerEvent.SoftDestroyed, destroyed.Count);
                 ServerSend.BombExploded(this, bomb.Col, bomb.Row, affected, destroyed);
             }
 
@@ -175,6 +180,7 @@ namespace GameServer
             }
 
             WinnerId = alive.Count == 1 ? alive[0].id : 0;
+            EventMetrics.Record(ServerEvent.RoundFinish);
             Phase = MatchPhase.Finished;
             bombs.Clear();
             BombUps.Clear();

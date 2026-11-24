@@ -5,6 +5,28 @@ namespace GameServer.Tests;
 
 public sealed class ServerMetricsTests
 {
+    [Fact]
+    public void TickDistributionComesFromIndividualCompletedIntervalsAndResets()
+    {
+        var metrics = new ServerMetrics(0);
+        long t = 0;
+        metrics.BeginTick(t);
+        foreach (int ms in new[] { 20, 25, 35, 41, 80 })
+        {
+            metrics.EndGameplay(new ActionBatchMetrics(1, 10, 1, 1, 0, 8, 2), 2);
+            metrics.BeginTick(t += At(ms));
+        }
+        var first = Publish(metrics, t);
+        Assert.Equal(35d, first.Timing!.P50Ms!.Value, 4);
+        Assert.Equal(80d, first.Timing.P99Ms!.Value, 4);
+        Assert.Equal(3, first.Timing.IntervalOverruns);
+        Assert.Equal(1, first.Timing.WorkOverruns);
+        Assert.Equal(2, first.Timing.SleepOvershootAvgMs);
+        var next = Publish(metrics, t + 1);
+        Assert.Null(next.Timing!.P95Ms);
+        Assert.Equal(5, first.Timing.IntervalsMs.Count);
+    }
+
     private static long At(double milliseconds) => (long)(milliseconds * Stopwatch.Frequency / 1000);
 
     private static ServerMetricsSnapshot Publish(ServerMetrics collector, long timestamp,

@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -8,6 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <EmbeddedResource Include="Monitoring/index.html;Monitoring/monitor.css;Monitoring/monitor.js" LogicalName="TinyBomber.Monitor.%(Filename)%(Extension)" />
     <ProjectReference Include="..\GameShared\GameShared.csproj" />
     <InternalsVisibleTo Include="GameServer.Tests" />
   </ItemGroup>

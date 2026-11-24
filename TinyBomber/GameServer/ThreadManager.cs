@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
@@ -9,7 +9,7 @@ namespace GameServer
     {
         // ===== CONSTANTS =====
         private const int TICKS_PER_SECOND = 30;
-        private const int MS_PER_TICK = 1000 / TICKS_PER_SECOND; // ~33ms
+        private const int MS_PER_TICK = 1000 / TICKS_PER_SECOND;
 
         // ===== FIELDS =====
         private static List<Action> actionQueue = new List<Action>();   
@@ -60,8 +60,14 @@ namespace GameServer
 
         public static void UpdateMain()
         {
+            long started = Stopwatch.GetTimestamp();
+            var batch = DrainActions();
+            LastBatchMetrics = TickPacer.WaitUntil(started + TickPacer.Period, batch);
+        }
+
+        internal static ActionBatchMetrics DrainActions()
+        {
             long actionStart = Stopwatch.GetTimestamp();
-            long tickStartTime = GetCurrentTimeMs();
 
             lock (queueLock)
             {
@@ -92,29 +98,8 @@ namespace GameServer
 
             actionQueue.Clear();
             double actionMs = Stopwatch.GetElapsedTime(actionStart).TotalMilliseconds;
-            double sleepMs = 0;
-
-            long tickElapsedMs = GetCurrentTimeMs() - tickStartTime;
-            int sleepTimeMs = (int)(MS_PER_TICK - tickElapsedMs);
-
-            if (sleepTimeMs > 0)
-            {
-                long sleepStart = Stopwatch.GetTimestamp();
-                Thread.Sleep(sleepTimeMs);
-                sleepMs = Stopwatch.GetElapsedTime(sleepStart).TotalMilliseconds;
-            }
-            else if (sleepTimeMs < -5)
-            {
-                Console.WriteLine($"[WARNING] Frame {frameCount} exceeded budget: {tickElapsedMs}ms (target: {MS_PER_TICK}ms)");
-            }
-
             frameCount++;
-            LastBatchMetrics = new ActionBatchMetrics(actionMs, sleepMs, actionsThisFrame, succeeded, failed);
-
-            if (frameCount % TICKS_PER_SECOND == 0 && frameCount > 0)
-            {
-                // Console.WriteLine($"[DEBUG] Frame {frameCount}: {actionsThisFrame} actions processed. Total: {totalActionsProcessed}");
-            }
+            return LastBatchMetrics = new ActionBatchMetrics(actionMs, 0, actionsThisFrame, succeeded, failed);
         }
 
         public static int GetPendingActionCount()
@@ -152,9 +137,5 @@ namespace GameServer
             frameCount = 0;
         }
 
-        private static long GetCurrentTimeMs()
-        {
-            return DateTime.Now.Ticks / 10000L;
-        }
     }
 }

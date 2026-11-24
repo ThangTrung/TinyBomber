@@ -9,6 +9,81 @@ using UnityEngine;
 using UnityEngine.TestTools;
 using Object = UnityEngine.Object;
 
+public sealed class UdpCompletionTests
+{
+    [Test]
+    public void DisposedUdpSocketTriggersTheExistingSynchronousTcpFallback()
+    {
+        var type = Type.GetType("Client+UDP, Assembly-CSharp", true);
+        var wrapper = Activator.CreateInstance(type, new object[] { System.Net.IPAddress.Loopback, null });
+        var socket = new System.Net.Sockets.UdpClient(0);
+        type.GetField("socket").SetValue(wrapper, socket);
+        socket.Close();
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        var send = type.GetMethod("TrySendData", flags);
+        using var packet = new Packet(new byte[] { 42 });
+        int tcpSends = 0;
+        var ordering = new MovementOrdering();
+        var scope = (wrapper, 1, 1);
+        Assert.That(ordering.TrySend(scope, Vector2.zero, 0, 0.25,
+            (_, _) => (bool)send.Invoke(wrapper, new object[] { packet }),
+            (seq, _) => { tcpSends++; return seq == 1; }), Is.True);
+        Assert.That(tcpSends, Is.EqualTo(1));
+        Assert.That(ordering.TryRetry(scope, 1, 0.25, (_, _) => true), Is.False);
+        Assert.That((long)type.GetField("completedSends", flags).GetValue(wrapper), Is.Zero);
+        Assert.That((long)type.GetField("failedCompletions", flags).GetValue(wrapper), Is.Zero);
+    }
+
+    [TestCase(false)]
+    [TestCase(true)]
+    public void SubmittedSendCompletesOnceOnItsOriginalWrapper(bool retireDuringCompletion)
+    {
+        var type = Type.GetType("Client+UDP, Assembly-CSharp", true);
+        var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+        using var sink = new System.Net.Sockets.UdpClient(new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0));
+        using var sender = new System.Net.Sockets.UdpClient(0);
+        sender.Connect((System.Net.IPEndPoint)sink.Client.LocalEndPoint);
+        using var arrived = new System.Threading.ManualResetEventSlim();
+        using var release = new System.Threading.ManualResetEventSlim();
+        int calls = 0;
+        bool originalSocket = false;
+        Func<System.Net.Sockets.UdpClient, IAsyncResult, int> finish = (owner, result) =>
+        {
+            System.Threading.Interlocked.Increment(ref calls);
+            originalSocket = ReferenceEquals(owner, sender);
+            int bytes = owner.EndSend(result);
+            arrived.Set();
+            if (retireDuringCompletion)
+            {
+                release.Wait(TimeSpan.FromSeconds(3));
+                throw new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.OperationAborted);
+            }
+            return bytes;
+        };
+        object wrapper = Activator.CreateInstance(type, flags, null, new object[] { System.Net.IPAddress.Loopback, null, finish }, null);
+        object replacement = Activator.CreateInstance(type, new object[] { System.Net.IPAddress.Loopback, null });
+        type.GetField("socket").SetValue(wrapper, sender);
+        var send = type.GetMethod("TrySendData", flags);
+        using var frame = new Packet(new byte[] { 42 });
+        try
+        {
+            Assert.That(send.Invoke(wrapper, new object[] { frame }), Is.EqualTo(true));
+            Assert.That(arrived.Wait(TimeSpan.FromSeconds(3)), Is.True);
+            if (retireDuringCompletion) type.GetMethod("Close").Invoke(wrapper, null);
+            release.Set();
+            var counter = type.GetField(retireDuringCompletion ? "failedCompletions" : "completedSends", flags);
+            Assert.That(System.Threading.SpinWait.SpinUntil(() => (long)counter.GetValue(wrapper) == 1, 3000), Is.True);
+            Assert.That(calls, Is.EqualTo(1));
+            Assert.That(originalSocket, Is.True);
+            Assert.That((long)counter.GetValue(replacement), Is.Zero);
+            type.GetMethod("Close").Invoke(wrapper, null);
+            Assert.That(send.Invoke(wrapper, new object[] { frame }), Is.EqualTo(false));
+            Assert.That(calls, Is.EqualTo(1));
+        }
+        finally { release.Set(); type.GetMethod("Close").Invoke(wrapper, null); }
+    }
+}
+
 public sealed class MovementOrderingTests
 {
     private const double Delay = 0.25;

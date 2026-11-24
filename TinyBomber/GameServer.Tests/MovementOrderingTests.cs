@@ -18,8 +18,10 @@ public sealed class MovementOrderingTests
     private (long Processed, long Accepted) Watermarks => (Player.LastProcessedMoveSeq, Player.LastAcceptedMoveSeq);
     private (float X, float Y) Position => (Player.x, Player.y);
 
-    public MovementOrderingTests()
+    private readonly Xunit.Abstractions.ITestOutputHelper output;
+    public MovementOrderingTests(Xunit.Abstractions.ITestOutputHelper output)
     {
+        this.output = output;
         MakeReady(mover);
         MakeReady(peer);
         mover.udp.endPoint = endpoint;
@@ -642,6 +644,45 @@ public sealed class MovementOrderingTests
         room.StartRound(mover, room.Id, room.RoundId, 2 * Stopwatch.Frequency);
         Assert.False(Player.TryTakeFinalPositionRefresh(10 * Stopwatch.Frequency, delay));
         Assert.Equal((0L, 0L), Watermarks);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SeededMovementDeliveryConvergesAfterStop(bool impaired)
+    {
+        // Virtual application delivery clock. The real TCP/UDP final-refresh fixture covers framing separately.
+        const int count = 200, period = 50;
+        var random = new Random(8024);
+        var losses = Enumerable.Range(1, count - 1).OrderBy(_ => random.Next()).Take(3).ToHashSet();
+        losses.Add(count); // Four of 200, including the tail.
+        var deliveries = new List<(int At, int Sequence)>();
+        int duplicates = 0;
+        for (int seq = 1; seq <= count; seq++)
+        {
+            if (impaired && losses.Contains(seq)) continue;
+            int arrival = seq * period + (impaired ? 40 + random.Next(-10, 11) : 0);
+            if (impaired && seq % 23 == 0) arrival += 75;
+            deliveries.Add((arrival, seq));
+            if (impaired && seq % 17 == 0) { deliveries.Add((arrival + 8, seq)); duplicates++; }
+        }
+        int late = 0;
+        foreach (var delivery in deliveries.OrderBy(d => d.At))
+        {
+            if (delivery.Sequence < Player.LastProcessedMoveSeq) late++;
+            Move(delivery.Sequence, delivery.Sequence * 0.0002f, ms: delivery.At, viaUdp: true);
+        }
+        int tailTime = count * period;
+        if (impaired) Move(count, count * 0.0002f, ms: tailTime + 250);
+        int finalAccept = tailTime + (impaired ? 250 : 0);
+        Assert.Equal(((long)count, (long)count), Watermarks);
+        Assert.Equal(count * 0.0002f, Position.X);
+        Assert.False(Player.TryTakeFinalPositionRefresh(Stopwatch.Frequency * (finalAccept + 199) / 1000,
+            TimeSpan.FromMilliseconds(200)));
+        Assert.True(Player.TryTakeFinalPositionRefresh(Stopwatch.Frequency * (finalAccept + 200) / 1000,
+            TimeSpan.FromMilliseconds(200)));
+        if (impaired) Assert.True(late > 0 && duplicates > 0);
+        output.WriteLine($"offered={count} loss={(impaired ? losses.Count : 0)} delayed={(impaired ? count-losses.Count : 0)} duplicate={duplicates} reordered={late} virtual_tail_to_refresh_ms={finalAccept+200-tailTime}");
     }
 
     private static void Seal(Packet packet)

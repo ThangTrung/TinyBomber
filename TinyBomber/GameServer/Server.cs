@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Buffers.Binary;
 using System.Diagnostics;
@@ -44,6 +44,11 @@ namespace GameServer
         private static Thread updateThread = null!;
         private static volatile bool isRunning = false;
         private static volatile bool stopping;
+        internal static (bool Current, bool Stopping) WriteContext(int id, Client.TCP connection)
+        {
+            lock (slotLock) return (clients.TryGetValue(id, out var slot) && slot.tcp == connection, stopping);
+        }
+
         private static readonly object slotLock = new object();
         private static ServerMetrics metrics = null!;
         private static ProcessMetricsSampler processMetrics = null!;
@@ -98,6 +103,7 @@ namespace GameServer
             try
             {
                 data = udpSocket.EndReceive(_result, ref endpoint!);
+                EventMetrics.Record(ServerEvent.UdpDatagramReceived);
                 Network.RecordUdpReceive(data.Length);
             }
             catch (ObjectDisposedException) when (!isRunning) { return; }
@@ -123,7 +129,7 @@ namespace GameServer
 
         private static void HandleUdpDatagram(byte[] data, IPEndPoint endpoint)
         {
-            if (data.Length <= sizeof(int)) return;
+            if (data.Length <= sizeof(int)) { EventMetrics.Record(ServerEvent.UdpMalformed); return; }
             int slotId = BinaryPrimitives.ReadInt32LittleEndian(data);
             if (slotId < 1 || slotId > MaxConnections) return;
 
@@ -160,6 +166,7 @@ namespace GameServer
                         break;
                     case ClientPackets.udpPlayerMovementV4 when connection.UsesMovementOrdering:
                         var orderedMove = ProtocolV4.ReadUdpPlayerMovement(packet);
+                        EventMetrics.Record(ServerEvent.MoveUdp);
                         ThreadManager.EnqueueAction(() => ServerHandle.UdpMovement(clients[slotId], connection, udp,
                             endpoint, orderedMove.Token, orderedMove.RoomId, orderedMove.RoundId,
                             orderedMove.X, orderedMove.Y, moveSeq: orderedMove.MoveSeq));
@@ -173,7 +180,7 @@ namespace GameServer
             }
             catch (InvalidDataException)
             {
-                // Receive is already armed. Discard malformed or unauthenticated datagrams.
+                EventMetrics.Record(ServerEvent.UdpMalformed);
             }
         }
 
@@ -208,6 +215,7 @@ namespace GameServer
             try
             {
                 counters.RecordUdpSend(sender.EndSend(result));
+                EventMetrics.Record(ServerEvent.UdpDatagramSent);
             }
             catch (Exception)
             {
@@ -241,18 +249,20 @@ namespace GameServer
         private static void UpdateLoop()
         {
             var dueConnections = new List<(int Id, Client.TCP Connection)>();
+            long deadline = Stopwatch.GetTimestamp() + TickPacer.Period;
             while (isRunning)
             {
                 long now = Stopwatch.GetTimestamp();
                 metrics.BeginTick(now);
                 UpdateConnections(now, dueConnections);
-                ThreadManager.UpdateMain();
+                var actions = ThreadManager.DrainActions();
                 long roomStarted = Stopwatch.GetTimestamp();
                 foreach (var room in rooms.Values) room.UpdateRound(roomStarted);
-                metrics.EndGameplay(ThreadManager.LastBatchMetrics,
-                    Stopwatch.GetElapsedTime(roomStarted).TotalMilliseconds);
+                double roomMs = Stopwatch.GetElapsedTime(roomStarted).TotalMilliseconds;
                 if (metrics.IsSnapshotDue(Stopwatch.GetTimestamp()))
                     CaptureMetrics();
+                metrics.EndGameplay(TickPacer.WaitUntil(deadline, actions), roomMs);
+                deadline = TickPacer.Next(deadline, Stopwatch.GetTimestamp());
             }
         }
 
@@ -310,8 +320,11 @@ namespace GameServer
                 int waiting = ThreadManager.GetWaitingActionCount();
                 var process = processMetrics.Latest;
                 var network = Network.Capture(Stopwatch.GetTimestamp());
+                var transports = clients.Values.Select(slot => slot.tcp.ReadTransport()).ToArray();
+                var transport = new TransportSample(transports.Sum(t => t.Pending), transports.Max(t => t.HighWater),
+                    transports.Sum(t => t.InFlight), transports.Sum(t => t.HeartbeatSamples), transports.Sum(t => t.HeartbeatTotalMs));
                 var snapshot = metrics.Publish(Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow,
-                    connected, ready, roomMetrics, waiting, captureStarted, process, network);
+                    connected, ready, roomMetrics, waiting, captureStarted, process, network, transport);
                 exporter.TryEnqueue(snapshot);
             }
             catch (Exception ex)

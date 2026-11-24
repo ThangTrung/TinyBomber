@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="vi">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark">
+<title>Tiny Bomber Server Monitor</title><link rel="stylesheet" href="/monitor.css"><script defer src="/monitor.js"></script></head>
+<body><main>
+<header><div class="brand"><span class="mark" aria-hidden="true">TB</span><h1>Tiny Bomber <span>Server Monitor</span></h1></div>
+<div class="status"><span id="status" role="status" data-state="starting">Đang kết nối</span><span>Uptime <b id="uptime">—</b></span><span>Mẫu <b id="sample">—</b></span></div></header>
+<section class="kpis" aria-label="Tổng quan">
+<article><h2>Clients</h2><strong id="connected">—</strong><small><b id="ready">—</b> Ready</small></article>
+<article><h2>Rooms</h2><strong id="roomCount">—</strong><small><b id="playing">—</b> Playing</small></article>
+<article><h2>Active players</h2><strong id="active">—</strong><small><b id="alive">—</b> Alive</small></article>
+<article><h2>Tick rate</h2><strong id="hz">—</strong><small>Hz · mục tiêu 30</small></article>
+<article><h2>Heartbeat RTT</h2><strong id="rtt">—</strong><small>ms · <b id="rttN">—</b> mẫu hợp lệ</small></article>
+</section>
+<section class="charts" aria-label="Lịch sử telemetry">
+<article class="panel"><div class="panel-head"><h2>Tick pacing</h2><span>ms</span></div><div class="legend"><i class="green"></i>Interval TB <i class="target"></i>33,33 ms</div><canvas id="tickChart" aria-label="Tick interval theo thời gian"></canvas></article>
+<article class="panel"><div class="panel-head"><h2>Game traffic</h2><span>KiB/s</span></div><div class="legend"><i class="blue"></i>TCP RX <i class="blue dashed"></i>TCP TX <i class="orange"></i>UDP RX <i class="orange dashed"></i>UDP TX</div><canvas id="netChart" aria-label="TCP và UDP tại socket game"></canvas></article>
+<article class="panel"><div class="panel-head"><h2>CPU tiến trình</h2><span>% tổng logical CPU</span></div><div class="legend"><i class="purple"></i>GameServer <b id="cpuNow">—</b></div><canvas id="cpuChart" aria-label="CPU GameServer theo thời gian"></canvas></article>
+<article class="panel"><div class="panel-head"><h2>Bộ nhớ tiến trình</h2><span>MiB</span></div><div class="legend"><i class="aqua"></i>Working set <b id="ramNow">—</b></div><canvas id="ramChart" aria-label="Working set GameServer theo thời gian"></canvas></article>
+</section>
+<div class="details"><section class="panel rooms"><div class="panel-head"><h2>Phòng chơi</h2><span id="roomSample">—</span></div>
+<div class="scroll"><table><thead><tr><th>Room</th><th>Round</th><th>Phase</th><th>Members</th><th>Ready</th><th>Active</th><th>Alive</th></tr></thead><tbody id="rooms"></tbody></table></div><p id="empty">Đang chờ snapshot đầu tiên.</p></section>
+<section class="panel"><div class="panel-head"><h2>Chẩn đoán server</h2></div><dl id="diagnostics"></dl></section></div>
+<section class="changes"><h2>Thay đổi quan sát từ snapshot</h2><ol id="changes"></ol></section>
+<footer><span>GameServer · IPv4 loopback</span><span id="lastTime">Chưa có snapshot</span></footer>
+</main></body></html>
