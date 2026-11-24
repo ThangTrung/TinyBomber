@@ -75,6 +75,7 @@ internal static class Program
         var rounds = new Dictionary<SimulatedClient, ClientState>();
         bool gameplay = options.Mode != WorkloadMode.LobbyIdle;
         bool active = options.Mode == WorkloadMode.GameplayActive;
+        bool combat = options.Mode is WorkloadMode.CombatActive or WorkloadMode.RepeatedRound;
         bool completed = false;
         double elapsed = 0;
         DateTimeOffset? measurementStartUtc = null;
@@ -113,7 +114,7 @@ internal static class Program
             }
             try
             {
-                await RunWindowAsync(clients, rounds, active, options.MovementHz, workload,
+                await RunWindowAsync(clients, rounds, active, options.Mode, options.MovementHz, workload,
                     SampleMeasurementStart, errors, stop);
             }
             finally
@@ -148,7 +149,11 @@ internal static class Program
                         errors.Add(ErrorKind.Workload, $"Slot {rounds[client].Id} thiếu movement/peer observation hoặc bị server chỉnh vị trí.");
                 }
             }
-            RequireHealthy(clients, errors, rounds);
+            RequireHealthy(clients, errors, rounds, allowTransitions: combat);
+            if (combat && clients.Any(c => c.ExplosionsSeen == 0))
+                throw new InvalidDataException("A room member observed no combat explosion.");
+            if (options.Mode == WorkloadMode.RepeatedRound && clients.All(c => c.CompletedCombatRounds != 5))
+                throw new InvalidDataException("RepeatedRound did not finish five rounds.");
             completed = true;
         }
         catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
@@ -219,6 +224,8 @@ internal static class Program
                     DegradedClients = udpHealth.Count(health => health.IsDegraded),
                     UnavailableSockets = udpHealth.Count(health => health.SocketUnavailable)
                 },
+                Latency = clients.Select(c => new { Client = c.ReadState().Id, Samples = c.Trace.Latencies() }),
+                Combat = clients.Select(c => c.CombatReport()),
                 MovementExamples = reports
             };
             Console.WriteLine(JsonSerializer.Serialize(summary, new JsonSerializerOptions { WriteIndented = true }));
@@ -308,14 +315,18 @@ internal static class Program
     }
 
     private static async Task RunWindowAsync(SimulatedClient[] clients, Dictionary<SimulatedClient, ClientState> rounds,
-        bool active, int hz, WorkloadWindow workload, Action sampleMeasurementStart,
+        bool active, WorkloadMode mode, int hz, WorkloadWindow workload, Action sampleMeasurementStart,
         RunErrors errors, CancellationToken stop)
     {
         using var window = CancellationTokenSource.CreateLinkedTokenSource(stop);
         bool measurementStarted = workload.WarmupSeconds == 0;
         if (measurementStarted) sampleMeasurementStart();
         window.CancelAfter(Stopwatch.GetElapsedTime(Stopwatch.GetTimestamp(), workload.EndsAt));
-        var movers = active
+        bool combat = mode is WorkloadMode.CombatActive or WorkloadMode.RepeatedRound;
+        var movers = combat
+            ? clients.GroupBy(c => rounds[c].RoomId).Select(group => SimulatedClient.RunCombatRoomAsync(
+                group.ToArray(), mode == WorkloadMode.RepeatedRound, workload, window.Token)).ToArray()
+            : active
             ? clients.Select(client => client.MoveAsync(rounds[client], workload, hz, window.Token)).ToArray()
             : Array.Empty<Task>();
         try
@@ -324,7 +335,7 @@ internal static class Program
             {
                 long now = Stopwatch.GetTimestamp();
                 if (now >= workload.EndsAt) break;
-                RequireHealthy(clients, errors, rounds);
+                RequireHealthy(clients, errors, rounds, allowTransitions: combat);
                 if (!measurementStarted && now >= workload.MeasurementStartsAt)
                 {
                     sampleMeasurementStart();
@@ -343,7 +354,7 @@ internal static class Program
     }
 
     private static void RequireHealthy(SimulatedClient[] clients, RunErrors errors,
-        Dictionary<SimulatedClient, ClientState> rounds)
+        Dictionary<SimulatedClient, ClientState> rounds, bool allowTransitions = false)
     {
         if (errors.Total != 0) throw new InvalidOperationException("Workload có client báo lỗi.");
         foreach (var client in clients)
@@ -352,8 +363,8 @@ internal static class Program
             if (!state.Connected || !state.Ready)
                 throw new InvalidOperationException("Chưa đủ số client đã kết nối và Ready.");
             if (rounds.TryGetValue(client, out ClientState expected) &&
-                (!IsPlaying(state) || !state.Alive || state.RoomId != expected.RoomId ||
-                    state.RoundId != expected.RoundId || state.ReadyInRoom != expected.ReadyInRoom))
+                (state.RoomId != expected.RoomId || state.ReadyInRoom != expected.ReadyInRoom ||
+                    (!allowTransitions && (!IsPlaying(state) || !state.Alive || state.RoundId != expected.RoundId))))
                 throw new InvalidOperationException($"Slot {state.Id} mất trạng thái của round yêu cầu.");
         }
     }

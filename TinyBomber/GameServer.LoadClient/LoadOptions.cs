@@ -2,7 +2,7 @@ using System.Globalization;
 
 namespace GameServer.LoadClient;
 
-internal enum WorkloadMode { LobbyIdle, GameplayIdle, GameplayActive }
+internal enum WorkloadMode { LobbyIdle, GameplayIdle, GameplayActive, CombatActive, RepeatedRound }
 
 internal sealed record LoadOptions(
     string Server = "127.0.0.1",
@@ -17,7 +17,7 @@ internal sealed record LoadOptions(
 
     internal const string Usage = """
         GameServer.LoadClient [--server <IPv4 hoặc hostname>] [--clients <1-2048>]
-           [--mode lobby-idle|gameplay-idle|gameplay-active] [--movement-hz <1-50>] [--seconds <1-600>]
+           [--mode lobby-idle|gameplay-idle|gameplay-active|combat-active|repeated-round] [--movement-hz <1-50>] [--seconds <1-600>]
            [--warmup-seconds <0-599>]
         Mặc định: 127.0.0.1, 8 client, lobby-idle, 20 Hz, đo 10 giây, warm-up 0 giây.
         Tổng thời gian warm-up và đo tối đa 600 giây.
@@ -49,6 +49,8 @@ internal sealed record LoadOptions(
                         "lobby-idle" => WorkloadMode.LobbyIdle,
                         "gameplay-idle" => WorkloadMode.GameplayIdle,
                         "gameplay-active" => WorkloadMode.GameplayActive,
+                        "combat-active" => WorkloadMode.CombatActive,
+                        "repeated-round" => WorkloadMode.RepeatedRound,
                         _ => throw new ArgumentException($"Workload không hợp lệ: {value}.")
                     }
                 },
@@ -57,6 +59,8 @@ internal sealed record LoadOptions(
         }
         if (options.Mode != WorkloadMode.LobbyIdle && options.Clients < 2)
             throw new ArgumentException("Chế độ gameplay cần ít nhất 2 client.");
+        if (options.Mode == WorkloadMode.RepeatedRound && options.Clients != 2)
+            throw new ArgumentException("RepeatedRound cần đúng hai client trong cùng phòng.");
         if (options.WarmupSeconds + options.Seconds > MaxSeconds)
             throw new ArgumentException($"Tổng thời gian warm-up và đo tối đa {MaxSeconds} giây.");
         return options;

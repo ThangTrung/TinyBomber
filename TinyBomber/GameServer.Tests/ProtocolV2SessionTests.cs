@@ -272,9 +272,9 @@ public sealed class ProtocolV2SessionTests
             object origin = Activator.CreateInstance(positionType, 1f, y)!;
             object oldTarget = Activator.CreateInstance(positionType, oldX, y)!;
             object newTarget = Activator.CreateInstance(positionType, newX, y)!;
-            Invoke(trace, "Prepare", origin, oldTarget, true);
+            Invoke(trace, "Prepare", origin, oldTarget, true, 1L, Stopwatch.GetTimestamp());
             Invoke(trace, "MarkSent", oldTarget, 0d);
-            Invoke(trace, "Prepare", origin, newTarget, true);
+            Invoke(trace, "Prepare", origin, newTarget, true, 1L, Stopwatch.GetTimestamp());
             Invoke(trace, "MarkSent", newTarget, 0d);
             Invoke(replacement, "Watch", actor, trace);
 
@@ -558,7 +558,7 @@ public sealed class ProtocolV2SessionTests
             Type positionType = LoadClientAssembly().GetType("GameServer.LoadClient.Position", throwOnError: true)!;
             object origin = Activator.CreateInstance(positionType, 1f, y)!;
             object target = Activator.CreateInstance(positionType, x, y)!;
-            Invoke(trace, "Prepare", origin, target, true);
+            Invoke(trace, "Prepare", origin, target, true, 1L, Stopwatch.GetTimestamp());
             Invoke(trace, "MarkSent", target, 0d);
             Invoke(observer.Value.Client, "Watch", sender.Value.Slot, trace);
             using var movement = ProtocolV4.CreateUdpPlayerMovement(sender.Value.Slot, sender.Value.Session,

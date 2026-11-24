@@ -31,6 +31,8 @@ namespace GameServer
             private static readonly long HeartbeatTimeout = 20 * Stopwatch.Frequency;
             public TcpClient socket = null!;
             private readonly int id;
+            private static long nextConnection;
+            private readonly long connectionId = Interlocked.Increment(ref nextConnection);
             private long? handshakeDeadline;
             private NetworkStream stream = null!;
             private byte[] receiveBuffer = null!;
@@ -46,6 +48,17 @@ namespace GameServer
             // Read and written by the server update thread.
             internal byte[]? SessionToken { get; set; }
             private long? lastHeartbeatProof;
+            private int highWater, inFlight;
+            private long? challengeStarted;
+            private long rttSamples;
+            private double rttTotalMs;
+
+            internal TransportSample ReadTransport()
+            {
+                lock (pendingWrites)
+                    return new TransportSample(pendingWrites.Count, highWater, Volatile.Read(ref inFlight), rttSamples, rttTotalMs);
+            }
+
             private long heartbeatSequence;
             private long? pendingChallenge;
             private long heartbeatAttempt;
@@ -111,6 +124,7 @@ namespace GameServer
                 long sequence = pendingChallenge ?? checked(heartbeatSequence + 1);
                 if (!(queuePing?.Invoke(sequence) ?? ServerSend.HeartbeatPing(this, sequence))) return;
 
+                challengeStarted = pendingChallenge.HasValue ? null : now;
                 heartbeatSequence = sequence;
                 pendingChallenge = sequence;
             }
@@ -118,6 +132,12 @@ namespace GameServer
             internal void AcceptHeartbeatPong(long sequence, long now)
             {
                 if (pendingChallenge != sequence || HeartbeatHasExpired(now)) return;
+                if (challengeStarted is long started)
+                {
+                    rttSamples++;
+                    rttTotalMs += Stopwatch.GetElapsedTime(started, now).TotalMilliseconds;
+                }
+                challengeStarted = null;
                 pendingChallenge = null;
                 lastHeartbeatProof = now;
                 heartbeatAttempt = 0;
@@ -133,6 +153,7 @@ namespace GameServer
                 {
                     if (socket == null || closed || writeFailed || (heartbeat && heartbeatWritePending)) return false;
                     pendingWrites.Enqueue((packet.ToArray(), heartbeat));
+                    highWater = Math.Max(highWater, pendingWrites.Count);
                     if (heartbeat) heartbeatWritePending = true;
                     if (writing) return true;
                     writing = true;
@@ -160,13 +181,29 @@ namespace GameServer
 
                         try
                         {
+                            Volatile.Write(ref inFlight, 1);
                             await stream.WriteAsync(write.Frame.AsMemory()).ConfigureAwait(false);
                         }
-                        catch
+                        catch (Exception error)
                         {
                             Server.Network.RecordTcpSendError();
+                            int pending;
+                            lock (pendingWrites) pending = pendingWrites.Count;
+                            var context = Server.WriteContext(id, this);
+                            var socketError = (error.GetBaseException() as SocketException)?.SocketErrorCode;
+                            bool wrapperClosed = closed;
+                            bool localClose = wrapperClosed && (error is ObjectDisposedException || socketError is
+                                SocketError.OperationAborted or SocketError.Interrupted or SocketError.NotSocket);
+                            Console.WriteLine($"[TCP_WRITE_ERROR] utc={DateTimeOffset.UtcNow:O} slot={id} connection={connectionId} " +
+                                $"type={error.GetType().Name} socket={socketError?.ToString() ?? "unknown"} closed={wrapperClosed} " +
+                                $"current={context.Current} stopping={context.Stopping} pending={pending} in_flight=1 " +
+                                $"frame={(write.Heartbeat ? "heartbeat" : "unknown")} bytes={write.Frame.Length} " +
+                                $"classification={(localClose ? "local-close" : "unclassified")}");
+
                             throw;
                         }
+                        finally { Volatile.Write(ref inFlight, 0); }
+                        EventMetrics.Record(ServerEvent.TcpFrameWritten);
                         Server.Network.RecordTcpWrite(write.Frame.Length);
                         if (write.Heartbeat)
                         {
@@ -174,7 +211,7 @@ namespace GameServer
                         }
                     }
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
                     lock (pendingWrites)
                     {
@@ -184,13 +221,13 @@ namespace GameServer
                         pendingWrites.Clear();
                     }
                     if (closed) return;
-                    Console.WriteLine($"Loi khi gui du lieu toi Player {id}: {ex.Message}");
                     ThreadManager.EnqueueAction(() => Server.Disconnect(id, this));
                 }
             }
 
             private void HandleFrame(byte[] _data)
             {
+                EventMetrics.Record(ServerEvent.TcpFrameReceived);
                 using (Packet _packet = new Packet(_data))
                 {
                     _packet.DecryptPayload();
@@ -222,6 +259,7 @@ namespace GameServer
                     {
                         if (!UsesMovementOrdering) return;
                         var move = ProtocolV4.ReadTcpPlayerMovement(_packet);
+                        EventMetrics.Record(ServerEvent.MoveTcp);
                         EnqueueCurrent(slot => ServerHandle.PlayerMovement(slot, move.RoomId, move.RoundId,
                             move.X, move.Y, moveSeq: move.MoveSeq));
                         return;
@@ -287,7 +325,8 @@ namespace GameServer
                         return;
                     }
 
-                    frameReader.Feed(receiveBuffer.AsSpan(0, _byteLength), HandleFrame);
+                    try { frameReader.Feed(receiveBuffer.AsSpan(0, _byteLength), HandleFrame); }
+                    catch { EventMetrics.Record(ServerEvent.TcpMalformed); throw; }
 
                     if (!closed) stream.BeginRead(receiveBuffer, 0, Constants.DATA_BUFFER_SIZE, ReceiveCallback, null);
                 }

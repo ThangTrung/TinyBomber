@@ -13,7 +13,7 @@ internal readonly record struct UdpHealthStats(
     long ProbesSent, long EchoesAccepted, long ProbesExpired, long Degradations, long Recoveries,
     long SendErrors, long ReceiveErrors, bool IsDegraded, bool SocketUnavailable);
 
-internal sealed class SimulatedClient : IAsyncDisposable
+internal sealed partial class SimulatedClient : IAsyncDisposable
 {
     private const int HandshakeTimeoutSeconds = 16;
     private readonly object stateLock = new();
@@ -528,6 +528,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
                         if (roster.Contains(player))
                         {
                             spawns[player] = position;
+                            if (player == id) authoritativePosition = position;
                             bombUps.SpawnPlayer(player);
                         }
                     }
@@ -553,12 +554,15 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     var item = ProtocolV5.ReadBombUp(packet, type);
                     if (phase == MatchPhase.Playing && item.Room == roomId && item.Round == roundId && map != null)
                     {
-                        if (item.Actor == 0) bombUps.Spawn(item.Col, item.Row);
-                        else bombUps.Collect(item.Col, item.Row, item.Actor, item.Capacity);
+                        if (item.Actor == 0)
+                        {
+                            if (bombUps.Spawn(item.Col, item.Row)) spawnsSeen++;
+                        }
+                        else if (bombUps.Collect(item.Col, item.Row, item.Actor, item.Capacity)) pickupsSeen++;
                     }
                     break;
                 case ServerPackets.bombPlaced:
-                    if (phase == MatchPhase.Playing && IsCurrentRound(packet)) bombs.Add(ReadCell(packet));
+                    if (phase == MatchPhase.Playing && IsCurrentRound(packet) && bombs.Add(ReadCell(packet))) placementsSeen++;
                     break;
                 case ServerPackets.bombExploded:
                     if (phase == MatchPhase.Playing && IsCurrentRound(packet)) ReadExplosion(packet);
@@ -729,6 +733,8 @@ internal sealed class SimulatedClient : IAsyncDisposable
         if (!position.IsFinite) throw new InvalidDataException("Tọa độ server không hữu hạn.");
 
         lastOwnerProcessedMoveSeq = sequence;
+        if (!isCorrection) Trace.Acknowledge(sequence);
+        authoritativePosition = position;
         // Preserve the benchmark's existing correction failure criterion.
         if (isCorrection) corrected = true;
     }
@@ -760,6 +766,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private void ReadExplosion(Packet packet)
     {
         bombs.Remove(ReadCell(packet));
+        explosionsSeen++;
         int blast = ReadCellCount(packet);
         for (int i = 0; i < blast; i++) ReadCell(packet);
         int destroyed = ReadCellCount(packet);
@@ -767,6 +774,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         {
             var (col, row) = ReadCell(packet);
             if (map != null) map[col, row] = 0;
+            blocksSeen++;
         }
     }
 
@@ -835,7 +843,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
                 byte[]? data = viaUdp ? packet.ToArray() : null;
                 long sendAt = Stopwatch.GetTimestamp();
                 if (sendAt >= end) break;
-                Trace.Prepare(position, target, window.ContainsMeasurement(sendAt));
+                Trace.Prepare(position, target, window.ContainsMeasurement(sendAt), moveSeq, sendAt);
                 // Use the latest due slot. Never emit a burst to make up missed slots.
                 slot = (sendAt - start) / period;
                 try

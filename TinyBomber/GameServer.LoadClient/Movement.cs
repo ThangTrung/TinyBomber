@@ -64,6 +64,21 @@ internal sealed class MovementTrace
     private readonly object sync = new();
     private readonly Dictionary<Position, Entry> recent = new();
     private readonly Queue<Position> order = new();
+    private readonly (long Sequence, long SentAt)[] ackTimes = new (long, long)[RecentLimit];
+    private readonly LatencyHistogram ackLatency = new(), peerLatency = new();
+    internal object Latencies()
+    {
+        lock (sync) return new { OwnerAck = ackLatency.Report(), PeerApply = peerLatency.Report() };
+    }
+    internal void Acknowledge(long sequence)
+    {
+        lock (sync)
+        {
+            var sample = ackTimes[(int)(sequence % RecentLimit)];
+            if (sample.Sequence == sequence && sample.SentAt > 0)
+                ackLatency.Record(sample.SentAt, System.Diagnostics.Stopwatch.GetTimestamp());
+        }
+    }
     private int warmupSent;
     private int warmupObserved;
     private int measuredSent;
@@ -78,16 +93,18 @@ internal sealed class MovementTrace
         internal Position Origin { get; } = origin;
         internal Position Target { get; } = target;
         internal bool Measured { get; } = measured;
+        internal long SentAt { get; init; }
         internal bool Sent { get; set; }
         internal int ObserverId { get; set; }
         internal Position Observed { get; set; }
     }
 
-    internal void Prepare(Position origin, Position target, bool measured)
+    internal void Prepare(Position origin, Position target, bool measured, long sequence, long sentAt)
     {
         lock (sync)
         {
-            recent.Add(target, new Entry(origin, target, measured));
+            recent.Add(target, new Entry(origin, target, measured) { SentAt = sentAt });
+            ackTimes[(int)(sequence % RecentLimit)] = (sequence, measured ? sentAt : 0);
             order.Enqueue(target);
             if (order.Count > RecentLimit) recent.Remove(order.Dequeue());
         }
@@ -119,6 +136,7 @@ internal sealed class MovementTrace
         lock (sync)
         {
             if (!recent.TryGetValue(position, out Entry? entry) || entry.ObserverId != 0) return;
+            if (entry.Measured && entry.SentAt > 0) peerLatency.Record(entry.SentAt, System.Diagnostics.Stopwatch.GetTimestamp());
             entry.ObserverId = observerId;
             entry.Observed = position;
             if (entry.Sent) CountMatch(entry);
