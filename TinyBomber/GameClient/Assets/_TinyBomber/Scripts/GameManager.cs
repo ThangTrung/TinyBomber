@@ -12,6 +12,33 @@ public class GameManager : MonoBehaviour
     public GameObject localPlayerPrefab; 
     public GameObject playerPrefab;
     public GameObject softBlockPrefab;
+    public GameObject bombUpPrefab;
+    private readonly BombUpRoundState bombUps = new BombUpRoundState();
+    private readonly Dictionary<Vector2Int, GameObject> itemViews = new Dictionary<Vector2Int, GameObject>();
+
+    internal void ApplyBombUp(int room, int round, int col, int row, int actor, int capacity)
+    {
+        if (!IsPlaying || room != RoomId || round != ActiveRoundId) return;
+        var cell = new Vector2Int(col, row);
+        if (actor == 0)
+        {
+            if (bombUps.Spawn(col, row) && bombUpPrefab)
+                itemViews.Add(cell, Instantiate(bombUpPrefab, CellCenter(cell), Quaternion.identity));
+        }
+        else if (bombUps.Collect(col, row, actor, capacity) && itemViews.TryGetValue(cell, out var view))
+        {
+            itemViews.Remove(cell);
+            Destroy(view);
+        }
+    }
+
+    private void ClearBombUps()
+    {
+        bombUps.Clear();
+        foreach (var view in itemViews.Values) if (view) Destroy(view);
+        itemViews.Clear();
+    }
+
     public GameObject bombPrefab;
     private readonly Dictionary<Vector2Int, GameObject> bombs = new Dictionary<Vector2Int, GameObject>();
     [SerializeField] private Text matchStatus;
@@ -156,6 +183,7 @@ public class GameManager : MonoBehaviour
         winnerId = winner;
         if (phase == MatchPhase.Finished)
         {
+            ClearBombUps();
             movementOrdering.Reset();
             ClearBombs();
         }
@@ -298,6 +326,7 @@ public class GameManager : MonoBehaviour
         }
 
         players.Add(_id, _player);
+        bombUps.SpawnPlayer(_id);
         if (IsPlaying && _id != Client.instance.myId) ApplyStoredPeerPosition(_id, _player);
     }
 
@@ -305,6 +334,7 @@ public class GameManager : MonoBehaviour
     {
         if (instance)
         {
+            instance.bombUps.RemovePlayer(id);
             instance.pendingSpawns.Remove(id);
             instance.movementOrdering.RemovePeer(id);
             if (Client.instance && id == Client.instance.myId) instance.movementOrdering.ResetLocal();
@@ -331,6 +361,7 @@ public class GameManager : MonoBehaviour
 
     private void ClearRound()
     {
+        ClearBombUps();
         movementOrdering.Reset();
         movementResolver?.Reset();
         ActiveRoundId = 0;

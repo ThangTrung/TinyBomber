@@ -158,13 +158,38 @@ public sealed class LoadClientMovementOrderingTests
         Assert.Equal(0, Read<int>(client, "roundId"));
     }
 
+    [Fact]
+    public async Task ItemReplicationIsScopedAndSurvivesLocalElimination()
+    {
+        await using var client = ReadyClient();
+        Set(client, "map", new int[17, 15]);
+        var state = Read<BombUpRoundState>(client, "bombUps");
+        ReceiveTcp(client, ServerPackets.playerEliminated, 7, 1, 1);
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 8, 1, 4, 5);
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 2, 4, 5);
+        Assert.False(state.HasItem(4, 5));
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 1, 4, 5);
+        Assert.True(state.HasItem(4, 5));
+        Assert.Throws<TargetInvocationException>(() =>
+            ReceiveTcp(client, ServerPackets.bombUpCollected, 7, 1, 4, 5, 2, 4));
+        Assert.True(state.HasItem(4, 5));
+        ReceiveTcp(client, ServerPackets.bombUpCollected, 7, 1, 4, 5, 2, 2);
+        Assert.False(state.HasItem(4, 5));
+        Assert.True(state.TryGetCapacity(2, out int capacity));
+        Assert.Equal(2, capacity);
+        ReceiveTcp(client, ServerPackets.matchState, 7, 1, (int)MatchPhase.Finished, 2, 2);
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 1, 4, 5);
+        Assert.False(state.HasItem(4, 5));
+        Assert.False(state.TryGetCapacity(2, out _));
+    }
+
     private IAsyncDisposable ReadyClient()
     {
         Type errorsType = LoadClient.GetType("GameServer.LoadClient.RunErrors", true)!;
         object errors = Activator.CreateInstance(errorsType, nonPublic: true)!;
         var client = (IAsyncDisposable)Activator.CreateInstance(ClientType, Members, null,
             new object?[] { 1, errors, CancellationToken.None, null }, null)!;
-        Set(client, "acceptedProtocolVersion", ProtocolV4.Version);
+        Set(client, "acceptedProtocolVersion", ProtocolV5.Version);
         Set(client, "connected", true);
         Set(client, "ready", true);
         Set(client, "sessionToken", token);

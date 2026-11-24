@@ -95,9 +95,9 @@ public class Client : MonoBehaviour
         if (!IsConnecting || myId != 0 || slotId <= 0)
             throw new InvalidDataException("ServerHello không hợp lệ.");
         if (CheckHandshakeDeadline()) return;
-        if (version != ProtocolV4.Version)
+        if (version != ProtocolV5.Version)
         {
-            Disconnect($"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV4.Version}.");
+            Disconnect($"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV5.Version}.");
             return;
         }
 
@@ -175,7 +175,7 @@ public class Client : MonoBehaviour
     public class TCP
     {
         internal int AcceptedProtocolVersion { get; set; }
-        internal bool UsesMovementOrdering => AcceptedProtocolVersion == ProtocolV4.Version;
+        internal bool UsesMovementOrdering => AcceptedProtocolVersion == ProtocolV5.Version;
         private readonly long handshakeDeadline =
             Stopwatch.GetTimestamp() + HandshakeTimeoutSeconds * Stopwatch.Frequency;
         public TcpClient socket;
@@ -403,7 +403,7 @@ public class Client : MonoBehaviour
                     _packet.ReadString();
                     if (_packet.UnreadLength() != sizeof(int) || _packet.ReadInt() <= 0)
                         throw new InvalidDataException("Welcome v1 không hợp lệ.");
-                    instance.Disconnect($"Máy chủ dùng protocol v1. Client yêu cầu v{ProtocolV4.Version}.");
+                    instance.Disconnect($"Máy chủ dùng protocol v1. Client yêu cầu v{ProtocolV5.Version}.");
                     return;
                 }
                 if (instance.IsConnecting)
@@ -420,6 +420,11 @@ public class Client : MonoBehaviour
                 else if (_packetId == (int)ServerPackets.playerDisconnected)
                 {
                     ClientHandle.PlayerDisconnected(_packet);
+                }
+                else if (_packetId == (int)ServerPackets.bombUpSpawned || _packetId == (int)ServerPackets.bombUpCollected)
+                {
+                    var item = ProtocolV5.ReadBombUp(_packet, (ServerPackets)_packetId);
+                    GameManager.instance.ApplyBombUp(item.Room, item.Round, item.Col, item.Row, item.Actor, item.Capacity);
                 }
                 else if (_packetId == (int)ServerPackets.bombPlaced)
                 {

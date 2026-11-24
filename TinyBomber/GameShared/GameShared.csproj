@@ -6,7 +6,10 @@
   </PropertyGroup>
 
   <Target Name="PostBuild" AfterTargets="PostBuildEvent">
-    <Exec Command="copy /Y &quot;$(TargetPath)&quot; &quot;$(SolutionDir)GameClient\Assets\Plugins\&quot;" />
+    <PropertyGroup>
+      <PluginOutputDirectory Condition="'$(PluginOutputDirectory)' == ''">$(SolutionDir)GameClient\Assets\Plugins</PluginOutputDirectory>
+    </PropertyGroup>
+    <Exec Command="copy /Y &quot;$(TargetPath)&quot; &quot;$(PluginOutputDirectory)\&quot;" />
   </Target>
 
 </Project>

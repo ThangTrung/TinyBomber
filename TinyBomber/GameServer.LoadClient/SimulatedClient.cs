@@ -28,6 +28,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private readonly TaskCompletionSource<byte[]> sessionGranted = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource<byte[]> udpProbe = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly TaskCompletionSource lobbyReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly BombUpRoundState bombUps = new();
     private readonly HashSet<int> roster = new();
     private readonly Dictionary<int, Position> spawns = new();
     private readonly Dictionary<int, long> peerMovementSequences = new();
@@ -63,7 +64,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
     private MovementTrace? watchedTrace;
 
     internal MovementTrace Trace { get; } = new();
-    private bool UsesMovementOrdering => acceptedProtocolVersion == ProtocolV4.Version;
+    private bool UsesMovementOrdering => acceptedProtocolVersion == ProtocolV5.Version;
 
     internal SimulatedClient(int index, RunErrors errors, CancellationToken stop,
         Func<UdpClient, CancellationToken, ValueTask<UdpReceiveResult>>? receiveDatagram = null)
@@ -159,7 +160,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         try
         {
             int slot = await serverHello.Task.WaitAsync(token).ConfigureAwait(false);
-            using var hello = ProtocolV4.CreateClientHello(slot, $"LoadClient_{slot}");
+            using var hello = ProtocolV5.CreateClientHello(slot, $"LoadClient_{slot}");
             lock (stateLock) clientHelloSent = true;
             await SendTcpFrameAsync(hello, ClientPackets.clientHello, token).ConfigureAwait(false);
 
@@ -524,7 +525,11 @@ internal sealed class SimulatedClient : IAsyncDisposable
                     {
                         int player = packet.ReadInt();
                         Position position = ReadPosition(packet);
-                        if (roster.Contains(player)) spawns[player] = position;
+                        if (roster.Contains(player))
+                        {
+                            spawns[player] = position;
+                            bombUps.SpawnPlayer(player);
+                        }
                     }
                     break;
                 case ServerPackets.playerPosition:
@@ -538,8 +543,18 @@ internal sealed class SimulatedClient : IAsyncDisposable
                         if (player == id) alive = false;
                         if (type == ServerPackets.playerDisconnected) roster.Remove(player);
                         spawns.Remove(player);
+                        bombUps.RemovePlayer(player);
                         peerMovementSequences.Remove(player);
                         if (player == id) ResetLocalMovementOrdering();
+                    }
+                    break;
+                case ServerPackets.bombUpSpawned:
+                case ServerPackets.bombUpCollected:
+                    var item = ProtocolV5.ReadBombUp(packet, type);
+                    if (phase == MatchPhase.Playing && item.Room == roomId && item.Round == roundId && map != null)
+                    {
+                        if (item.Actor == 0) bombUps.Spawn(item.Col, item.Row);
+                        else bombUps.Collect(item.Col, item.Row, item.Actor, item.Capacity);
                     }
                     break;
                 case ServerPackets.bombPlaced:
@@ -575,7 +590,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         if (hello.SlotId <= 0 || serverHello.Task.IsCompleted)
             throw new InvalidDataException("ServerHello không hợp lệ.");
         if (HandshakeHasExpired()) return;
-        if (hello.Version != ProtocolV4.Version)
+        if (hello.Version != ProtocolV5.Version)
         {
             RejectProtocolVersion(hello.Version);
             return;
@@ -592,7 +607,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
 
     private void RejectProtocolVersion(int version)
     {
-        Fail(ErrorKind.Connection, $"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV4.Version}.");
+        Fail(ErrorKind.Connection, $"Máy chủ dùng protocol v{version}. Client yêu cầu v{ProtocolV5.Version}.");
     }
 
     private void HandleUdpPacket(byte[] data)
@@ -657,6 +672,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         alive = false;
         corrected = false;
         map = null;
+        bombUps.Clear();
         roster.Clear();
         spawns.Clear();
         bombs.Clear();
@@ -687,7 +703,11 @@ internal sealed class SimulatedClient : IAsyncDisposable
             throw new InvalidDataException("MatchPhase không hợp lệ.");
         readyInRoom = packet.ReadInt();
         packet.ReadInt(); // Winner id.
-        if (phase == MatchPhase.Finished) ResetMovementOrdering();
+        if (phase == MatchPhase.Finished)
+        {
+            bombUps.Clear();
+            ResetMovementOrdering();
+        }
     }
 
     private void ReadMap(Packet packet)
@@ -948,6 +968,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         {
             if (ready || ended || lifetime.IsCancellationRequested) return;
             ended = true;
+            bombUps.Clear();
             connected = false;
             ResetMovementOrdering();
             errors.Add(ErrorKind.Timeout, $"Client {index}: {message}");
@@ -962,6 +983,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         {
             if (ended) return;
             ended = true;
+            bombUps.Clear();
             if (!lifetime.IsCancellationRequested) errors.Add(kind, $"Client {index}: {message}");
             connected = ready = false;
             ResetMovementOrdering();
@@ -981,6 +1003,7 @@ internal sealed class SimulatedClient : IAsyncDisposable
         lock (stateLock)
         {
             ended = true;
+            bombUps.Clear();
             connected = ready = false;
             ResetMovementOrdering();
         }

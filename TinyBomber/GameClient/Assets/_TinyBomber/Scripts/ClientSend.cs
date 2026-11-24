@@ -59,7 +59,7 @@ public class ClientSend : MonoBehaviour
     public static void SendClientHello()
     {
         int slotId = Client.instance.myId;
-        using var packet = ProtocolV4.CreateClientHello(slotId, "Player_" + slotId);
+        using var packet = ProtocolV5.CreateClientHello(slotId, "Player_" + slotId);
         Client.instance.tcp.SendData(packet);
     }
 

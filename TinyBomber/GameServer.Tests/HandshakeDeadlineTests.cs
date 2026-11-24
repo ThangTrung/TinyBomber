@@ -21,7 +21,7 @@ public sealed class HandshakeDeadlineTests
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
 
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", Deadline + offset);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV5.Version, slot.id, "Player", Deadline + offset);
 
         Assert.Equal(accepted ? "Player" : null, slot.Username);
         Assert.Equal(accepted, slot.tcp.SessionToken?.Length == 16);
@@ -35,7 +35,7 @@ public sealed class HandshakeDeadlineTests
     {
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", AcceptedAt);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV5.Version, slot.id, "Player", AcceptedAt);
         var endpoint = new IPEndPoint(IPAddress.Loopback, 12345);
 
         Assert.Equal(accepted, ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp, endpoint,
@@ -51,7 +51,7 @@ public sealed class HandshakeDeadlineTests
     {
         var slot = new Client(1);
         slot.tcp.StartHandshake(AcceptedAt);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", AcceptedAt);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV5.Version, slot.id, "Player", AcceptedAt);
         byte[] token = slot.tcp.SessionToken!;
         Assert.True(ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp,
             new IPEndPoint(IPAddress.Loopback, 12345), token, Deadline - 2));
@@ -87,7 +87,7 @@ public sealed class HandshakeDeadlineTests
             Assert.True(firstHandle.IsClosed);
 
             next.StartHandshake(Deadline);
-            ServerHandle.ClientHello(slot, next, ProtocolV4.Version, slot.id, "Replacement", Deadline + 1);
+            ServerHandle.ClientHello(slot, next, ProtocolV5.Version, slot.id, "Replacement", Deadline + 1);
             next.socket = nextSocket;
             Server.ExpireHandshake(slot.id, first, Deadline + 1);
             Server.Disconnect(slot.id, first);
@@ -110,7 +110,7 @@ public sealed class HandshakeDeadlineTests
         var slot = new Client(int.MaxValue);
         var connection = slot.tcp;
         connection.StartHandshake(AcceptedAt);
-        ServerHandle.ClientHello(slot, connection, ProtocolV4.Version, slot.id, "Player", AcceptedAt);
+        ServerHandle.ClientHello(slot, connection, ProtocolV5.Version, slot.id, "Player", AcceptedAt);
         ServerHandle.RegisterUdp(slot, connection, slot.udp, new IPEndPoint(IPAddress.Loopback, 12345),
             connection.SessionToken!, Deadline - 2);
         ServerHandle.ConfirmUdp(slot, connection, connection.SessionToken!, slot.udp.ProbeNonce!, Deadline - 1);
@@ -142,7 +142,7 @@ public sealed class HandshakeDeadlineTests
         {
             await AssertBootstrapRejectedAsync(tcpPort, ProtocolV2.Version, malformed: false, token);
             await AssertBootstrapRejectedAsync(tcpPort, ProtocolV3.Version, malformed: false, token);
-            await AssertBootstrapRejectedAsync(tcpPort, ProtocolV4.Version, malformed: true, token);
+            await AssertBootstrapRejectedAsync(tcpPort, ProtocolV5.Version, malformed: true, token);
             using var ready = await Peer.OpenAsync(tcpPort, token);
             await AssertRegistrationAndRetryAsync(ready, udpPort, token);
             using var unresponsiveReady = await Peer.OpenAsync(tcpPort, token);
@@ -154,7 +154,7 @@ public sealed class HandshakeDeadlineTests
             using var noConfirmation = await Peer.OpenAsync(tcpPort, token);
             using var retrying = await Peer.OpenAsync(tcpPort, token);
 
-            using var partialHello = ProtocolV4.CreateClientHello(partial.SlotId, "Partial");
+            using var partialHello = ProtocolV5.CreateClientHello(partial.SlotId, "Partial");
             byte[] partialFrame = partialHello.ToArray();
             await partial.Stream.WriteAsync(partialFrame.AsMemory(0, 10), token);
             await noRegistration.GrantSessionAsync(token);
@@ -538,7 +538,7 @@ public sealed class HandshakeDeadlineTests
                 await peer.tcp.ConnectAsync(IPAddress.Loopback, port, token);
                 using Packet hello = await peer.ReadAsync(ServerPackets.serverHello, token, leaveId: true);
                 var server = ProtocolV2.ReadServerHello(hello);
-                Assert.Equal(ProtocolV4.Version, server.Version);
+                Assert.Equal(ProtocolV5.Version, server.Version);
                 peer.SlotId = server.SlotId;
                 return peer;
             }
@@ -587,7 +587,7 @@ public sealed class HandshakeDeadlineTests
 
         internal async Task GrantSessionAsync(CancellationToken cancellation)
         {
-            using var hello = ProtocolV4.CreateClientHello(SlotId, $"Peer{SlotId}");
+            using var hello = ProtocolV5.CreateClientHello(SlotId, $"Peer{SlotId}");
             await Stream.WriteAsync(hello.ToArray(), cancellation);
             using Packet granted = await ReadAsync(ServerPackets.sessionGranted, cancellation, leaveId: true);
             SessionToken = ProtocolV2.ReadSessionGranted(granted);

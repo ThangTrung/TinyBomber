@@ -42,7 +42,7 @@ namespace GameServer
             private volatile bool closed;
             // Published by the update thread after hello validation and read by receive callbacks.
             internal volatile int AcceptedProtocolVersion;
-            internal bool UsesMovementOrdering => AcceptedProtocolVersion == ProtocolV4.Version;
+            internal bool UsesMovementOrdering => AcceptedProtocolVersion == ProtocolV5.Version;
             // Read and written by the server update thread.
             internal byte[]? SessionToken { get; set; }
             private long? lastHeartbeatProof;
@@ -217,7 +217,7 @@ namespace GameServer
                         return;
                     }
                     if (packetId is (int)ClientPackets.welcomeReceived or (int)ClientPackets.udpReady)
-                        throw new InvalidDataException($"Legacy v1 handshake packet on a v{ProtocolV4.Version} server.");
+                        throw new InvalidDataException($"Legacy v1 handshake packet on a v{ProtocolV5.Version} server.");
                     if (packetId == (int)ClientPackets.playerMovementV4)
                     {
                         if (!UsesMovementOrdering) return;

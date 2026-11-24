@@ -76,7 +76,9 @@ namespace GameShared
         udpHealthEcho = 20,
         playerPositionV4 = 21,
         udpPlayerPositionV4 = 22,
-        playerCorrectionV4 = 23
+        playerCorrectionV4 = 23,
+        bombUpSpawned = 24,
+        bombUpCollected = 25
     }
 
     public enum ClientPackets

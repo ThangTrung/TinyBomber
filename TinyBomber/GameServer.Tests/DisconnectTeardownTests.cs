@@ -140,6 +140,36 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
         output.WriteLine($"TCP send errors observed during the closing batch: {Server.Network.ReadTotals().TcpSendErrors - errorsBefore}");
     }
 
+    [Fact]
+    public async Task BombUpEventsReachEveryParticipantIncludingEliminatedPeer()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var token = timeout.Token;
+        using var fixture = new SocketFixture();
+        var (room, peers) = await fixture.StartRoomAsync(3, token, new GameLogic(987, itemRandom: new BombUpTests.Roll(0)));
+        var owner = peers[0].Slot.player!;
+        var (col, row) = GameLogic.WorldToGrid(owner.x, owner.y);
+        room.mapData[col + 1, row] = 2;
+        room.PlaceBomb(peers[0].Slot, room.Id, 1);
+        room.UpdateRound(long.MaxValue);
+        Assert.False(owner.isAlive);
+        Assert.Contains((col + 1, row), room.BombUps);
+        var winner = peers[1].Slot.player!;
+        (winner.x, winner.y) = GameLogic.GridToWorld(col + 1, row);
+        room.UpdateRound(long.MaxValue);
+        Assert.Empty(room.BombUps);
+        Assert.Equal(2, winner.maxActiveBombs);
+        foreach (var peer in peers)
+        {
+            await peer.ExpectAsync(ServerPackets.bombPlaced, token, room.Id, 1, col, row);
+            using var explosion = await peer.ReadAsync(token);
+            Assert.Equal((int)ServerPackets.bombExploded, explosion.ReadInt());
+            await peer.ExpectAsync(ServerPackets.playerEliminated, token, room.Id, 1, owner.id);
+            await peer.ExpectAsync(ServerPackets.bombUpSpawned, token, room.Id, 1, col + 1, row);
+            await peer.ExpectAsync(ServerPackets.bombUpCollected, token, room.Id, 1, col + 1, row, winner.id, 2);
+        }
+    }
+
     private static async Task DrainAsync(int minimumActions, CancellationToken token)
     {
         // The queue count, not elapsed time, controls when the update thread may apply the batch.
@@ -162,7 +192,7 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
             listener.Start();
         }
 
-        public async Task<(GameLogic Room, Peer[] Peers)> StartRoomAsync(int count, CancellationToken token)
+        public async Task<(GameLogic Room, Peer[] Peers)> StartRoomAsync(int count, CancellationToken token, GameLogic? controlledRoom = null)
         {
             var group = new Peer[count];
             for (int i = 0; i < count; i++)
@@ -173,7 +203,7 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
                 group[i] = await OpenAsync(slot, token);
             }
 
-            var room = Server.CreateRoom();
+            var room = controlledRoom ?? Server.CreateRoom();
             foreach (var peer in group) Assert.True(room.TryAddMember(peer.Slot));
             room.StartRound(group[0].Slot, room.Id, 0);
             Assert.Equal(MatchPhase.Playing, room.Phase);
@@ -201,10 +231,10 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
             await peer.Tcp.ConnectAsync((IPEndPoint)listener.LocalEndpoint, token);
             peer.Accept(await listener.AcceptTcpClientAsync(token));
             using (var hello = await peer.ReadAsync(token))
-                Assert.Equal((ProtocolV4.Version, slot.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, slot.id), ProtocolV2.ReadServerHello(hello));
 
             // Drive the v2 state transitions in the fixture. The M3 integration test covers the UDP socket handshake.
-            ServerHandle.ClientHello(slot, peer.Connection, ProtocolV4.Version, slot.id, $"Peer{slot.id}");
+            ServerHandle.ClientHello(slot, peer.Connection, ProtocolV5.Version, slot.id, $"Peer{slot.id}");
             using var grant = await peer.ReadAsync(token);
             byte[] session = ProtocolV2.ReadSessionGranted(grant);
             Assert.True(ServerHandle.RegisterUdp(slot, peer.Connection, peer.Udp,

@@ -336,16 +336,16 @@ public sealed class MovementOrderingTests
             mover.tcp.StartReceiving();
             peer.tcp.StartReceiving();
             using (Packet hello = await ReadFrameAsync(ownerStream, cancellation))
-                Assert.Equal((ProtocolV4.Version, mover.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, mover.id), ProtocolV2.ReadServerHello(hello));
             using (Packet hello = await ReadFrameAsync(peerStream, cancellation))
-                Assert.Equal((ProtocolV4.Version, peer.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, peer.id), ProtocolV2.ReadServerHello(hello));
 
             mover.tcp.AcceptedProtocolVersion = ProtocolV3.Version;
             SendTcp(100, 0.06f);
             SendUdp(100, 0.06f);
             Assert.Equal(0, ThreadManager.GetWaitingActionCount());
             Assert.Equal((0L, 0L), Watermarks);
-            mover.tcp.AcceptedProtocolVersion = ProtocolV4.Version;
+            mover.tcp.AcceptedProtocolVersion = ProtocolV5.Version;
             using (var legacy = ProtocolV2.CreateUdpPlayerMovement(mover.id, ownerToken, room.Id, room.RoundId, 0.06f, 0f))
                 udpDispatch.Invoke(null, new object[] { legacy.ToArray(), endpoint });
             using (var legacy = new Packet((int)ClientPackets.playerMovement))
@@ -478,7 +478,7 @@ public sealed class MovementOrderingTests
         {
             var stream = owner.GetStream();
             using (Packet hello = await ReadFrameAsync(stream, cancellation))
-                Assert.Equal((ProtocolV4.Version, mover.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, mover.id), ProtocolV2.ReadServerHello(hello));
 
             Move(11, 0.08f, ms: 0, viaUdp: true);
             Move(12, 0.16f, ms: 1);
@@ -542,9 +542,9 @@ public sealed class MovementOrderingTests
             var ownerStream = owner.GetStream();
             var peerStream = recipient.GetStream();
             using (Packet hello = await ReadFrameAsync(ownerStream, token))
-                Assert.Equal((ProtocolV4.Version, mover.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, mover.id), ProtocolV2.ReadServerHello(hello));
             using (Packet hello = await ReadFrameAsync(peerStream, token))
-                Assert.Equal((ProtocolV4.Version, peer.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, peer.id), ProtocolV2.ReadServerHello(hello));
             peer.udp.endPoint = (IPEndPoint)udpRecipient.Client.LocalEndPoint!;
 
             if (arrivalOrder == 1) Move(11, 0.08f, viaUdp: true);
@@ -679,7 +679,7 @@ public sealed class MovementOrderingTests
     {
         slot.Username = $"Player {slot.id}";
         slot.UdpConfirmed = true;
-        slot.tcp.AcceptedProtocolVersion = ProtocolV4.Version;
+        slot.tcp.AcceptedProtocolVersion = ProtocolV5.Version;
         slot.tcp.SessionToken = ProtocolV2.NewSessionToken();
     }
 }

@@ -17,7 +17,7 @@ namespace GameServer
         public float y;
         public int hp = 1;
         public bool isAlive = true;
-        public int maxActiveBombs = 1;
+        public int maxActiveBombs = GameShared.ProtocolV5.InitialCapacity;
         public int blastRange = 1;
 
         internal long LastProcessedMoveSeq { get; private set; }

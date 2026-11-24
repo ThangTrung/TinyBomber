@@ -424,11 +424,33 @@ public sealed class MovementOrderingUnityTests
         Assert.That(local.transform.position, Is.EqualTo(Vector3.zero));
     }
 
+    [Test]
+    public void RetiredTcpWrapperCannotSpawnItemInReusedRoomAndRound()
+    {
+        Invoke("ApplyMatchState", 1, MatchPhase.Playing, 2, 0);
+        var state = (BombUpRoundState)gameType.GetField("bombUps", Instance).GetValue(game);
+        using var spawn = new Packet((int)ServerPackets.bombUpSpawned);
+        foreach (int field in new[] { 7, 1, 4, 5 }) spawn.Write(field);
+        spawn.WriteLength();
+        spawn.EncryptPayload();
+        Receive(InstallConnection(), spawn);
+        var current = InstallConnection();
+        DrainNetwork();
+        Assert.IsFalse(state.HasItem(4, 5));
+        Receive(current, spawn);
+        DrainNetwork();
+        Assert.IsTrue(state.HasItem(4, 5));
+        Invoke("ApplyMatchState", 1, MatchPhase.Finished, 2, 1);
+        Receive(current, spawn);
+        DrainNetwork();
+        Assert.IsFalse(state.HasItem(4, 5));
+    }
+
     private object InstallConnection()
     {
         var type = clientType.GetNestedType("TCP");
         var connection = Activator.CreateInstance(type);
-        type.GetProperty("AcceptedProtocolVersion", Instance).SetValue(connection, ProtocolV4.Version);
+        type.GetProperty("AcceptedProtocolVersion", Instance).SetValue(connection, ProtocolV5.Version);
         clientType.GetField("tcp").SetValue(clientInstance.GetValue(null), connection);
         return connection;
     }

@@ -14,7 +14,8 @@ public sealed class ProtocolV2SessionTests
     [InlineData(1, 42)]
     [InlineData(2, 42)]
     [InlineData(ProtocolV3.Version, 42)]
-    [InlineData(ProtocolV4.Version, 43)]
+    [InlineData(ProtocolV4.Version, 42)]
+    [InlineData(ProtocolV5.Version, 43)]
     public void ClientHelloWithWrongVersionOrSlotReleasesConnectionBeforeGrant(int version, int slotId)
     {
         var slot = new Client(42);
@@ -49,9 +50,9 @@ public sealed class ProtocolV2SessionTests
 
         Assert.False(ServerHandle.RegisterUdp(slot, slot.tcp, slot.udp, endpoint, new byte[16], 100));
         Assert.Null(slot.udp.endPoint);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", 100);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV5.Version, slot.id, "Player", 100);
         byte[] token = Assert.IsType<byte[]>(slot.tcp.SessionToken);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Repeated", 101);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV5.Version, slot.id, "Repeated", 101);
         Assert.Same(token, slot.tcp.SessionToken);
         Assert.Equal("Player", slot.Username);
 
@@ -70,7 +71,7 @@ public sealed class ProtocolV2SessionTests
         var slot = new Client(1);
         var endpoint = new IPEndPoint(IPAddress.Loopback, 12345);
         slot.tcp.StartHandshake(100);
-        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV4.Version, slot.id, "Player", 100);
+        ServerHandle.ClientHello(slot, slot.tcp, ProtocolV5.Version, slot.id, "Player", 100);
         byte[] token = slot.tcp.SessionToken!;
         ServerHandle.ConfirmUdp(slot, slot.tcp, token, new byte[16], 101);
         Assert.False(slot.IsReady);
@@ -110,7 +111,7 @@ public sealed class ProtocolV2SessionTests
             Server.Disconnect(slot.id, first);
             var next = slot.tcp;
             Assert.NotSame(first, next);
-            ServerHandle.ClientHello(slot, next, ProtocolV4.Version, slot.id, "Replacement", 100);
+            ServerHandle.ClientHello(slot, next, ProtocolV5.Version, slot.id, "Replacement", 100);
             byte[] token = next.SessionToken!;
             Assert.True(ServerHandle.RegisterUdp(slot, next, slot.udp,
                 new IPEndPoint(IPAddress.Loopback, 12345), token, 100));
@@ -160,9 +161,9 @@ public sealed class ProtocolV2SessionTests
             try
             {
                 using Packet hello = await ReadFrameAsync(peer.GetStream(), token);
-                Assert.Equal((ProtocolV4.Version, recipient.id), ProtocolV2.ReadServerHello(hello));
+                Assert.Equal((ProtocolV5.Version, recipient.id), ProtocolV2.ReadServerHello(hello));
 
-                recipient.tcp.AcceptedProtocolVersion = ProtocolV4.Version;
+                recipient.tcp.AcceptedProtocolVersion = ProtocolV5.Version;
                 Assert.True(player.TryMarkMovementProcessed(11));
                 player.AcceptMovement(player.x, player.y, 11);
                 ServerSend.BroadcastPlayerPosition(room, player);
@@ -299,9 +300,10 @@ public sealed class ProtocolV2SessionTests
     [Theory]
     [InlineData(ProtocolV2.Version, false)]
     [InlineData(ProtocolV3.Version, false)]
-    [InlineData(ProtocolV4.Version, true)]
+    [InlineData(ProtocolV4.Version, false)]
+    [InlineData(ProtocolV5.Version, true)]
     [Trait("Category", "LoadClientIntegration")]
-    public async Task V4LoadClientClosesBeforeClientHelloOnOldOrMalformedServerHello(int version, bool malformed)
+    public async Task CurrentLoadClientClosesBeforeClientHelloOnOldOrMalformedServerHello(int version, bool malformed)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(8));
         CancellationToken token = timeout.Token;
@@ -326,7 +328,7 @@ public sealed class ProtocolV2SessionTests
         var errors = ReadField<object>(client, "errors");
         string detail = Assert.Single((string[])Invoke(errors, "Details")!);
         Assert.StartsWith(malformed ? "Receive:" : "Connection:", detail);
-        Assert.Contains(malformed ? "Invalid v2 packet payload length" : $"protocol v{version}. Client yêu cầu v4", detail);
+        Assert.Contains(malformed ? "Invalid v2 packet payload length" : $"protocol v{version}. Client yêu cầu v{ProtocolV5.Version}", detail);
     }
 
     [Fact]
@@ -715,11 +717,11 @@ public sealed class ProtocolV2SessionTests
     private static async Task<IPEndPoint> GrantLoadClientAsync(NetworkStream stream, UdpClient udp,
         int slot, byte[] sessionToken, CancellationToken token)
     {
-        using var hello = ProtocolV4.CreateServerHello(slot);
+        using var hello = ProtocolV5.CreateServerHello(slot);
         await stream.WriteAsync(hello.ToArray(), token);
         using Packet clientHello = await ReadFrameAsync(stream, token);
         var advertised = ProtocolV2.ReadClientHello(clientHello);
-        Assert.Equal((ProtocolV4.Version, slot), (advertised.Version, advertised.SlotId));
+        Assert.Equal((ProtocolV5.Version, slot), (advertised.Version, advertised.SlotId));
         using var grant = ProtocolV2.CreateSessionGranted(sessionToken);
         await stream.WriteAsync(grant.ToArray(), token);
         return await ReadRegistrationAsync(udp, slot, sessionToken, token);
