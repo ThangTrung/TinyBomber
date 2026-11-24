@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace GameShared
@@ -15,8 +16,9 @@ namespace GameShared
         public bool Spawn(int col, int row) => !collected.Contains((col, row)) && visible.Add((col, row));
         public bool Collect(int col, int row, int actor, int capacity)
         {
-            if (!capacities.TryGetValue(actor, out int previous) || capacity != previous + 1 ||
-                capacity > ProtocolV5.MaximumCapacity || !visible.Remove((col, row))) return false;
+            if (!capacities.TryGetValue(actor, out int previous) ||
+                capacity != Math.Min(previous + 1, ProtocolV5.MaximumCapacity) ||
+                !visible.Remove((col, row))) return false;
             collected.Add((col, row));
             capacities[actor] = capacity;
             return true;

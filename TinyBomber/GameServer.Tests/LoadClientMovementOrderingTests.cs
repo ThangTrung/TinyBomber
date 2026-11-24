@@ -177,6 +177,18 @@ public sealed class LoadClientMovementOrderingTests
         Assert.False(state.HasItem(4, 5));
         Assert.True(state.TryGetCapacity(2, out int capacity));
         Assert.Equal(2, capacity);
+
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 1, 5, 5);
+        ReceiveTcp(client, ServerPackets.bombUpCollected, 7, 1, 5, 5, 2, 3);
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 1, 6, 5);
+        Assert.True(state.HasItem(6, 5));
+        ReceiveTcp(client, ServerPackets.bombUpCollected, 7, 1, 6, 5, 2, 3);
+        ReceiveTcp(client, ServerPackets.bombUpCollected, 7, 1, 6, 5, 2, 3);
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 1, 6, 5);
+        Assert.False(state.HasItem(6, 5));
+        Assert.True(state.TryGetCapacity(2, out capacity));
+        Assert.Equal(3, capacity);
+
         ReceiveTcp(client, ServerPackets.matchState, 7, 1, (int)MatchPhase.Finished, 2, 2);
         ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 1, 4, 5);
         Assert.False(state.HasItem(4, 5));

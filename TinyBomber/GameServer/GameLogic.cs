@@ -163,8 +163,8 @@ namespace GameServer
                     foreach (var player in alive.OrderBy(p => p.id))
                     {
                         var cell = WorldToGrid(player.x, player.y);
-                        if (player.maxActiveBombs >= ProtocolV5.MaximumCapacity || !BombUps.Remove(cell)) continue;
-                        player.maxActiveBombs++;
+                        if (!BombUps.Remove(cell)) continue;
+                        player.maxActiveBombs = Math.Min(player.maxActiveBombs + 1, ProtocolV5.MaximumCapacity);
                         ServerSend.BombUp(this, cell.col, cell.row, player);
                     }
 

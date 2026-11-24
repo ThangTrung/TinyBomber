@@ -50,8 +50,23 @@ public sealed class BombUpTests
         room.UpdateRound(0);
         room.UpdateRound(1);
         Assert.Empty(room.BombUps);
-        Assert.Equal(status == "eligible" ? 1 : 2, high.player!.maxActiveBombs);
+        Assert.Equal(status is "eligible" or "full" ? 1 : 2, high.player!.maxActiveBombs);
         Assert.Equal(status == "eligible" ? 2 : status == "full" ? 3 : 1, a.maxActiveBombs);
+    }
+
+    [Fact]
+    public void FullPlayerConsumesSuccessiveItemsWithoutIncreasingCapacity()
+    {
+        var player = low.player!;
+        player.maxActiveBombs = ProtocolV5.MaximumCapacity;
+        for (int col = 5; col <= 7; col++)
+        {
+            Put(low, col, 5);
+            room.BombUps.Add((col, 5));
+            room.UpdateRound(0);
+            Assert.Empty(room.BombUps);
+            Assert.Equal(ProtocolV5.MaximumCapacity, player.maxActiveBombs);
+        }
     }
 
     [Fact]
@@ -71,7 +86,7 @@ public sealed class BombUpTests
             room.BombUps.Add((10, 3));
             room.UpdateRound(0);
             Assert.Equal(Math.Min(3, cap + 1), player.maxActiveBombs);
-            Assert.Equal(cap == 3, room.BombUps.Contains((10, 3)));
+            Assert.Empty(room.BombUps);
         }
         room.UpdateRound(2 * Stopwatch.Frequency + 1);
         Assert.Equal(2, room.ActiveBombCount(player));

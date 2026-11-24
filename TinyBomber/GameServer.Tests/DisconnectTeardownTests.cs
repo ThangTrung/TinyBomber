@@ -170,6 +170,56 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
         }
     }
 
+    [Fact]
+    public async Task BothPeersRemoveItemsCollectedAtMaximumCapacity()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var token = timeout.Token;
+        using var fixture = new SocketFixture();
+        var (room, peers) = await fixture.StartRoomAsync(2, token);
+        var replicas = peers.Select(_ => new BombUpRoundState()).ToArray();
+        foreach (var replica in replicas)
+            foreach (var peer in peers)
+                replica.SpawnPlayer(peer.Slot.id);
+
+        var winner = peers[0].Slot.player!;
+        var other = peers[1].Slot.player!;
+        const int row = 5;
+        int expectedCapacity = ProtocolV5.InitialCapacity;
+        for (int col = 5; col <= 8; col++)
+        {
+            (winner.x, winner.y) = (other.x, other.y) = GameLogic.GridToWorld(col, row);
+            room.mapData[col, row] = 0;
+            Assert.True(room.BombUps.Add((col, row)));
+            ServerSend.BombUp(room, col, row);
+            room.UpdateRound(0);
+
+            expectedCapacity = Math.Min(expectedCapacity + 1, ProtocolV5.MaximumCapacity);
+            Assert.Empty(room.BombUps);
+            Assert.Equal(expectedCapacity, winner.maxActiveBombs);
+            Assert.Equal(1, other.maxActiveBombs);
+            for (int i = 0; i < peers.Length; i++)
+            {
+                using var spawn = await peers[i].ReadAsync(token);
+                var spawnType = (ServerPackets)spawn.ReadInt();
+                Assert.Equal(ServerPackets.bombUpSpawned, spawnType);
+                var spawned = ProtocolV5.ReadBombUp(spawn, spawnType);
+                Assert.Equal((room.Id, room.RoundId, col, row, 0, 0), spawned);
+                Assert.True(replicas[i].Spawn(spawned.Col, spawned.Row));
+
+                using var collect = await peers[i].ReadAsync(token);
+                var collectType = (ServerPackets)collect.ReadInt();
+                Assert.Equal(ServerPackets.bombUpCollected, collectType);
+                var collected = ProtocolV5.ReadBombUp(collect, collectType);
+                Assert.Equal((room.Id, room.RoundId, col, row, winner.id, expectedCapacity), collected);
+                Assert.True(replicas[i].Collect(collected.Col, collected.Row, collected.Actor, collected.Capacity));
+                Assert.False(replicas[i].HasItem(col, row));
+                Assert.True(replicas[i].TryGetCapacity(winner.id, out int observed));
+                Assert.Equal(expectedCapacity, observed);
+            }
+        }
+    }
+
     private static async Task DrainAsync(int minimumActions, CancellationToken token)
     {
         // The queue count, not elapsed time, controls when the update thread may apply the batch.
