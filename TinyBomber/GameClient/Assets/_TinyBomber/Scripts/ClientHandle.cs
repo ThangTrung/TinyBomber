@@ -99,12 +99,13 @@ public class ClientHandle : MonoBehaviour
 
     public static void BombPlaced(Packet packet)
     {
-        if (IsCurrentRound(packet)) GameManager.instance.ShowBomb(ReadCell(packet));
+        if (GameManager.instance.IsPlaying && IsCurrentRound(packet))
+            GameManager.instance.ShowBomb(ReadCell(packet));
     }
 
     public static void BombExploded(Packet packet)
     {
-        if (!IsCurrentRound(packet)) return;
+        if (!GameManager.instance.IsPlaying || !IsCurrentRound(packet)) return;
         var origin = ReadCell(packet);
         var affected = ReadCells(packet);
         var destroyed = ReadCells(packet);

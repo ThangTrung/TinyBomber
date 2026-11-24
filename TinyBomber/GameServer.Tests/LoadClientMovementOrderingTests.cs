@@ -195,6 +195,79 @@ public sealed class LoadClientMovementOrderingTests
         Assert.False(state.TryGetCapacity(2, out _));
     }
 
+    [Fact]
+    public async Task FinishedClearsBombsBeforeReplay()
+    {
+        await using var client = ReadyClient();
+        var bombs = Read<HashSet<(int, int)>>(client, "bombs");
+        var map = new int[17, 15];
+        map[4, 5] = 2;
+        Set(client, "map", map);
+        byte[] session = Read<byte[]>(client, "sessionToken");
+
+        ReceiveTcp(client, ServerPackets.bombPlaced, 7, 1, 3, 5);
+        Assert.Contains((3, 5), bombs);
+        ReceiveTcp(client, ServerPackets.matchState, 7, 1, (int)MatchPhase.Finished, 2, 1);
+        Assert.Empty(bombs);
+        ReceiveTcp(client, ServerPackets.matchState, 7, 1, (int)MatchPhase.Finished, 2, 1);
+        Assert.Empty(bombs);
+        Assert.Same(map, Read<int[,]>(client, "map"));
+        Assert.Same(session, Read<byte[]>(client, "sessionToken"));
+        Assert.True(Read<bool>(client, "ready"));
+    }
+
+    [Fact]
+    public async Task BombEventsRequirePlayingAndCurrentScopeEvenForSpectators()
+    {
+        await using var client = ReadyClient();
+        var bombs = Read<HashSet<(int, int)>>(client, "bombs");
+        var map = new int[17, 15];
+        map[4, 5] = map[5, 5] = 2;
+        Set(client, "map", map);
+        ReceiveTcp(client, ServerPackets.playerEliminated, 7, 1, 1);
+
+        ReceiveTcp(client, ServerPackets.bombPlaced, 7, 1, 3, 5);
+        Assert.Contains((3, 5), bombs);
+        ReceiveTcp(client, ServerPackets.bombExploded, 7, 1, 3, 5, 0, 1, 4, 5);
+        Assert.Empty(bombs);
+        Assert.Equal(0, map[4, 5]);
+
+        ReceiveTcp(client, ServerPackets.matchState, 7, 1, (int)MatchPhase.Finished, 2, 2);
+        ReceiveTcp(client, ServerPackets.bombPlaced, 7, 1, 3, 5);
+        ReceiveTcp(client, ServerPackets.bombExploded, 7, 1, 3, 5, 0, 1, 5, 5);
+        Assert.Empty(bombs);
+        Assert.Equal(2, map[5, 5]);
+        ReceiveTcp(client, ServerPackets.playerDisconnected, 7, 1, 2);
+        Assert.DoesNotContain(2, Read<HashSet<int>>(client, "roster"));
+
+        ReceiveTcp(client, ServerPackets.roundBegin, 7, 2, 2, 1, 3);
+        int[] terrain = new int[17 * 15];
+        terrain[5 * 15 + 5] = 2;
+        ReceiveTcp(client, ServerPackets.mapData, [7, 2, .. terrain]);
+        ReceiveTcp(client, ServerPackets.spawnPlayer, 7, 2, 3, 0, 0);
+        Assert.NotNull(Read<int[,]>(client, "map"));
+        Assert.True(Read<System.Collections.IDictionary>(client, "spawns").Contains(3));
+
+        ReceiveTcp(client, ServerPackets.bombPlaced, 7, 2, 3, 5);
+        Assert.Empty(bombs);
+        ReceiveTcp(client, ServerPackets.matchState, 7, 2, (int)MatchPhase.Playing, 2, 0);
+        ReceiveTcp(client, ServerPackets.bombPlaced, 7, 2, 3, 5);
+        ReceiveTcp(client, ServerPackets.bombExploded, 7, 1, 3, 5, 0, 1, 5, 5);
+        ReceiveTcp(client, ServerPackets.bombExploded, 8, 2, 3, 5, 0, 1, 5, 5);
+        ReceiveTcp(client, ServerPackets.bombPlaced, 7, 1, 6, 5);
+        Assert.Equal((3, 5), Assert.Single(bombs));
+        Assert.Equal(2, Read<int[,]>(client, "map")[5, 5]);
+
+        var items = Read<BombUpRoundState>(client, "bombUps");
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 2, 5, 5);
+        ReceiveTcp(client, ServerPackets.bombUpCollected, 7, 1, 5, 5, 3, 2);
+        ReceiveTcp(client, ServerPackets.bombUpSpawned, 7, 1, 6, 5);
+        Assert.True(items.HasItem(5, 5));
+        Assert.False(items.HasItem(6, 5));
+        Assert.True(items.TryGetCapacity(3, out int capacity));
+        Assert.Equal(1, capacity);
+    }
+
     private IAsyncDisposable ReadyClient()
     {
         Type errorsType = LoadClient.GetType("GameServer.LoadClient.RunErrors", true)!;

@@ -220,11 +220,242 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
         }
     }
 
+    [Fact]
+    public async Task TwentyRoundsReuseTheSameRoomAndReadySessions()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var token = timeout.Token;
+        int connectedBefore = Server.clients.Values.Count(slot => slot.tcp.socket != null);
+        int readyBefore = Server.clients.Values.Count(slot => slot.IsReady);
+        using var fixture = new SocketFixture();
+        var (room, peers) = await fixture.StartRoomAsync(2, token);
+        var first = peers[0].Slot;
+        var second = peers[1].Slot;
+        var sessions = peers.Select(peer => peer.Connection.SessionToken).ToArray();
+        Player[]? previousPlayers = null;
+        long fuse = 2 * Stopwatch.Frequency;
+        const int roundCount = 20;
+
+        for (int round = 1; round <= roundCount; round++)
+        {
+            Assert.Equal((round, MatchPhase.Playing, 0), (room.RoundId, room.Phase, room.WinnerId));
+            Assert.Same(room, Server.FindRoom(room.Id));
+            Assert.Equal(new[] { first, second }, room.Members);
+            Assert.Equal(connectedBefore + 2, Server.clients.Values.Count(slot => slot.tcp.socket != null));
+            Assert.Equal(readyBefore + 2, Server.clients.Values.Count(slot => slot.IsReady));
+            Assert.Empty(room.BombUps);
+
+            var players = peers.Select(peer => Assert.IsType<Player>(peer.Slot.player)).ToArray();
+            for (int i = 0; i < players.Length; i++)
+            {
+                var player = players[i];
+                Assert.Same(peers[i].Connection, peers[i].Slot.tcp);
+                Assert.Same(peers[i].Udp, peers[i].Slot.udp);
+                Assert.Same(sessions[i], peers[i].Slot.tcp.SessionToken);
+                if (previousPlayers != null) Assert.NotSame(previousPlayers[i], player);
+                Assert.True(player.isAlive);
+                Assert.Equal((1, 1, 0L, 0L, 0), (player.hp, player.maxActiveBombs,
+                    player.LastProcessedMoveSeq, player.LastAcceptedMoveSeq, room.ActiveBombCount(player)));
+                Assert.Equal((i == 0 ? 1 : 15, 13), GameLogic.WorldToGrid(player.x, player.y));
+                Assert.False(player.TryTakeFinalPositionRefresh(fuse, TimeSpan.Zero));
+
+                // Before any refill, a new player can spend the opening credit only once.
+                Assert.True(player.TrySpendMovementCredit(player.x + 0.075f, player.y, 0));
+                Assert.False(player.TrySpendMovementCredit(player.x + 0.01f, player.y, 0));
+            }
+            for (int col = 0; col < Constants.MAP_WIDTH; col++)
+            for (int row = 0; row < Constants.MAP_HEIGHT; row++)
+                Assert.InRange(room.mapData[col, row], 0, 2);
+            Assert.Equal(1, room.mapData[0, 0]);
+            foreach (var (col, row) in new[] { (1, 1), (2, 1), (1, 2), (15, 1), (14, 1), (15, 2),
+                         (1, 13), (2, 13), (1, 12), (15, 13), (14, 13), (15, 12) })
+                Assert.Equal(0, room.mapData[col, row]);
+
+            if (round > 1)
+            {
+                await peers[0].SendAsync(ClientPackets.placeBomb, token, room.Id, round - 1);
+                await DrainAsync(1, token);
+                ServerHandle.PlayerMovement(first, room.Id, round - 1, players[0].x, players[0].y, 0, 99);
+                Assert.Equal(0, room.ActiveBombCount(players[0]));
+                Assert.Equal(0, players[0].LastProcessedMoveSeq);
+            }
+
+            // Seed item cells and control fuse timestamps while applying the production pickup and finish logic.
+            var firstPlayer = players[0];
+            var firstSpawn = (firstPlayer.x, firstPlayer.y);
+            foreach (int col in new[] { 3, 4 })
+            {
+                room.mapData[col, 13] = 0;
+                (firstPlayer.x, firstPlayer.y) = GameLogic.GridToWorld(col, 13);
+                room.BombUps.Add((col, 13));
+                ServerSend.BombUp(room, col, 13);
+                room.UpdateRound(0);
+                foreach (var peer in peers)
+                {
+                    await peer.ExpectAsync(ServerPackets.bombUpSpawned, token, room.Id, round, col, 13);
+                    await peer.ExpectAsync(ServerPackets.bombUpCollected, token, room.Id, round,
+                        col, 13, first.id, col - 1);
+                }
+            }
+            Assert.Equal(3, firstPlayer.maxActiveBombs);
+            (firstPlayer.x, firstPlayer.y) = firstSpawn;
+            foreach (var player in players)
+            {
+                Assert.True(player.TryMarkMovementProcessed(1));
+                player.AcceptMovement(player.x, player.y, 1, 0);
+            }
+            room.mapData[2, 13] = 2;
+            room.BombUps.Add((5, 13));
+            ServerSend.BombUp(room, 5, 13);
+            bool draw = round % 2 == 0;
+            room.PlaceBomb(first, room.Id, round, placedAt: 0);
+            if (draw) room.PlaceBomb(second, room.Id, round, placedAt: 0);
+            (firstPlayer.x, firstPlayer.y) = GameLogic.GridToWorld(4, 13);
+            room.PlaceBomb(first, room.Id, round, placedAt: 1);
+            (firstPlayer.x, firstPlayer.y) = firstSpawn;
+            Assert.Equal(2, room.ActiveBombCount(firstPlayer));
+
+            room.UpdateRound(fuse);
+            Assert.Equal(MatchPhase.Finished, room.Phase);
+            Assert.Equal(draw ? 0 : second.id, room.WinnerId);
+            Assert.Equal(0, room.mapData[2, 13]);
+            Assert.Empty(room.BombUps);
+            Assert.False(firstPlayer.isAlive);
+            Assert.Equal(!draw, players[1].isAlive);
+            Assert.All(players, player => Assert.Equal(0, room.ActiveBombCount(player)));
+            room.UpdateRound(fuse + 1); // The cancelled fuse and pending refresh must emit nothing.
+            foreach (var peer in peers)
+            {
+                await peer.ExpectAsync(ServerPackets.bombUpSpawned, token, room.Id, round, 5, 13);
+                await peer.ExpectAsync(ServerPackets.bombPlaced, token, room.Id, round, 1, 13);
+                if (draw) await peer.ExpectAsync(ServerPackets.bombPlaced, token, room.Id, round, 15, 13);
+                await peer.ExpectAsync(ServerPackets.bombPlaced, token, room.Id, round, 4, 13);
+                await peer.ExpectExplosionAsync(room, 1, 13, token);
+                if (draw) await peer.ExpectExplosionAsync(room, 15, 13, token);
+                await peer.ExpectAsync(ServerPackets.playerEliminated, token, room.Id, round, first.id);
+                if (draw) await peer.ExpectAsync(ServerPackets.playerEliminated, token, room.Id, round, second.id);
+                await peer.ExpectMatchStateAsync(room, token);
+            }
+
+            previousPlayers = players;
+            if (round == roundCount) break;
+            await peers[0].SendAsync(ClientPackets.requestStart, token, room.Id, round);
+            await DrainAsync(1, token);
+            await SocketFixture.ExpectRoundAsync(room, peers, token);
+        }
+
+        await peers[0].SendAsync(ClientPackets.leaveRoom, token, room.Id);
+        await DrainAsync(1, token);
+        await peers[0].ExpectAsync(ServerPackets.roomChanged, token, 0);
+        await peers[1].ExpectAsync(ServerPackets.playerDisconnected, token, room.Id, roundCount, first.id);
+        await peers[1].ExpectMatchStateAsync(room, token);
+        Assert.Null(first.Room);
+        Assert.Null(first.player);
+        foreach (var peer in peers)
+        {
+            peer.Close();
+            await DrainAsync(1, token);
+            peer.AssertReleased();
+        }
+        Assert.Empty(room.Members);
+        Assert.Null(Server.FindRoom(room.Id));
+        Assert.Equal(connectedBefore, Server.clients.Values.Count(slot => slot.tcp.socket != null));
+        Assert.Equal(readyBefore, Server.clients.Values.Count(slot => slot.IsReady));
+        output.WriteLine($"Verified {roundCount} rounds on two sessions: 10 wins and 10 draws. Queue after teardown: {ThreadManager.GetWaitingActionCount()}.");
+    }
+
+    [Fact]
+    public async Task SwitchingRoomsAndReusingSlotCannotCarryOldRoundState()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var token = timeout.Token;
+        using var fixture = new SocketFixture();
+        var (roomA, a) = await fixture.StartRoomAsync(2, token);
+        var (roomB, b) = await fixture.StartRoomAsync(2, token);
+        Assert.Equal(roomA.RoundId, roomB.RoundId);
+        foreach (var (room, owner) in new[] { (roomA, a[0]), (roomB, b[0]) })
+        {
+            room.mapData[5, 5] = 0;
+            room.BombUps.Add((5, 5));
+            var player = owner.Slot.player!;
+            (player.x, player.y) = GameLogic.GridToWorld(5, 5);
+            room.PlaceBomb(owner.Slot, room.Id, 1, placedAt: 0);
+        }
+        foreach (var peer in a) await peer.ExpectAsync(ServerPackets.bombPlaced, token, roomA.Id, 1, 5, 5);
+        foreach (var peer in b) await peer.ExpectAsync(ServerPackets.bombPlaced, token, roomB.Id, 1, 5, 5);
+
+        var mover = a[0];
+        var ownerB = b[0].Slot.player!;
+        roomA.mapData[6, 5] = 0;
+        roomB.mapData[6, 5] = 2;
+        await mover.SendAsync(ClientPackets.leaveRoom, token, roomA.Id);
+        await DrainAsync(1, token);
+        await mover.ExpectAsync(ServerPackets.roomChanged, token, 0);
+        await a[1].ExpectAsync(ServerPackets.playerDisconnected, token, roomA.Id, 1, mover.Slot.id);
+        await a[1].ExpectMatchStateAsync(roomA, token);
+        await mover.SendAsync(ClientPackets.joinRoom, token, roomB.Id);
+        await DrainAsync(1, token);
+        await mover.ExpectAsync(ServerPackets.roomChanged, token, roomB.Id);
+        foreach (var peer in b.Append(mover)) await peer.ExpectMatchStateAsync(roomB, token);
+        Assert.Same(roomB, mover.Slot.Room);
+        Assert.Null(mover.Slot.player);
+        Assert.False(roomB.AcceptsInput(mover.Slot, roomB.Id, 1));
+
+        var departing = a[1];
+        var oldToken = departing.Connection.SessionToken;
+        await departing.SendAsync(ClientPackets.createRoom, token);
+        await WaitForActionsAsync(1, token);
+        Server.Disconnect(departing.Slot.id, departing.Connection);
+        Assert.Null(Server.FindRoom(roomA.Id));
+        var replacement = await fixture.OpenAsync(departing.Slot, token);
+        Assert.False(oldToken!.SequenceEqual(replacement.Connection.SessionToken!));
+        await DrainAsync(1, token);
+        Assert.Same(replacement.Connection, replacement.Slot.tcp);
+        Assert.Null(replacement.Slot.Room);
+        Assert.Null(replacement.Slot.player);
+
+        Assert.Same(roomB, Server.FindRoom(roomB.Id));
+        Assert.Same(ownerB, b[0].Slot.player);
+        Assert.Equal(1, roomB.ActiveBombCount(ownerB));
+        Assert.Contains((5, 5), roomB.BombUps);
+        Assert.Equal(2, roomB.mapData[6, 5]);
+        roomB.UpdateRound(2 * Stopwatch.Frequency);
+        foreach (var peer in b)
+        {
+            await peer.ExpectExplosionAsync(roomB, 5, 5, token);
+            await peer.ExpectAsync(ServerPackets.playerEliminated, token, roomB.Id, 1, ownerB.id);
+        }
+        foreach (var peer in b.Append(mover)) await peer.ExpectMatchStateAsync(roomB, token);
+        Assert.Equal(0, roomB.mapData[6, 5]);
+
+        await b[1].SendAsync(ClientPackets.requestStart, token, roomB.Id, 1);
+        await DrainAsync(1, token);
+        await SocketFixture.ExpectRoundAsync(roomB, [mover, .. b], token);
+        Assert.Equal(2, roomB.RoundId);
+        Assert.Equal(1, mover.Slot.player!.maxActiveBombs);
+        Assert.Empty(roomB.BombUps);
+
+        // A solo Ready client may disconnect in Waiting without leaving a room or player behind.
+        await replacement.SendAsync(ClientPackets.createRoom, token);
+        await DrainAsync(1, token);
+        var waitingRoom = Assert.IsType<GameLogic>(replacement.Slot.Room);
+        Assert.Equal(MatchPhase.Waiting, waitingRoom.Phase);
+        replacement.Close();
+        await DrainAsync(1, token);
+        replacement.AssertReleased();
+        Assert.Null(Server.FindRoom(waitingRoom.Id));
+    }
+
+    private static async Task WaitForActionsAsync(int minimumActions, CancellationToken token)
+    {
+        while (ThreadManager.GetWaitingActionCount() < minimumActions)
+            await Task.Delay(5, token);
+    }
+
     private static async Task DrainAsync(int minimumActions, CancellationToken token)
     {
         // The queue count, not elapsed time, controls when the update thread may apply the batch.
-        while (ThreadManager.GetWaitingActionCount() < minimumActions)
-            await Task.Delay(5, token);
+        await WaitForActionsAsync(minimumActions, token);
         ThreadManager.UpdateMain();
         Assert.Equal(0, ThreadManager.LastBatchMetrics.Failed);
     }
@@ -256,22 +487,37 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
             var room = controlledRoom ?? Server.CreateRoom();
             foreach (var peer in group) Assert.True(room.TryAddMember(peer.Slot));
             room.StartRound(group[0].Slot, room.Id, 0);
+            await ExpectRoundAsync(room, group, token);
+            return (room, group);
+        }
+
+        public static async Task ExpectRoundAsync(GameLogic room, Peer[] group, CancellationToken token)
+        {
             Assert.Equal(MatchPhase.Playing, room.Phase);
             foreach (var peer in group)
             {
                 await peer.ExpectAsync(ServerPackets.roundBegin, token,
-                    [room.Id, 1, count, .. group.Select(member => member.Slot.id)]);
+                    [room.Id, room.RoundId, group.Length, .. group.Select(member => member.Slot.id)]);
                 using (var map = await peer.ReadAsync(token))
-                    Assert.Equal((ServerPackets.mapData, room.Id, 1), ((ServerPackets)map.ReadInt(), map.ReadInt(), map.ReadInt()));
+                {
+                    Assert.Equal((ServerPackets.mapData, room.Id, room.RoundId),
+                        ((ServerPackets)map.ReadInt(), map.ReadInt(), map.ReadInt()));
+                    for (int col = 0; col < Constants.MAP_WIDTH; col++)
+                    for (int row = 0; row < Constants.MAP_HEIGHT; row++)
+                        Assert.Equal(room.mapData[col, row], map.ReadInt());
+                    Assert.Equal(0, map.UnreadLength());
+                }
                 foreach (var member in group)
                 {
                     using var spawn = await peer.ReadAsync(token);
-                    Assert.Equal((ServerPackets.spawnPlayer, room.Id, 1, member.Slot.id),
-                        ((ServerPackets)spawn.ReadInt(), spawn.ReadInt(), spawn.ReadInt(), spawn.ReadInt()));
+                    var player = member.Slot.player!;
+                    Assert.Equal((ServerPackets.spawnPlayer, room.Id, room.RoundId, member.Slot.id, player.x, player.y),
+                        ((ServerPackets)spawn.ReadInt(), spawn.ReadInt(), spawn.ReadInt(), spawn.ReadInt(),
+                            spawn.ReadFloat(), spawn.ReadFloat()));
+                    Assert.Equal(0, spawn.UnreadLength());
                 }
                 await peer.ExpectMatchStateAsync(room, token);
             }
-            return (room, group);
         }
 
         public async Task<Peer> OpenAsync(Client slot, CancellationToken token)
@@ -359,6 +605,13 @@ public sealed class DisconnectTeardownTests(ITestOutputHelper output)
             Assert.Equal(type, (ServerPackets)packet.ReadInt());
             foreach (var field in fields) Assert.Equal(field, packet.ReadInt());
             Assert.Equal(0, packet.UnreadLength());
+        }
+
+        public async Task ExpectExplosionAsync(GameLogic room, int col, int row, CancellationToken token)
+        {
+            using var packet = await ReadAsync(token);
+            Assert.Equal((ServerPackets.bombExploded, room.Id, room.RoundId, col, row),
+                ((ServerPackets)packet.ReadInt(), packet.ReadInt(), packet.ReadInt(), packet.ReadInt(), packet.ReadInt()));
         }
 
         public async Task<Packet> ReadAsync(CancellationToken token)

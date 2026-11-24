@@ -4,7 +4,9 @@ using System.Collections.Generic;
 using System.Reflection;
 using GameShared;
 using NUnit.Framework;
+using UnityEditor;
 using UnityEngine;
+using UnityEngine.TestTools;
 using Object = UnityEngine.Object;
 
 public sealed class MovementOrderingTests
@@ -335,11 +337,13 @@ public sealed class MovementOrderingUnityTests
     public void ReplayRoomChangeAndSessionResetAllowReusedPlayerIdButDropOldScope()
     {
         var ordering = (MovementOrdering)gameType.GetField("movementOrdering", Instance).GetValue(game);
-        Assert.That(MovementOrderingTests.Submit(ordering, seq => seq == 1), Is.True);
+        var scope = (new object(), 7, 1);
+        Assert.IsTrue(ordering.TrySend(scope, Vector2.zero, 0, 0.25, (seq, _) => seq == 1, (_, _) => false));
         Peer(7, 1, 12, Vector2.right);
         Invoke("ApplyMatchState", 1, MatchPhase.Finished, 2, 0);
         Peer(7, 1, 13, Vector2.left);
         Assert.That(ordering.TryGetPeerTarget(2, out _, out _), Is.False);
+        Assert.IsFalse(ordering.TryRetry(scope, 1, 0.25, (_, _) => true));
         Invoke("BeginRound", 2, new[] { 1, 2 });
         Peer(7, 1, 13, Vector2.left);
         Peer(7, 2, 1, Vector2.up);
@@ -470,6 +474,196 @@ public sealed class MovementOrderingUnityTests
         var item = new GameObject("Movement ordering test");
         objects.Add(item);
         return item;
+    }
+
+    private static Type FindType(string name) => Type.GetType(name + ", Assembly-CSharp", throwOnError: true);
+}
+
+
+[Category("UnityRuntime")]
+public sealed class RoundCleanupUnityTests
+{
+    private const double WaitTimeoutSeconds = 5;
+
+    [UnityTearDown]
+    public IEnumerator ReturnToEditMode()
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode)
+            yield return new ExitPlayMode();
+    }
+
+    [UnityTest]
+    public IEnumerator ReplayDestroysOldObjectsAndIgnoresLateBombEvents()
+    {
+        bool expectDomainReload = !EditorSettings.enterPlayModeOptionsEnabled ||
+            (EditorSettings.enterPlayModeOptions & EnterPlayModeOptions.DisableDomainReload) == 0;
+        yield return new EnterPlayMode(expectDomainReload);
+        Assert.IsTrue(Application.isPlaying, "Runtime Destroy must be tested in Play Mode.");
+
+        const BindingFlags Instance = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        var gameType = FindType("GameManager");
+        var clientType = FindType("Client");
+        var handleType = FindType("ClientHandle");
+        var remoteType = FindType("RemotePlayerController");
+        var gameSingleton = gameType.GetField("instance");
+        var clientSingleton = clientType.GetField("instance");
+        var playerField = gameType.GetField("players");
+        var softBlockField = gameType.GetField("softBlocks");
+        object previousGame = gameSingleton.GetValue(null), previousClient = clientSingleton.GetValue(null);
+        object previousPlayers = playerField.GetValue(null), previousSoftBlocks = softBlockField.GetValue(null);
+        var players = new Dictionary<int, GameObject>();
+        var softBlocks = new Dictionary<Vector2Int, GameObject>();
+        var fixture = new GameObject("Round cleanup test");
+        var managerObject = new GameObject("Test GameManager");
+        var clientObject = new GameObject("Test Client");
+        managerObject.transform.SetParent(fixture.transform);
+        clientObject.transform.SetParent(fixture.transform);
+        float oldTimeScale = Time.timeScale;
+        try
+        {
+            Time.timeScale = 1;
+            gameSingleton.SetValue(null, null);
+            clientSingleton.SetValue(null, null);
+            playerField.SetValue(null, players);
+            softBlockField.SetValue(null, softBlocks);
+            var manager = (Behaviour)managerObject.AddComponent(gameType);
+            var client = (Behaviour)clientObject.AddComponent(clientType);
+            manager.enabled = client.enabled = false;
+            clientType.GetField("myId").SetValue(client, 1);
+
+            var tilePrefab = new GameObject("Test tile prefab");
+            tilePrefab.transform.SetParent(fixture.transform);
+            var remotePrefab = new GameObject("Test remote prefab");
+            remotePrefab.transform.SetParent(fixture.transform);
+            remotePrefab.SetActive(false);
+            remotePrefab.AddComponent(remoteType);
+            gameType.GetField("playerPrefab").SetValue(manager, remotePrefab);
+            foreach (string name in new[] { "bombPrefab", "bombUpPrefab", "softBlockPrefab" })
+                gameType.GetField(name).SetValue(manager, tilePrefab);
+
+            var bombs = (Dictionary<Vector2Int, GameObject>)gameType.GetField("bombs", Instance).GetValue(manager);
+            var items = (Dictionary<Vector2Int, GameObject>)gameType.GetField("itemViews", Instance).GetValue(manager);
+            var blasts = (List<GameObject>)gameType.GetField("blasts", Instance).GetValue(manager);
+            var bombCell = new Vector2Int(3, 5);
+            var itemCell = new Vector2Int(4, 5);
+            var softCell = new Vector2Int(5, 5);
+            var terrain = new int[17, 15];
+            terrain[5, 5] = 2;
+            Call("ChangeRoom", 7);
+            StartRound(1, terrain);
+
+            var oldPlayer = players[2];
+            var oldRemote = oldPlayer.GetComponent(remoteType);
+            var remoteTarget = remoteType.GetField("targetPosition", Instance);
+            var animationHold = remoteType.GetField("lastTargetChangeTime", Instance);
+            Call("ApplyOrderedPeerPosition", 7, 1, 2, 1L, Vector2.up, false);
+            Assert.AreEqual(Vector2.up, remoteTarget.GetValue(oldRemote));
+            animationHold.SetValue(oldRemote, 123d);
+            BombEvent("BombPlaced", 1, 3, 5);
+            BombEvent("BombExploded", 1, 3, 5, 1, 3, 5, 0);
+            Assert.IsEmpty(bombs);
+            Assert.AreEqual(1, blasts.Count);
+            var oldFlash = blasts[0];
+            double oldFlashWindowEnd = Time.timeAsDouble + 0.25;
+            BombEvent("BombPlaced", 1, 3, 5);
+            var oldBomb = bombs[bombCell];
+            Call("ApplyBombUp", 7, 1, 4, 5, 0, 0);
+            var oldItem = items[itemCell];
+            var oldSoft = softBlocks[softCell];
+
+            Call("ApplyMatchState", 1, MatchPhase.Finished, 2, 2);
+            BombEvent("BombPlaced", 1, 3, 5);
+            BombEvent("BombExploded", 1, 3, 5, 1, 3, 5, 1, 5, 5);
+            Assert.IsEmpty(bombs);
+            Assert.IsEmpty(items);
+            Assert.AreEqual(1, blasts.Count);
+            Assert.AreEqual(2, terrain[5, 5]);
+            Assert.IsTrue(oldFlash != null);
+
+            // Replay in the same frame while the old flash is still awaiting destruction.
+            var replayTerrain = new int[17, 15];
+            replayTerrain[5, 5] = 2;
+            StartRound(2, replayTerrain);
+            BombEvent("BombPlaced", 2, 3, 5);
+            Call("ApplyBombUp", 7, 2, 4, 5, 0, 0);
+            BombEvent("BombPlaced", 1, 6, 5);
+            BombEvent("BombExploded", 1, 3, 5, 1, 3, 5, 1, 5, 5);
+            Call("ApplyBombUp", 7, 1, 6, 5, 0, 0);
+            Assert.AreEqual(1, bombs.Count);
+            Assert.AreEqual(1, items.Count);
+            Assert.AreEqual(2, replayTerrain[5, 5]);
+            Assert.IsEmpty(blasts);
+
+            var newPlayer = players[2];
+            var newRemote = newPlayer.GetComponent(remoteType);
+            Assert.AreNotSame(oldPlayer, newPlayer);
+            Assert.IsNull(remoteTarget.GetValue(newRemote));
+            Assert.AreEqual(double.NegativeInfinity, animationHold.GetValue(newRemote));
+            var newBomb = bombs[bombCell];
+            var newItem = items[itemCell];
+            var newSoft = softBlocks[softCell];
+            yield return null;
+            Assert.IsTrue(oldPlayer == null && oldBomb == null && oldItem == null && oldSoft == null && oldFlash == null);
+            // Let the old flash's delayed Destroy window elapse before touching the new objects.
+            double deadline = Time.realtimeSinceStartupAsDouble + WaitTimeoutSeconds;
+            while (Time.timeAsDouble < oldFlashWindowEnd && Time.realtimeSinceStartupAsDouble < deadline)
+                yield return null;
+            Assert.GreaterOrEqual(Time.timeAsDouble, oldFlashWindowEnd, "Play Mode time did not advance.");
+            Assert.IsTrue(newPlayer != null && newBomb != null && newItem != null && newSoft != null);
+
+            BombEvent("BombExploded", 2, 3, 5, 1, 3, 5, 1, 5, 5);
+            Assert.AreEqual(0, replayTerrain[5, 5]);
+            var replayFlash = blasts[0];
+            Call("ApplyMatchState", 2, MatchPhase.Finished, 2, 2);
+            Assert.IsTrue(replayFlash != null);
+            double replayFlashWindowEnd = Time.timeAsDouble + 0.25;
+            deadline = Time.realtimeSinceStartupAsDouble + WaitTimeoutSeconds;
+            while (Time.timeAsDouble < replayFlashWindowEnd && Time.realtimeSinceStartupAsDouble < deadline)
+                yield return null;
+            Assert.GreaterOrEqual(Time.timeAsDouble, replayFlashWindowEnd, "Play Mode time did not advance.");
+            Assert.IsTrue(replayFlash == null);
+            Assert.IsTrue(newItem == null && newBomb == null && newSoft == null);
+
+            void Call(string method, params object[] args) => gameType.GetMethod(method, Instance).Invoke(manager, args);
+
+            void StartRound(int round, int[,] map)
+            {
+                Call("BeginRound", round, new[] { 1, 2 });
+                Call("BuildMap", map);
+                Call("SpawnPlayer", 2, Vector2.zero);
+                Call("SpawnPlayer", 2, Vector2.one);
+                Assert.AreEqual(1, players.Count);
+                Assert.AreEqual(Vector3.zero, players[2].transform.position);
+                Call("ApplyMatchState", round, MatchPhase.Playing, 2, 0);
+            }
+
+            void BombEvent(string method, int round, params int[] fields)
+            {
+                using var writer = new Packet();
+                writer.Write(7);
+                writer.Write(round);
+                foreach (int field in fields) writer.Write(field);
+                using var packet = new Packet(writer.ToArray());
+                handleType.GetMethod(method).Invoke(null, new object[] { packet });
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (gameSingleton.GetValue(null) is Component manager && manager && manager.gameObject == managerObject)
+                    gameType.GetMethod("OnDestroy", Instance).Invoke(manager, null);
+            }
+            finally
+            {
+                gameSingleton.SetValue(null, previousGame);
+                clientSingleton.SetValue(null, previousClient);
+                playerField.SetValue(null, previousPlayers);
+                softBlockField.SetValue(null, previousSoftBlocks);
+                Time.timeScale = oldTimeScale;
+                Object.Destroy(fixture);
+            }
+        }
     }
 
     private static Type FindType(string name) => Type.GetType(name + ", Assembly-CSharp", throwOnError: true);
